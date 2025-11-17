@@ -10,7 +10,7 @@ requires-python = ">=3.13"
 dependencies = []
 
 [project.scripts]
-sentinel-py = "sentinel_py.cli:cli"
+sentinel-py = "sentinel_py.cli.main:cli"
 
 [build-system]
 requires = ["hatchling"]

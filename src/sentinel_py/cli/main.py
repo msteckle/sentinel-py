@@ -1,52 +1,35 @@
-import click
+import typer
+from pathlib import Path
+from typing import Optional, List
 from sentinel_py.s2.workflows.download_s2 import download_s2_seasonal_scenes
 
-@click.group()
-def cli():
-    """Sentinel data and workflow CLI."""
-    pass
+app = typer.Typer(help="Sentinel data and workflow CLI.")
+s2 = typer.Typer(help="Sentinel-2 tools.")
+app.add_typer(s2, name="s2")
 
-@cli.group()
-def s2():
-    """Sentinel-2 tools."""
-    pass
 
 @s2.command("download-seasonally")
-@click.option("--aoi", type=click.Path(exists=True), required=True)
-@click.option("--output", type=click.Path(), required=True)
-@click.option("--start-year", type=int, required=True)
-@click.option("--start-month", type=int, default=6)
-@click.option("--start-day", type=int, default=1)
-@click.option("--end-year", type=int, required=True)
-@click.option("--end-month", type=int, default=8)
-@click.option("--end-day", type=int, default=31)
-@click.option("--catalogue-odata", type=str, default="https://cdse-catalogue.dataspace.copernicus.eu/odata/v1/Products")
-@click.option("--collection-name", type=str, default="Sentinel-2 MSI Level-2A")
-@click.option("--product-type", type=str, default="S2MSI2A")
-@click.option("--bands", type=str, multiple=True, default=["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"])
-@click.option("--target-res-m", type=int, default=20)
-@click.option("--credentials", type=str, default=None)
-@click.option("--max-scenes", type=int, default=None)
-@click.option("--max-workers-files", type=int, default=4)
-@click.option("--log-file", default=None)
 def download_seasonally(
-    aoi,
-    output,
-    start_year,
-    start_month,
-    start_day,
-    end_year,
-    end_month,
-    end_day,
-    catalogue_odata,
-    collection_name,
-    product_type,
-    bands,
-    target_res_m,
-    credentials,
-    max_scenes,
-    max_workers_files,
-    log_file
+    aoi: Path = typer.Option(..., exists=True, help="AOI file"),
+    output: Path = typer.Option(..., help="Output directory"),
+    start_year: int = typer.Option(...),
+    start_month: int = 6,
+    start_day: int = 1,
+    end_year: int = typer.Option(...),
+    end_month: int = 8,
+    end_day: int = 31,
+    catalogue_odata: str = "https://cdse-catalogue.dataspace.copernicus.eu/odata/v1/Products",
+    collection_name: str = "Sentinel-2 MSI Level-2A",
+    product_type: str = "S2MSI2A",
+    bands: List[str] = typer.Option(
+        ["B02","B03","B04","B05","B06","B07","B08","B8A","B11","B12"],
+        help="Bands to include.",
+    ),
+    target_res_m: int = 20,
+    credentials: Optional[str] = None,
+    max_scenes: Optional[int] = None,
+    max_workers_files: int = 4,
+    log_file: Optional[str] = None,
 ):
     download_s2_seasonal_scenes(
         aoi=aoi,
@@ -67,3 +50,7 @@ def download_seasonally(
         max_workers_files=max_workers_files,
         log_file=log_file,
     )
+
+
+if __name__ == "__main__":
+    app()

@@ -13,7 +13,7 @@ from sentinel_py.common.utils import seasonal_date_ranges
 from sentinel_py.common.cdse_search import build_search_query, fetch_all_products
 from sentinel_py.common.cdse_auth import AutoRefreshSession
 from sentinel_py.s2.cdse_s2_nodes import select_s2_targets
-from sentinel_py.s2.cdse_s2_download import download_scene_targets
+from sentinel_py.s2.cdse_s2_download import download_s2_targets
 
 
 def download_s2_seasonal_scenes(
@@ -78,7 +78,6 @@ def download_s2_seasonal_scenes(
             logger.info("Querying CDSE: %s", query_url)
 
         df = fetch_all_products(query_url)  # <- from cdse_search.py
-        # you might want to annotate year / window on the rows
         df = df.assign(
             window_start=start_iso,
             window_end=end_iso,
@@ -100,8 +99,8 @@ def download_s2_seasonal_scenes(
         # for each scene, select targets and download them
         results: list[dict] = []
         for _, row in products.iterrows():
-            scene_id = row.get("Id")     # CDSE product ID
-            scene_name = row.get("Name") # human-readable scene name
+            scene_id = row.get("Id")  # CDSE product ID
+            scene_name = row.get("Name")  # human-readable scene name
 
             if not scene_id or not scene_name:
                 continue
@@ -119,7 +118,7 @@ def download_s2_seasonal_scenes(
                 logger.info("Scene %s: selected %d targets", scene_name, len(targets))
 
             # download targets concurrently
-            failures = download_scene_targets(
+            failures = download_s2_targets(
                 session=sess,
                 scene_id=str(scene_id),
                 targets=targets,

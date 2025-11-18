@@ -12,7 +12,7 @@ cd sentinel-py
 ```
 2. Install the required Python packages with uv:
 ```bash
-uv sync
+uv pip install -e .
 ```
 3. Set up the SNAP environment:
 ```bash

@@ -2,10 +2,52 @@ import typer
 from pathlib import Path
 from typing import Optional, List
 from sentinel_py.s2.workflows.download_s2 import download_s2_seasonal_scenes
+from sentinel_py.common.aoi import create_aoi_geojson, overlay_latlon_grid
 
 app = typer.Typer(help="Sentinel data and workflow CLI.")
 s2 = typer.Typer(help="Sentinel-2 tools.")
 app.add_typer(s2, name="s2")
+
+
+@app.command("create-aoi")
+def create_aoi(
+    xmin: float = typer.Option(..., help="Minimum longitude"),
+    xmax: float = typer.Option(..., help="Maximum longitude"),
+    ymin: float = typer.Option(..., help="Minimum latitude"),
+    ymax: float = typer.Option(..., help="Maximum latitude"),
+    crs: str = typer.Option("EPSG:4326", help="CRS for AOI and grid"),
+    out_file: Path = typer.Option("latlon_aoi.geojson", help="Output .geojson file"),
+):
+    create_aoi_geojson(
+        xmin, 
+        xmax, 
+        ymin, 
+        ymax, 
+        crs, 
+        out_file
+    )
+
+
+@app.command("create-latlon-grid")
+def create_latlon_grid(
+    aoi_file: Path = typer.Option(..., exists=True, help="AOI .geojson file"),
+    dx_deg: float = typer.Option(..., help="Grid cell size in degrees (longitude)"),
+    dy_deg: float = typer.Option(..., help="Grid cell size in degrees (latitude)"),
+    crs: str = typer.Option("EPSG:4326", help="CRS for AOI and grid"),
+    clip_to_aoi: bool = typer.Option(True, help="Clip grid cells to AOI"),
+    fill_aoi_holes: bool = typer.Option(True, help="Fill holes in AOI geometry"),
+    fill_cell_holes: bool = typer.Option(True, help="Fill holes in grid cells"),
+    out_file: Path = typer.Option("latlon_grid.geojson", help="Output .geojson file"),
+):
+    overlay_latlon_grid(
+        aoi=aoi_file,
+        cell_size_deg=(dx_deg, dy_deg),
+        crs=crs,
+        clip_to_aoi=clip_to_aoi,
+        fill_aoi_holes=fill_aoi_holes,
+        fill_cell_holes=fill_cell_holes,
+        out_file=out_file,
+    )
 
 
 @s2.command("download-seasonally")

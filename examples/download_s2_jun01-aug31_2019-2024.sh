@@ -5,8 +5,8 @@ set -euo pipefail
 AOI_FILE="data/aoi_example.geojson"
 OUT_DIR="data/s2"
 CAT="https://cdse-catalogue.dataspace.copernicus.eu/odata/v1/Products"
-CREDS="path/to/credentials.json"
-LOG_FILE="data/sentinel-py_download.log"
+CREDS=".path/to/credentials"
+LOG_FILE="data/logs/sentinel-py_download.log"
 
 # Download all Sentinel-2 summer scenes for 2019–2024
 sentinel-py s2 download-seasonally \

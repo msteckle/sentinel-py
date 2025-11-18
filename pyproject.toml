@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
-sentinel-py = "sentinel_py.cli.main:cli"
+sentinel-py = "sentinel_py.cli.main:app"
 
 [build-system]
 requires = ["hatchling"]

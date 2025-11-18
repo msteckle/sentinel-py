@@ -1,6 +1,10 @@
-import typer
+# src/sentinel_py/cli/main.py
+
 from pathlib import Path
 from typing import Optional, List
+
+import typer
+
 from sentinel_py.s2.workflows.download_s2 import download_s2_seasonal_scenes
 from sentinel_py.common.aoi import create_aoi_geojson, overlay_latlon_grid
 
@@ -9,8 +13,8 @@ s2 = typer.Typer(help="Sentinel-2 tools.")
 app.add_typer(s2, name="s2")
 
 
-@app.command("create-aoi")
-def create_aoi(
+@app.command("aoi")
+def aoi(
     xmin: float = typer.Option(..., help="Minimum longitude"),
     xmax: float = typer.Option(..., help="Maximum longitude"),
     ymin: float = typer.Option(..., help="Minimum latitude"),
@@ -18,18 +22,26 @@ def create_aoi(
     crs: str = typer.Option("EPSG:4326", help="CRS for AOI and grid"),
     out_file: Path = typer.Option("latlon_aoi.geojson", help="Output .geojson file"),
 ):
+    # Tiny bit of validation is fine here
+    if xmin >= xmax:
+        typer.secho("Error: xmin must be less than xmax", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    if ymin >= ymax:
+        typer.secho("Error: ymin must be less than ymax", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
     create_aoi_geojson(
-        xmin, 
-        xmax, 
-        ymin, 
-        ymax, 
-        crs, 
-        out_file
+        xmin=xmin,
+        ymin=ymin,
+        xmax=xmax,
+        ymax=ymax,
+        crs=crs,
+        out_path=out_file,
     )
 
 
-@app.command("create-latlon-grid")
-def create_latlon_grid(
+@app.command("grid")
+def grid(
     aoi_file: Path = typer.Option(..., exists=True, help="AOI .geojson file"),
     dx_deg: float = typer.Option(..., help="Grid cell size in degrees (longitude)"),
     dy_deg: float = typer.Option(..., help="Grid cell size in degrees (latitude)"),
@@ -39,6 +51,10 @@ def create_latlon_grid(
     fill_cell_holes: bool = typer.Option(True, help="Fill holes in grid cells"),
     out_file: Path = typer.Option("latlon_grid.geojson", help="Output .geojson file"),
 ):
+    if dx_deg <= 0 or dy_deg <= 0:
+        typer.secho("Error: dx_deg and dy_deg must be positive", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
     overlay_latlon_grid(
         aoi=aoi_file,
         cell_size_deg=(dx_deg, dy_deg),
@@ -50,8 +66,8 @@ def create_latlon_grid(
     )
 
 
-@s2.command("download-seasonally")
-def download_seasonally(
+@s2.command("download")
+def download(
     aoi: Path = typer.Option(..., exists=True, help="AOI file"),
     output: Path = typer.Option(..., help="Output directory"),
     start_year: int = typer.Option(...),
@@ -73,6 +89,10 @@ def download_seasonally(
     max_workers_files: int = 4,
     log_file: Optional[str] = None,
 ):
+    if (end_year, end_month, end_day) < (start_year, start_month, start_day):
+        typer.secho("Error: end date must be on or after start date", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
     download_s2_seasonal_scenes(
         aoi=aoi,
         output_root=output,

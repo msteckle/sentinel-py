@@ -3,6 +3,7 @@ from typing import Optional, List
 from datetime import datetime
 import logging
 import sys
+from venv import logger
 
 import typer
 from typing_extensions import Annotated
@@ -313,6 +314,98 @@ def download(
         logger=logger,
     )
 
+
+@s2.command(
+    "dn-offset",
+    help=(
+        "Determine per-band DN offsets for Sentinel-2 Level-2A products "
+        "so later temporal composites and mosaics are radiometrically consistent."
+    ),
+)
+def dn_offset(
+    s2_data_dir: Annotated[Path, typer.Option(
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        help="Directory with Sentinel-2 L2A products.",
+    )],
+    out_path: Annotated[Path, typer.Option(
+        help="Output directory for DN offset VRT files.",
+    )],
+    years: Annotated[str, typer.Option(
+        help="""Space-separated list of years in quotes. E.g., "2020 2021 2022".""")],
+    period_start: Annotated[str, typer.Option(
+        help="Start of seasonal window as MM-DD. E.g. --period-start 06-01)")],
+    period_end: Annotated[str, typer.Option(
+        help="End of seasonal window as MM-DD. E.g. --period-end 08-31)")],
+    bands: Annotated[List[str], typer.Option(
+        help="List of bands to process.",
+    )] = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"],
+    target_res_m: Annotated[int, typer.Option(
+        help="Target resolution in meters: 10, 20, or 60.",
+    )] = 20,
+    log_path: Annotated[Path, typer.Option(
+        help=f"Optional log file path. If omitted, logs are written to {DEFAULT_LOG_DIR} automatically.",
+    )] = None,
+    verbose: Annotated[bool, typer.Option(
+        help="Enable verbose logging to the console.",
+    )] = False,
+):
+    """
+    In parallel, compute per-band DN offsets for Sentinel-2 L2A products.
+    """
+
+    from sentinel_py.s2.s2_masking import (
+        get_band_paths, 
+        get_scl_mask_paths,
+        get_pb_offset_from_jp2,
+        create_pb_offset_vrt,
+    )
+
+    # Optional logging
+    if log_path is not None or verbose:
+        actual_log_path = setup_logging(log_path, verbose)
+        typer.echo(f"Logging to: {actual_log_path}")
+
+    # create a df of all band paths
+    band_paths_df = get_band_paths(
+        s2_data_dir,
+        bands,
+        target_res_m,
+        logger
+    )
+
+    # add column to df with SCL paths
+    band_paths_df["scl_path"] = band_paths_df.apply(
+        lambda row: get_scl_mask_paths(
+            s2_data_dir=s2_data_dir,
+            band_jp2_path=row["band_jp2_path"],
+            target_res_m=target_res_m,
+            logger=logger
+        ),
+        axis=1
+    )
+
+    # add column to df with DN offset values
+    band_paths_df["dn_offset"] = band_paths_df.apply(
+        lambda row: get_pb_offset_from_jp2(
+            band_jp2_path=row["band_jp2_path"],
+            scl_path=row["scl_path"],
+            logger=logger
+        ),
+        axis=1
+    )
+
+    # create the offset data using info from the dataframe
+    band_paths_df.apply(
+        lambda row: create_pb_offset_vrt(
+            band_jp2_path=row["band_jp2_path"],
+            dn_offset=row["dn_offset"],
+            out_vrt_path=out_path,
+            logger=logger
+        ),
+        axis=1
+    )
 
 if __name__ == "__main__":
     app()

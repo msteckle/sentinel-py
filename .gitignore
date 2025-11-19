@@ -12,3 +12,4 @@ wheels/
 # Data files
 data/s1
 data/s2
+data/logs

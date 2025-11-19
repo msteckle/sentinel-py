@@ -12,10 +12,7 @@ from shapely.geometry.base import BaseGeometry
 GeometryLike = Union[BaseGeometry, gpd.GeoSeries, gpd.GeoDataFrame, str, Path]
 
 def create_aoi_geojson(
-    xmin: float,
-    ymin: float,
-    xmax: float,
-    ymax: float,
+    bbox: Tuple[float, float, float, float],
     *,
     crs: str = "EPSG:4326",
     out_file: str | Path | None = None,
@@ -38,6 +35,9 @@ def create_aoi_geojson(
     gdf : geopandas.GeoDataFrame
         A GeoDataFrame containing the AOI polygon.
     """
+
+    xmin, ymin, xmax, ymax = bbox
+
     # build shapely polygon
     poly = Polygon(
         [

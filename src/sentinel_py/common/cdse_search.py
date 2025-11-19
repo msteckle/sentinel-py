@@ -1,6 +1,7 @@
 import requests
 import pandas as pd
 from shapely.geometry.base import BaseGeometry
+import logging
 
 def build_search_query(
     aoi: BaseGeometry,
@@ -22,27 +23,36 @@ def build_search_query(
         f"and OData.CSC.Intersects(area=geography'SRID=4326;{aoi_wkt}') "
         f"and ContentDate/Start gt {start_iso} and ContentDate/Start lt {end_iso}"
     )
-    return f"{catalogue_odata}/Products?$filter={filter_expr}"
+    return f"{catalogue_odata}/Products?$top=100&$filter={filter_expr}"
 
 
 def fetch_all_products(
-    base_query: str,
-    top: int = 200,
-    timeout: int = 60,
+    url: str,
+    *,
     session: requests.Session | None = None,
+    timeout: int = 60,
+    logger: logging.Logger | None = None,
 ) -> pd.DataFrame:
     """
-    Fetch all products from an OData endpoint, handling pagination.
+    Follow CDSE OData pagination and collect all products into a DataFrame.
     """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+
     sess = session or requests.Session()
-    url = f"{base_query}&$count=true&$top={top}"
+
     items: list[dict] = []
 
     while url:
+        logger.debug("Fetching page: %s", url)
         r = sess.get(url, timeout=timeout)
         r.raise_for_status()
         j = r.json()
+
         items.extend(j.get("value", []))
         url = j.get("@odata.nextLink")
+
+    if not items:
+        return pd.DataFrame()
 
     return pd.DataFrame(items)

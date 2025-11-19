@@ -58,7 +58,7 @@ def create_aoi_geojson(
     return gdf
 
 
-def _load_aoi(aoi: GeometryLike, crs: str) -> gpd.GeoDataFrame:
+def load_aoi_as_gdf(aoi: GeometryLike, crs: str) -> gpd.GeoDataFrame:
     """Normalize AOI input into a GeoDataFrame in the given CRS."""
     # load AOI of certain object types
     if isinstance(aoi, gpd.GeoDataFrame):
@@ -83,6 +83,19 @@ def _load_aoi(aoi: GeometryLike, crs: str) -> gpd.GeoDataFrame:
         gdf = gdf.to_crs(crs)
 
     return gdf
+
+
+def load_aoi_as_geom(aoi):
+    # already a shapely geometry
+    if isinstance(aoi, BaseGeometry):
+        return aoi
+    
+    # a path to a file
+    if isinstance(aoi, (str, Path)):
+        gdf = gpd.read_file(aoi)
+        return gdf.geometry.union_all()  # or geometry.iloc[0]
+
+    raise TypeError("AOI must be a Shapely geometry or path to a vector file.")
 
 
 def _remove_holes(geom: BaseGeometry) -> BaseGeometry:
@@ -146,7 +159,7 @@ def overlay_latlon_grid(
           fill_cell_holes=True)
     """
     # prep the AOI
-    gdf = _load_aoi(aoi, crs)
+    gdf = load_aoi_as_gdf(aoi, crs)
     aoi_union = gdf.union_all()  # dissolve into single geometry
     aoi_union = aoi_union.buffer(0)  # fix potential geometry issues
 

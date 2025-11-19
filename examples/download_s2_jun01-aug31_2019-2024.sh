@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Params used more than once
-GEOJSON="data/aois/toolik_aoi.geojson"
-LOGPATH="data/logs"
+# Paths
+GEOJSON="../data/aois/toolik_aoi.geojson"
+LOGPATH="../data/logs/download"
+OUTPATH="../data/s2/raw"
 
 # Set up user/password for CDSE
 # Note: you need to have an account with CDSE to download data
@@ -20,16 +21,10 @@ sentinel-py aoi \
 # Download all Sentinel-2 summer scenes for 2019–2024
 sentinel-py s2 download \
   --aoi $GEOJSON \
-  --output "data/s2" \
-  --start-year 2019 \
-  --start-month 6 \
-  --start-day 1 \
-  --end-year 2024 \
-  --end-month 8 \
-  --end-day 31 \
-  --collection-name "Sentinel-2 MSI Level-2A" \
-  --product-type "S2MSI2A" \
-  --bands B02 B03 B04 B05 B06 B07 B08 B8A B11 B12 \
+  --output $OUTPATH \
+  --years "2020 2021 2022 2023 2024" \
+  --period-start "06-01" \
+  --period-end "08-31" \
   --target-res-m 20 \
   --max-workers-files 2 \
   --log-path $LOGPATH \

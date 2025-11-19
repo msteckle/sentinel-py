@@ -1,6 +1,7 @@
+import logging
 import os
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from collections.abc import Iterable, Sequence
 
 import requests
@@ -17,86 +18,87 @@ def download_s2_targets(
     chunk_mb: int = 4,
     timeout: int = 300,
     max_workers: int = 2,
+    logger: logging.Logger | None = None,
 ) -> list[dict]:
-    """
-    Download a set of Sentinel-2 SAFE files concurrently.
-
-    Uses simple content-based caching:
-    - For each target, do a HEAD request to get Content-Length.
-    - If a local file exists and its size matches the remote size, we treat it as
-      complete and skip re-download.
-    - Downloads go to a temporary *.part file and are only moved into place on success.
-    - If the server advertises Content-Length, we verify that all bytes were written.
-
-    Returns
-    -------
-    failures : list of dict
-        A list of failures, each like:
-        { "segments": segments, "status": "error: ..." }.
-        If empty, all downloads completed successfully or were already cached.
-    """
+    if logger is None:
+        logger = logging.getLogger(__name__)
 
     output_root = Path(output_root)
     failures: list[dict] = []
 
-    # helper to get remote file size via HEAD
     def _get_remote_size(url: str) -> int | None:
-        """Return Content-Length from a HEAD request, or None if unavailable."""
         try:
             resp = session.head(url, timeout=timeout, allow_redirects=True)
-        except Exception:
+        except Exception as ex:
+            logger.warning("HEAD request failed for %s: %s", url, ex)
             return None
+
         if not resp.ok:
+            logger.warning(
+                "HEAD request for %s returned HTTP %s", url, resp.status_code
+            )
             return None
+
         cl = resp.headers.get("Content-Length")
         try:
             return int(cl) if cl is not None else None
         except (TypeError, ValueError):
+            logger.warning("Invalid Content-Length %r for %s", cl, url)
             return None
 
-    # download a single target
     def _download_one(segments: Sequence[str]) -> tuple[Sequence[str], str]:
-        # local path
         rel = os.path.join(*segments)
         outpath = output_root / rel
         outpath.parent.mkdir(parents=True, exist_ok=True)
         tmp = outpath.with_suffix(outpath.suffix + ".part")
 
-        # CDSE URL for this target
         url = scene_node_url(scene_id, *segments, list_children=False)
+        seg_str = "/".join(segments)
 
-        # skip download: if local file exists and matches remote size
+        logger.debug("Preparing download for %s (%s)", seg_str, url)
+
         remote_size = _get_remote_size(url)
         if outpath.exists() and remote_size is not None:
             local_size = outpath.stat().st_size
             if local_size == remote_size:
-                # local file appears complete; treat as cached success
+                logger.info("Cached OK: %s (size=%d)", outpath, local_size)
                 return segments, "ok"
+            else:
+                logger.info(
+                    "Re-downloading %s: local size %d != remote size %d",
+                    outpath,
+                    local_size,
+                    remote_size,
+                )
 
-        # download/redownload URL
         try:
             resp = session.get(url, stream=True, timeout=timeout)
         except Exception as ex:
+            logger.error("Request failed for %s: %s", url, ex)
             return segments, f"error: request failed ({ex})"
 
         if resp.status_code != 200:
+            logger.error("HTTP %s for %s", resp.status_code, url)
             return segments, f"error: HTTP {resp.status_code}"
 
-        # prevent impartial downloads: determine expected size
         content_length = resp.headers.get("Content-Length")
         if content_length is not None:
             try:
                 expected_bytes = int(content_length)
             except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid Content-Length %r for %s; falling back to HEAD result",
+                    content_length,
+                    url,
+                )
                 expected_bytes = remote_size
         else:
             expected_bytes = remote_size
 
-        # create fresh temp file; remove any stale .part from prior runs
         tmp.unlink(missing_ok=True)
         bytes_written = 0
+
         try:
-            # stream download to temp file
             with open(tmp, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=chunk_mb * 1024 * 1024):
                     if not chunk:
@@ -104,8 +106,13 @@ def download_s2_targets(
                     f.write(chunk)
                     bytes_written += len(chunk)
 
-            # if server told us how big the file should be, verify we got it all
             if expected_bytes is not None and bytes_written != expected_bytes:
+                logger.error(
+                    "Incomplete download for %s: expected %d bytes, got %d",
+                    url,
+                    expected_bytes,
+                    bytes_written,
+                )
                 tmp.unlink(missing_ok=True)
                 return (
                     segments,
@@ -113,21 +120,34 @@ def download_s2_targets(
                     f"got {bytes_written})",
                 )
 
-            # atomically move into place
             os.replace(tmp, outpath)
+            logger.info("Downloaded OK: %s (%d bytes)", outpath, bytes_written)
             return segments, "ok"
 
         except Exception as ex:
-            # clean up partial temp file
             tmp.unlink(missing_ok=True)
+            logger.error("Write error for %s: %s", outpath, ex)
             return segments, f"write error: {ex}"
 
-    # run downloads concurrently
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = [ex.submit(_download_one, segs) for segs in targets]
         for fut in as_completed(futs):
             segments, status = fut.result()
             if status != "ok":
+                seg_str = "/".join(segments)
+                logger.error("Failure downloading %s: %s", seg_str, status)
                 failures.append({"segments": tuple(segments), "status": status})
+
+    if failures:
+        logger.warning(
+            "Completed downloads with %d failure(s) for scene %s",
+            len(failures),
+            scene_id,
+        )
+    else:
+        logger.info(
+            "All targets downloaded or cached successfully for scene %s",
+            scene_id,
+        )
 
     return failures

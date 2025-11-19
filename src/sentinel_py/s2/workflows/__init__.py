@@ -1,1 +1,1 @@
-from .download_s2 import download_s2_seasonal_scenes
+from .download_s2 import download_s2_scenes

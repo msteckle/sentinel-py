@@ -1,5 +1,3 @@
-# src/sentinel_py/cli/main.py
-
 from pathlib import Path
 from typing import Optional, List
 from datetime import datetime
@@ -7,62 +5,86 @@ import logging
 import sys
 
 import typer
+from typing_extensions import Annotated
 
 app = typer.Typer(
     help="Sentinel data and workflow CLI.",
     no_args_is_help=True,
 )
+s1 = typer.Typer(help="Sentinel-1 download, processing, and analysis tools.")
+app.add_typer(s1, name="s1")
 s2 = typer.Typer(help="Sentinel-2 download, processing, and analysis tools.")
 app.add_typer(s2, name="s2")
+
 
 # Default directory where log files are stored if --log-file is not given
 DEFAULT_LOG_DIR = Path.home() / ".sentinel-py" / "logs"
 
-
-def setup_logging(log_file: Path | None = None, verbose: bool = False) -> Path:
+def setup_logging(log_path: Path | None = None, verbose: bool = False) -> Path:
     """
-    Configure logging to a file and (optionally verbose) console.
+    Configure logging so that the *directory or prefix* is user-defined, but
+    the log file name is automatically generated.
 
     Parameters
     ----------
-    log_file : Path or None
-        If given, log file path to write logs to.
-        If None, a timestamped log file in DEFAULT_LOG_DIR is created.
+    log_path : Path or None
+        - If None: logs go in ~/.sentinel-py/logs/sentinel_py_<timestamp>.log
+        - If a directory: the file is created inside it
+        - If a file-like path: acts as a prefix; timestamp and .log are appended
     verbose : bool
-        If True, console logs at DEBUG. Otherwise, INFO.
+        True -> console logs at DEBUG level.
 
     Returns
     -------
     Path
-        The resolved log file path in use.
+        Fully resolved path to the created log file.
     """
-    DEFAULT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    if log_file is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file = DEFAULT_LOG_DIR / f"sentinel_py_{timestamp}.log"
+    # Determine final log file path
+    if log_path is None:
+        # Default location
+        log_dir = DEFAULT_LOG_DIR
+        log_dir.mkdir(parents=True, exist_ok=True)
+        logfile = log_dir / f"sentinel_py_{timestamp}.log"
 
+    else:
+        # Normalize
+        log_path = Path(log_path)
+
+        if log_path.exists() and log_path.is_dir():
+            # User gave a directory → use it
+            log_path.mkdir(parents=True, exist_ok=True)
+            logfile = log_path / f"sentinel_py_{timestamp}.log"
+
+        else:
+            # User gave a prefix (e.g., logs/myrun)
+            parent = log_path.parent
+            if parent != Path('.'):
+                parent.mkdir(parents=True, exist_ok=True)
+            prefix = log_path.name
+            logfile = parent / f"{prefix}_{timestamp}.log"
+
+    # Configure handlers
     handlers: list[logging.Handler] = []
 
-    # Console handler (stderr)
+    # Console handler
     console = logging.StreamHandler(sys.stderr)
     console.setLevel(logging.DEBUG if verbose else logging.INFO)
     handlers.append(console)
 
     # File handler
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setLevel(logging.DEBUG)  # full detail to file
+    file_handler = logging.FileHandler(logfile)
+    file_handler.setLevel(logging.DEBUG)
     handlers.append(file_handler)
 
-    # force=True so multiple invocations (e.g. tests) reset handlers cleanly
     logging.basicConfig(
         level=logging.DEBUG,
         handlers=handlers,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         force=True,
     )
-
-    return log_file
+    return logfile
 
 
 @app.command(
@@ -82,7 +104,7 @@ def aoi(
     ),
     crs: str = typer.Option("EPSG:4326", help="CRS for AOI."),
     out_file: Path = typer.Option("latlon_aoi.geojson", help="Output .geojson file."),
-    log_file: Optional[Path] = typer.Option(
+    log_path: Optional[Path] = typer.Option(
         None,
         help=(
             "Optional log file path. If omitted and --verbose is used, logs are "
@@ -102,8 +124,8 @@ def aoi(
     from sentinel_py.common.aoi import create_aoi_geojson
 
     # Optional logging: enabled only if user requests file or verbose output
-    if log_file is not None or verbose:
-        actual_log_path = setup_logging(log_file, verbose)
+    if log_path is not None or verbose:
+        actual_log_path = setup_logging(log_path, verbose)
         typer.echo(f"Logging to: {actual_log_path}")
 
     # Parse user-provided bbox string: accept commas OR spaces
@@ -165,7 +187,7 @@ def grid(
     fill_aoi_holes: bool = typer.Option(True, help="Fill holes in AOI geometry."),
     fill_cell_holes: bool = typer.Option(True, help="Fill holes in grid cells."),
     out_file: Path = typer.Option("latlon_grid.geojson", help="Output .geojson file."),
-    log_file: Optional[Path] = typer.Option(
+    log_path: Optional[Path] = typer.Option(
         None,
         help=(
             "Optional log file path. If omitted and --verbose is used, logs are "
@@ -193,8 +215,8 @@ def grid(
         raise typer.Exit(code=1)
 
     # Optional logging
-    if log_file is not None or verbose:
-        actual_log_path = setup_logging(log_file, verbose)
+    if log_path is not None or verbose:
+        actual_log_path = setup_logging(log_path, verbose)
         typer.echo(f"Logging to: {actual_log_path}")
 
     overlay_latlon_grid(
@@ -216,67 +238,77 @@ def grid(
     ),
 )
 def download(
-    aoi: Path = typer.Option(..., exists=True, help="AOI file (GeoJSON, shapefile, etc.)."),
-    output: Path = typer.Option(..., help="Output directory for downloaded data."),
-    years: List[int] = typer.Option(
-        ...,
-        help="List of year(s) to download (e.g. --years 2020 2021 2022).",
-    ),
-    period_start: tuple[int, int] = typer.Option(
-        ...,
-        help="(month, day) for the start of the seasonal window (e.g. (6, 1) for June 1).",
-    ),
-    period_end: tuple[int, int] = typer.Option(
-        ...,
-        help="(month, day) for the end of the seasonal window (e.g. (8, 31) for Aug 31).",
-    ),
-    collection_name: str = "Sentinel-2 MSI Level-2A",
-    product_type: str = "S2MSI2A",
-    bands: List[str] = typer.Option(
-        ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"],
-        help="Bands to download.",
-    ),
-    target_res_m: List[int] = typer.Option(
-        [10, 20, 60],
-        help="Target resolution in meters for downloaded bands.",
-    ),
-    credentials: Optional[str] = None,
-    max_workers_files: int = 4,
-    log_path: Optional[Path] = typer.Option(
-        None,
-        help=(
-            "Optional log file path. If omitted, logs are written to "
-            f"{DEFAULT_LOG_DIR} automatically."
-        ),
-    ),
-    verbose: bool = typer.Option(
-        False,
-        "--verbose",
-        "-v",
-        help="Enable verbose logging to the console.",
-    ),
+    aoi: Annotated[Path, typer.Option(
+        help="AOI file (GeoJSON, shapefile, etc.).")],
+    output: Annotated[Path, typer.Option(
+        help="Output directory for downloaded data.")],
+    years: Annotated[str, typer.Option(
+        help="""Space-separated list of years in quotes. E.g., "2020 2021 2022".""")],
+    period_start: Annotated[str, typer.Option(
+        help="Start of seasonal window as MM-DD. E.g. --period-start 06-01)")],
+    period_end: Annotated[str, typer.Option(
+        help="End of seasonal window as MM-DD. E.g. --period-end 08-31)")],
+    collection_name: Annotated[str, typer.Option(
+        help="CDSE collection name.")] = "SENTINEL-2",
+    product_type: Annotated[str, typer.Option(
+        help="Product type within the collection.")] = "S2MSI2A",
+    bands: Annotated[List[str], typer.Option(
+        help="List of bands to download.")] = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"],
+    include_scl: Annotated[bool, typer.Option(
+        help="Include the SCL band in the download.")] = True,
+    target_res_m: Annotated[int, typer.Option(
+        help="Target resolution in meters: 10, 20, or 60.")] = 20,
+    max_workers_files: Annotated[int, typer.Option(
+        help="Maximum number of worker threads for file downloads.")] = 4,
+    log_path: Annotated[Path, typer.Option(
+        help=f"Optional log file path. If omitted, logs are written to {DEFAULT_LOG_DIR} automatically.")] = None,
+    verbose: Annotated[bool, typer.Option(
+        help="Enable verbose logging to the console.")] = False,
 ):
     """
     Download Sentinel-2 scenes for a seasonal window over an AOI.
     """
-    from sentinel_py.s2.workflows.download_s2 import download_s2_seasonal_scenes
+    from sentinel_py.s2.workflows.download_s2 import download_s2_scenes
+
+    # Unpack years from space-separated string
+    try:
+        years = [int(y) for y in years.split()]
+    except ValueError:
+        typer.secho(
+            """Error: --years must be space-separated integers, e.g. --years "2020 2021 2022".""",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    
+    # Unpack month/day from period_start and period_end
+    try:
+        smonth, sday = [int(part) for part in period_start.split("-")]
+        emonth, eday = [int(part) for part in period_end.split("-")]
+    except ValueError:
+        typer.secho(
+            """Error: --period-start and --period-end must be in MM-DD format, e.g. --period-start 06-01.""",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
 
     # Always log for downloads (they are longer and more complex)
     actual_log_path = setup_logging(log_path, verbose)
     typer.echo(f"Logging to: {actual_log_path}")
     
     logger = logging.getLogger("sentinel_py.s2.workflows.download_s2")
-    download_s2_seasonal_scenes(
-        aoi=aoi,
+    download_s2_scenes(
+        aoi_path=aoi,
         output_root=output,
         years=years,
-        period_start=period_start,
-        period_end=period_end,
+        period_start=(smonth, sday),
+        period_end=(emonth, eday),
         collection_name=collection_name,
         product_type=product_type,
         bands=bands,
         target_res_m=target_res_m,
-        credentials=credentials,
+        include_scl=include_scl,
         max_workers_files=max_workers_files,
         logger=logger,
     )

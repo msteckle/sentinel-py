@@ -164,6 +164,97 @@ def choose_best_resolution(
     return min(avail)
 
 
+def _select_band_file(
+    band: str,
+    target_res_m: int,
+    nodes_by_res: dict[int, list[dict]],
+    safe_root: str,
+    granule_dir: str,
+    targets: list[tuple[str, ...]],
+) -> int | None:
+    """
+    Find the best-resolution file for a band (including SCL) and append it to targets.
+
+    Returns the chosen resolution (in meters), or None if not found.
+    """
+    # 1) Which resolutions even have this band?
+    available_for_band: list[int] = []
+    for res, nodes in nodes_by_res.items():
+        suffix = f"_{band}_{res}m.jp2"
+        if any(n.get("Name", "").endswith(suffix) for n in nodes):
+            available_for_band.append(res)
+
+    if not available_for_band:
+        return None
+
+    # 2) Choose best resolution given the target
+    chosen_res = choose_best_resolution(target_res_m, available_for_band)
+
+    # 3) Find the actual node at that resolution
+    nodes = nodes_by_res[chosen_res]
+    suffix = f"_{band}_{chosen_res}m.jp2"
+    hit = next(
+        (n for n in nodes if n.get("Name", "").endswith(suffix)),
+        None,
+    )
+    if hit:
+        targets.append(
+            (
+                safe_root,
+                "GRANULE",
+                granule_dir,
+                "IMG_DATA",
+                f"R{chosen_res}m",
+                hit["Name"],
+            )
+        )
+
+    return chosen_res
+
+
+def find_granule_directory(
+    session: requests.Session,
+    scene_id: str,
+    safe_root: str,
+    tile: str | None,
+) -> str | None:
+    """
+    Find the L2A granule directory inside SAFE/GRANULE.
+
+    We intentionally ignore quicklook JPEGs and other files that live
+    at the SAFE root and only look under the GRANULE directory.
+    """
+    # children directly under SAFE root
+    root_children = list_scene_children(session, scene_id, safe_root)
+    has_granule_folder = any(c.get("Name", "") == "GRANULE" for c in root_children)
+    if not has_granule_folder:
+        return None
+
+    # children under SAFE/GRANULE
+    granule_children = list_scene_children(
+        session, scene_id, safe_root, "GRANULE"
+    )
+
+    # prefer L2A_* that also contains the tile
+    if tile:
+        for child in granule_children:
+            name = child.get("Name", "")
+            if name.startswith("L2A_") and tile in name:
+                return name
+
+    # otherwise, any L2A_* granule will do
+    for child in granule_children:
+        name = child.get("Name", "")
+        if name.startswith("L2A_"):
+            return name
+
+    # fallback: first child if anything exists
+    if granule_children:
+        return granule_children[0].get("Name", "")
+
+    return None
+
+
 def select_s2_targets(
     session: requests.Session,
     scene_id: str,
@@ -172,6 +263,7 @@ def select_s2_targets(
     target_res_m: int,
     *,
     possible_resolutions: Iterable[int] = (10, 20, 60),
+    include_scl: bool = False,
 ) -> tuple[list[tuple[str, ...]], str, str | None, dict[str, int | None]]:
     """
     Select band files for a Sentinel-2 scene at or above the requested resolution.
@@ -185,41 +277,36 @@ def select_s2_targets(
     scene_name : str
         Human-readable scene name, used to parse the MGRS tile ID.
     bands : iterable of str
-        Band IDs to fetch (e.g., ["B02", "B03", "B04"]).
+        Reflectance band IDs to fetch (e.g., ["B02", "B03", "B04", "B08A"]).
     target_res_m : int
         Desired ground sampling distance in meters (e.g., 10, 20, 60).
     possible_resolutions : iterable of int, optional
-        All resolutions that may exist in the SAFE archive (default (10,20,60)).
+        All resolutions that may exist in the SAFE archive (default (10, 20, 60)).
+    include_scl : bool, optional
+        If True, also download the SCL classification band at its best available
+        resolution (typically 20 m).
 
     Returns
     -------
     targets : list[tuple[str, ...]]
-        List of node path segments for each selected file (SAFE root, GRANULE, IMG_DATA, Rxxm, filename).
+        List of node path segments for each selected file
+        (SAFE root, GRANULE, IMG_DATA, Rxxm, filename).
     safe_root : str
         Name of the SAFE root directory.
     granule_dir : str | None
         Name of the selected GRANULE directory, if found.
     band_res_map : dict[str, int | None]
-        Mapping of band ID -> chosen resolution (in meters), or None if not found.
+        Mapping of band ID -> chosen resolution (in meters),
+        including "SCL" if requested, or None if not found.
     """
     # get the SAFE root directory name
     safe_root = find_scene_safe_directory(session, scene_id)
-
-    # choose GRANULE directory within SAFE directory (by tile or fallback)
     tile = extract_tile_from_name(scene_name)
-    granules = list_scene_children(session, scene_id, safe_root)
-    granule_dir: str | None = None
-    for g in granules:
-        gname = g.get("Name", "")
-        if (tile and tile in gname) or gname.startswith("L2A_"):
-            granule_dir = gname
-            break
-    if not granule_dir and granules:
-        granule_dir = granules[0].get("Name", "")
+    granule_dir = find_granule_directory(session, scene_id, safe_root, tile)
 
-    # gather target file paths for download
     targets: list[tuple[str, ...]] = []
     band_res_map: dict[str, int | None] = {}
+
     if granule_dir:
         # get all possible band files organized by resolution
         nodes_by_res: dict[int, list[dict]] = {}
@@ -237,44 +324,43 @@ def select_s2_targets(
             except requests.HTTPError:
                 nodes_by_res[res] = []
 
-        # for each user-desired band, select the best available resolution
+        # reflectance bands
         for band in bands:
-            # determine which resolutions have this band available
-            available_for_band: list[int] = []
-            for res, nodes in nodes_by_res.items():
-                suffix = f"_{band}_{res}m.jp2"
-                if any(n.get("Name", "").endswith(suffix) for n in nodes):
-                    available_for_band.append(res)
-            if not available_for_band:
-                band_res_map[band] = None
-                continue
-
-            # select the best resolution for this band
-            chosen_res = choose_best_resolution(target_res_m, available_for_band)
+            chosen_res = _select_band_file(
+                band,
+                target_res_m,
+                nodes_by_res,
+                safe_root,
+                granule_dir,
+                targets,
+            )
             band_res_map[band] = chosen_res
 
-            # get the corresponding file node
-            nodes = nodes_by_res[chosen_res]
-            suffix = f"_{band}_{chosen_res}m.jp2"
-            hit = next(
-                (n for n in nodes if n.get("Name", "").endswith(suffix)),
-                None,
+        # SCL band (classification), if requested
+        if include_scl:
+            scl_res = _select_band_file(
+                "SCL",
+                target_res_m,  # if only 20m exists, choose_best_resolution() -> 20
+                nodes_by_res,
+                safe_root,
+                granule_dir,
+                targets,
             )
-            if hit:
-                targets.append(
-                    (
-                        safe_root,
-                        "GRANULE",
-                        granule_dir,
-                        "IMG_DATA",
-                        f"R{chosen_res}m",
-                        hit["Name"],
-                    )
-                )
+            band_res_map["SCL"] = scl_res
 
-        # always include band-level XML if we have a granule
-        targets.append((safe_root, "GRANULE", granule_dir, "MTD_TL.xml"))
+        # OPTIONAL: only include tile-level XML if it actually exists
+        try:
+            granule_children = list_scene_children(
+                session, scene_id, safe_root, "GRANULE", granule_dir
+            )
+        except requests.HTTPError:
+            granule_children = []
 
-    # also always include scene-level XML
+        if any(c.get("Name", "") == "MTD_TL.xml" for c in granule_children):
+            targets.append((safe_root, "GRANULE", granule_dir, "MTD_TL.xml"))
+
+    # always include scene-level XML
     targets.append((safe_root, "MTD_MSIL2A.xml"))
+
     return targets, safe_root, granule_dir, band_res_map
+

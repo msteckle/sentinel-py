@@ -1,6 +1,6 @@
-# sentinel_py/s2/workflows.py
-
-from __future__ import annotations
+"""
+Functions used to download Sentinel-2 scenes from CDSE over (optional) seasonal windows.
+"""
 
 import logging
 from datetime import date
@@ -9,18 +9,19 @@ from typing import Iterable
 import calendar
 
 import pandas as pd
+import geopandas as gpd
 from shapely.geometry.base import BaseGeometry
 
-from sentinel_py.common.utils import seasonal_date_ranges
-from sentinel_py.common.cdse_search import build_search_query, fetch_all_products
 from sentinel_py.common.cdse_auth import AutoRefreshSession
+from sentinel_py.common.cdse_search import build_search_query, fetch_all_products
 from sentinel_py.s2.cdse_s2_nodes import select_s2_targets
 from sentinel_py.s2.cdse_s2_download import download_s2_targets
+from sentinel_py.common.aoi import load_aoi_as_geom
 
 
-CDSE_CATALOGUE = "https://cdse-catalogue.dataspace.copernicus.eu/odata/v1/Products"
+CDSE_CATALOGUE = "https://catalogue.dataspace.copernicus.eu/odata/v1"
 
-def safe_date_with_adjust(
+def _safe_date_with_adjust(
     year: int, 
     month: int, 
     day: int, 
@@ -52,8 +53,8 @@ def safe_date_with_adjust(
     return date(year, month, last_day)
 
 
-def download_s2_seasonal_scenes(
-    aoi: BaseGeometry,
+def download_s2_scenes(
+    aoi_path: Path,
     output_root: Path,
     *,
     years: Iterable[int],
@@ -63,47 +64,40 @@ def download_s2_seasonal_scenes(
     product_type: str,
     bands: Iterable[str],
     target_res_m: int,
-    credentials: dict | None = None,
+    include_scl: bool = True,
     max_workers_files: int = 4,
     logger: logging.Logger | None = None,
 ) -> pd.DataFrame:
     """
     Download Sentinel-2 scenes for a seasonal window repeated over one or more years.
 
-    Parameters
-    ----------
-    years : iterable of int
-        Year(s) to download. For a single year, pass [2020]. Otherwise,
-        supply a range: (2020, 2021).
-    period_start : (int, int)
-        (month, day) for the start of the seasonal window (e.g. (6, 1) for June 1).
-    period_end : (int, int)
-        (month, day) for the end of the seasonal window (e.g. (8, 31) for Aug 31).
-        Assumed to be within the same calendar year as period_start.
+    Authentication is pulled from environment variables via cdse_auth._fill_creds:
+      - CDSE_USERNAME
+      - CDSE_PASSWORD or CDSE_PASSWORD_FILE
     """
-    # establish logger
     if logger is None:
         logger = logging.getLogger(__name__)
-    if credentials is None:
-        credentials = {}
 
-    # ensure years is a list and has at least one year
+    # Read the AOI and convert to shapely geometry
+    aoi = load_aoi_as_geom(aoi_path)
+    if aoi is None:
+        raise ValueError(f"Failed to load AOI from {aoi_path}")
+
+    # Ensure list of years has at least one entry
     years = list(years)
     if not years:
         raise ValueError("years must contain at least one year")
 
-    # build date windows for each year
+    # Build date windows, with “warn and adjust” behavior
     smonth, sday = period_start
     emonth, eday = period_end
-    date_windows = []
+    date_windows: list[tuple[date, date]] = []
     for year in years:
-        # adjust month end day if necessary
-        start = safe_date_with_adjust(year, smonth, sday, logger)
-        end = safe_date_with_adjust(year, emonth, eday, logger)
-        # ensure end is not before start
+        start = _safe_date_with_adjust(year, smonth, sday, logger)
+        end = _safe_date_with_adjust(year, emonth, eday, logger)
         if end < start:
             raise ValueError(
-                f"Period_end {end} is before period_start {start} in year {year}."
+                f"period_end {end} is before period_start {start} in year {year}."
             )
         date_windows.append((start, end))
 
@@ -116,12 +110,17 @@ def download_s2_seasonal_scenes(
         eday,
     )
 
-    # convert to ISO strings for each date range
-    iso_windows = (
-        [(sdate.isoformat(), edate.isoformat()) for sdate, edate in date_windows]
-    )
+    iso_windows = [
+        (f"{s.isoformat()}T00:00:00.000Z", f"{e.isoformat()}T23:59:59.999Z")
+        for s, e in date_windows
+    ]
 
-    # query and fetch products for each date window
+    # Start with empty creds; cdse_auth._fill_creds will pull from env.
+    credentials: dict = {}
+    token_cache: dict = {}
+    results: list[dict] = []
+
+    # Query products for each window
     all_rows: list[pd.DataFrame] = []
     for start_iso, end_iso in iso_windows:
         query_url = build_search_query(
@@ -134,24 +133,34 @@ def download_s2_seasonal_scenes(
         )
         logger.info("Querying CDSE: %s", query_url)
 
-        # request products for this date window
         df = fetch_all_products(query_url)
+        if df.empty:
+            logger.warning(
+                "No products returned for window %s → %s", start_iso, end_iso
+            )
         df = df.assign(window_start=start_iso, window_end=end_iso)
         all_rows.append(df)
 
-    # check if any products found
     if not all_rows:
         logger.warning("No products found for given AOI and date windows.")
         return pd.DataFrame()
-    products = pd.concat(all_rows, ignore_index=True)
 
-    token_cache: dict = {}
+    products = pd.concat(all_rows, ignore_index=True)
+    if products.empty:
+        logger.warning("Products DataFrame is empty after concatenation.")
+        return pd.DataFrame()
+
+    # Some logging about the products found
+    logger.info("Total products fetched: %d", len(products))
+    logger.info("Example columns: %s", products.columns.tolist()[:10])
+    logger.info("First 3 names: %s", products["Name"].head(3).to_list())
+
+    # Open a CDSE session that auto-refreshes tokens.
     with AutoRefreshSession(
         credentials=credentials,
         token_cache=token_cache,
         logger=logger,
     ) as sess:
-        results: list[dict] = []
         for _, row in products.iterrows():
             scene_id = row.get("Id")
             scene_name = row.get("Name")
@@ -169,6 +178,7 @@ def download_s2_seasonal_scenes(
                 scene_name=str(scene_name),
                 bands=bands,
                 target_res_m=target_res_m,
+                include_scl=include_scl,
             )
 
             logger.info(
@@ -178,16 +188,15 @@ def download_s2_seasonal_scenes(
                 len(targets),
             )
 
-            # download in parallel
             failures = download_s2_targets(
                 session=sess,
                 scene_id=str(scene_id),
                 targets=targets,
                 output_root=output_root,
                 max_workers=max_workers_files,
+                logger=logger,
             )
 
-            # log any failures
             if failures:
                 logger.warning(
                     "Scene %s (%s): %d target(s) failed to download",
@@ -195,6 +204,12 @@ def download_s2_seasonal_scenes(
                     scene_id,
                     len(failures),
                 )
+                for f in failures:
+                    logger.debug(
+                        "  Failed target %s: %s",
+                        "/".join(f["segments"]),
+                        f["status"],
+                    )
 
             results.append(
                 {

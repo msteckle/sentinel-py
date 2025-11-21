@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Mapping
+from osgeo import gdal
 
 from lxml import etree
 
@@ -62,3 +63,21 @@ def add_python_pixelfunc_to_vrt(
 
     # Write back in place
     tree.write(str(vrt_path), pretty_print=True, xml_declaration=True, encoding="UTF-8")
+
+
+def gdaltranslate(
+    src_file: Path,
+    dst_file: Path,
+    *,
+    options: list[str] | None = None,
+) -> None:
+    """
+    Python wrapper around gdal.Translate.
+    """
+
+    gdal.UseExceptions()
+    gdal.SetConfigOption("GDAL_VRT_ENABLE_PYTHON", "YES")
+    ds = gdal.Open(str(src_file))
+    if ds is None:
+        raise RuntimeError(f"Failed to open {src_file}")
+    gdal.Translate(str(dst_file), ds, options=options or [])

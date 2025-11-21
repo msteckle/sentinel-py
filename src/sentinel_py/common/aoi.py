@@ -15,7 +15,7 @@ def create_aoi_geojson(
     bbox: Tuple[float, float, float, float],
     *,
     crs: str = "EPSG:4326",
-    out_file: str | Path | None = None,
+    output_file: str | Path | None = None,
 ) -> gpd.GeoDataFrame:
     """
     Create an AOI polygon from bounding-box coordinates and optionally
@@ -50,10 +50,10 @@ def create_aoi_geojson(
     gdf = gpd.GeoDataFrame({"name": ["AOI"], "geometry": [poly]}, crs=crs)
 
     # export to GeoJSON if requested
-    if out_file is not None:
-        out_file = Path(out_file)
-        out_file.parent.mkdir(parents=True, exist_ok=True)
-        gdf.to_file(out_file, driver="GeoJSON")
+    if output_file is not None:
+        output_file = Path(output_file)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        gdf.to_file(output_file, driver="GeoJSON")
 
     return gdf
 

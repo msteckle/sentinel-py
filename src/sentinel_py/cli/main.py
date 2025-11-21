@@ -1,13 +1,15 @@
 from pathlib import Path
 from typing import Optional, List
-from datetime import datetime
+import datetime as dt
 import logging
 import sys
 from venv import logger
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import typer
 from typing_extensions import Annotated
 
+# Set up main app and subcommands
 app = typer.Typer(
     help="Sentinel data and workflow CLI.",
     no_args_is_help=True,
@@ -40,7 +42,7 @@ def setup_logging(log_path: Path | None = None, verbose: bool = False) -> Path:
     Path
         Fully resolved path to the created log file.
     """
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # Determine final log file path
     if log_path is None:
@@ -104,7 +106,7 @@ def aoi(
         ),
     ),
     crs: str = typer.Option("EPSG:4326", help="CRS for AOI."),
-    out_file: Path = typer.Option("latlon_aoi.geojson", help="Output .geojson file."),
+    output_file: Path = typer.Option("latlon_aoi.geojson", help="Output .geojson file."),
     log_path: Optional[Path] = typer.Option(
         None,
         help=(
@@ -168,7 +170,7 @@ def aoi(
     create_aoi_geojson(
         bbox=(xmin, ymin, xmax, ymax),
         crs=crs,
-        out_file=out_file,
+        out_file=output_file,
     )
 
 
@@ -231,6 +233,36 @@ def grid(
     )
 
 
+@app.command(
+    "translate",
+    help=(
+        "Wrapper around gdal.Translate to convert raster files to different formats. " \
+        "E.g., convert VRT to GeoTIFF."
+    ),
+)
+def translate(
+    src_file: Annotated[Path, typer.Option(
+        help="Source raster file path.")],
+    dst_file: Annotated[Path, typer.Option(
+        help="Destination raster file path.")],
+    options: Annotated[List[str], typer.Option(
+        help=(
+            "List of gdal.Translate options as strings. "
+            "E.g., --options '-of VRT' '-co COMPRESS=LZW'"
+        ))] | None = None,
+):
+    """
+    GDAL Translate with Python PixelFunction support enabled.
+    """
+    from sentinel_py.common.gdal import gdaltranslate
+
+    gdaltranslate(
+        src_file=src_file,
+        dst_file=dst_file,
+        options=options,
+    )
+
+
 @s2.command(
     "download",
     help=(
@@ -239,27 +271,27 @@ def grid(
     ),
 )
 def download(
-    aoi: Annotated[Path, typer.Option(
+    input_aoi: Annotated[Path, typer.Option(
         help="AOI file (GeoJSON, shapefile, etc.).")],
-    output: Annotated[Path, typer.Option(
+    output_dir: Annotated[Path, typer.Option(
         help="Output directory for downloaded data.")],
     years: Annotated[str, typer.Option(
         help="""Space-separated list of years in quotes. E.g., "2020 2021 2022".""")],
-    period_start: Annotated[str, typer.Option(
+    speriod: Annotated[str, typer.Option(
         help="Start of seasonal window as MM-DD. E.g. --period-start 06-01)")],
-    period_end: Annotated[str, typer.Option(
+    eperiod: Annotated[str, typer.Option(
         help="End of seasonal window as MM-DD. E.g. --period-end 08-31)")],
-    collection_name: Annotated[str, typer.Option(
+    collection: Annotated[str, typer.Option(
         help="CDSE collection name.")] = "SENTINEL-2",
-    product_type: Annotated[str, typer.Option(
+    product: Annotated[str, typer.Option(
         help="Product type within the collection.")] = "S2MSI2A",
     bands: Annotated[List[str], typer.Option(
         help="List of bands to download.")] = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"],
     include_scl: Annotated[bool, typer.Option(
         help="Include the SCL band in the download.")] = True,
-    target_res_m: Annotated[int, typer.Option(
+    res: Annotated[int, typer.Option(
         help="Target resolution in meters: 10, 20, or 60.")] = 20,
-    max_workers_files: Annotated[int, typer.Option(
+    max_workers: Annotated[int, typer.Option(
         help="Maximum number of worker threads for file downloads.")] = 4,
     log_path: Annotated[Path, typer.Option(
         help=f"Optional log file path. If omitted, logs are written to {DEFAULT_LOG_DIR} automatically.")] = None,
@@ -284,11 +316,11 @@ def download(
     
     # Unpack month/day from period_start and period_end
     try:
-        smonth, sday = [int(part) for part in period_start.split("-")]
-        emonth, eday = [int(part) for part in period_end.split("-")]
+        smonth, sday = [int(part) for part in speriod.split("-")]
+        emonth, eday = [int(part) for part in eperiod.split("-")]
     except ValueError:
         typer.secho(
-            """Error: --period-start and --period-end must be in MM-DD format, e.g. --period-start 06-01.""",
+            """Error: --speriod and --eperiod must be in MM-DD format, e.g. --speriod 06-01.""",
             fg=typer.colors.RED,
             err=True,
         )
@@ -300,19 +332,42 @@ def download(
     
     logger = logging.getLogger("sentinel_py.s2.workflows.download_s2")
     download_s2_scenes(
-        aoi_path=aoi,
-        output_root=output,
+        aoi_path=input_aoi,
+        output_root=output_dir,
         years=years,
         period_start=(smonth, sday),
         period_end=(emonth, eday),
-        collection_name=collection_name,
-        product_type=product_type,
+        collection_name=collection,
+        product_type=product,
         bands=bands,
-        target_res_m=target_res_m,
+        target_res_m=res,
         include_scl=include_scl,
-        max_workers_files=max_workers_files,
+        max_workers_files=max_workers,
         logger=logger,
     )
+
+
+def _process_one_band(
+    band_path: str,
+    dn_offset: int,
+    out_dir: str,
+    dst_nodata: int,
+) -> str:
+    """
+    Worker used in ProcessPoolExecutor.
+    Uses only simple, picklable arguments.
+    """
+    from sentinel_py.s2.s2_masking import create_pb_offset_vrt
+    band_p = Path(band_path)
+    out_d = Path(out_dir)
+    vrt = create_pb_offset_vrt(
+        band_jp2_path=band_p,
+        dn_offset=dn_offset,
+        out_vrt_dir=out_d,
+        dst_nodata=dst_nodata,
+        logger=None,
+    )
+    return str(vrt)
 
 
 @s2.command(
@@ -323,89 +378,126 @@ def download(
     ),
 )
 def dn_offset(
-    s2_data_dir: Annotated[Path, typer.Option(
+    input_dir: Annotated[Path, typer.Option(
         exists=True,
         file_okay=False,
         dir_okay=True,
         help="Directory with Sentinel-2 L2A products.",
     )],
-    out_path: Annotated[Path, typer.Option(
-        help="Output directory for DN offset VRT files.",
-    )],
+    output_dir: Annotated[Path, typer.Option(
+        help="Output directory for DN offset VRT files.")],
     years: Annotated[str, typer.Option(
-        help="""Space-separated list of years in quotes. E.g., "2020 2021 2022".""")],
-    period_start: Annotated[str, typer.Option(
-        help="Start of seasonal window as MM-DD. E.g. --period-start 06-01)")],
-    period_end: Annotated[str, typer.Option(
-        help="End of seasonal window as MM-DD. E.g. --period-end 08-31)")],
+        help='Space-separated list of years in quotes. E.g., "2020 2021 2022".')],
+    speriod: Annotated[str, typer.Option(
+        help="Start of seasonal window as MM-DD. E.g. --speriod 06-01")],
+    eperiod: Annotated[str, typer.Option(
+        help="End of seasonal window as MM-DD. E.g. --eperiod 08-31")],
     bands: Annotated[List[str], typer.Option(
-        help="List of bands to process.",
-    )] = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"],
-    target_res_m: Annotated[int, typer.Option(
-        help="Target resolution in meters: 10, 20, or 60.",
-    )] = 20,
-    log_path: Annotated[Path, typer.Option(
-        help=f"Optional log file path. If omitted, logs are written to {DEFAULT_LOG_DIR} automatically.",
-    )] = None,
+        help="List of bands to process.")] = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"],
+    res: Annotated[int, typer.Option(
+        help="Target resolution in meters: 10, 20, or 60.")] = 20,
+    log_path: Annotated[Path | None, typer.Option(
+        help="Optional log file path. If omitted, default logging config is used.")] = None,
     verbose: Annotated[bool, typer.Option(
-        help="Enable verbose logging to the console.",
-    )] = False,
+        help="Enable verbose logging to the console.")] = False,
+    n_workers: Annotated[int, typer.Option(
+        help="Number of parallel workers.")] = 4,
+    dst_nodata: Annotated[int, typer.Option(
+        help="Nodata value to write into PB-offset VRTs.")] = 65535,
 ):
     """
-    In parallel, compute per-band DN offsets for Sentinel-2 L2A products.
+    In parallel, compute per-band DN offsets for Sentinel-2 L2A products
+    and write PB-offset VRTs.
     """
-
+    from sentinel_py.common.utils import parse_years
     from sentinel_py.s2.s2_masking import (
         get_band_paths, 
-        get_scl_mask_paths,
-        get_pb_offset_from_jp2,
-        create_pb_offset_vrt,
+        get_pb_offset_from_jp2, 
+        create_pb_offset_vrt
     )
 
-    # Optional logging
+    # Set up logging if requested
     if log_path is not None or verbose:
         actual_log_path = setup_logging(log_path, verbose)
         typer.echo(f"Logging to: {actual_log_path}")
+    logger = logging.getLogger(__name__)
 
-    # create a df of all band paths
+    # Ensure output directory exists
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Parse years and seasonal window
+    years_set = parse_years(years)
+    try:
+        start_month, start_day = map(int, speriod.split("-"))
+        end_month, end_day = map(int, eperiod.split("-"))
+    except Exception as exc:
+        raise typer.BadParameter(
+            f"Could not parse period_start/period_end as MM-DD: {speriod}, {eperiod}"
+        ) from exc
+    start_md = (start_month, start_day)
+    end_md = (end_month, end_day)
+
+    # get all jp2 band paths
     band_paths_df = get_band_paths(
-        s2_data_dir,
+        input_dir,
         bands,
-        target_res_m,
-        logger
+        res,
+        years=years_set,
+        period_start=start_md,
+        period_end=end_md,
+        logger=logger,
     )
 
-    # add column to df with SCL paths
-    band_paths_df["scl_path"] = band_paths_df.apply(
-        lambda row: get_scl_mask_paths(
-            s2_data_dir=s2_data_dir,
-            band_jp2_path=row["band_jp2_path"],
-            target_res_m=target_res_m,
-            logger=logger
-        ),
-        axis=1
+    # Compute DN offsets for each band
+    band_paths_df["dn_offset"] = band_paths_df["band_jp2_path"].apply(
+        lambda p: get_pb_offset_from_jp2(Path(p), logger=logger)
     )
 
-    # add column to df with DN offset values
-    band_paths_df["dn_offset"] = band_paths_df.apply(
-        lambda row: get_pb_offset_from_jp2(
-            band_jp2_path=row["band_jp2_path"],
-            scl_path=row["scl_path"],
-            logger=logger
-        ),
-        axis=1
-    )
+    # In parallel, create PB-offset VRTs
+    tasks = [
+        (str(Path(row["band_jp2_path"])), int(row["dn_offset"]))
+        for _, row in band_paths_df.iterrows()
+    ]
+    if logger:
+        logger.info(
+            f"Starting PB-offset VRT creation for {len(tasks)} bands "
+            f"using {n_workers} workers. Output dir: {output_dir}"
+        )
 
-    # create the offset data using info from the dataframe
-    band_paths_df.apply(
-        lambda row: create_pb_offset_vrt(
-            band_jp2_path=row["band_jp2_path"],
-            dn_offset=row["dn_offset"],
-            out_vrt_path=out_path,
-            logger=logger
-        ),
-        axis=1
-    )
+    # Assign tasks to workers and collects failures
+    failures: list[tuple[Path, Exception]] = []
+    with ProcessPoolExecutor(max_workers=n_workers) as ex:
+        future_to_band = {
+            ex.submit(
+                _process_one_band,
+                band_path,
+                dn_off,
+                output_dir,
+                dst_nodata,
+            ): Path(band_path)
+            for band_path, dn_off in tasks
+        }
+
+        for fut in as_completed(future_to_band):
+            band_path = future_to_band[fut]
+            try:
+                vrt_path = Path(fut.result())
+                if logger:
+                    logger.info(f"Created PB-offset VRT for {band_path} -> {vrt_path}")
+            except Exception as exc:
+                failures.append((band_path, exc))
+                if logger:
+                    logger.error(f"Failed PB-offset VRT for {band_path}: {exc!r}")
+
+    if failures:
+        typer.echo(
+            f"Completed with {len(failures)} failures out of {len(tasks)} bands.",
+            err=True,
+        )
+    else:
+        typer.echo(f"Successfully processed {len(tasks)} bands.")
+
 
 if __name__ == "__main__":
     app()

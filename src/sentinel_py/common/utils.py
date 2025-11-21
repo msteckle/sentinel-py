@@ -1,4 +1,6 @@
-from datetime import datetime
+import datetime as dt
+from pathlib import Path
+import re
 
 def seasonal_date_ranges(
     start_year: int,
@@ -21,9 +23,55 @@ def seasonal_date_ranges(
     """
     ranges: list[tuple[str, str]] = []
     for year in range(start_year, end_year + 1):
-        start = datetime(year, start_month, start_day, 0, 0, 0)
-        end = datetime(year, end_month, end_day, 23, 59, 59)
+        start = dt.datetime(year, start_month, start_day, 0, 0, 0)
+        end = dt.datetime(year, end_month, end_day, 23, 59, 59)
         start_iso = start.strftime("%Y-%m-%dT%H:%M:%SZ")
         end_iso = end.strftime("%Y-%m-%dT%H:%M:%SZ")
         ranges.append((start_iso, end_iso))
     return ranges
+
+
+def parse_years(years_str: str) -> set[int]:
+    """Parse a space-separated years string like '2020 2021' into a set of ints."""
+    years_str = years_str.strip()
+    if not years_str:
+        return set()
+    return {int(y) for y in years_str.split()}
+
+
+def in_season_window(
+    d: dt.date,
+    start_md: tuple[int, int],
+    end_md: tuple[int, int],
+) -> bool:
+    """Check if date d is within the MM-DD window, allowing wrap-around."""
+    md = (d.month, d.day)
+    if end_md >= start_md:
+        # e.g. 06-01 → 08-31
+        return start_md <= md <= end_md
+    else:
+        # wrap-around, e.g. 11-01 → 02-28
+        return md >= start_md or md <= end_md
+    
+
+def extract_s2_acq_date(band_path: Path) -> dt.date | None:
+    """
+    Extract acquisition date from Sentinel-2 filename or SAFE name.
+    Examples:
+      S2B_MSIL2A_20200616T213529_...
+      T06WVB_20200616T213529_B03_20m.jp2
+    """
+    s = band_path.name
+    m = re.search(r"_([0-9]{8})T[0-9]{6}", s)
+    if not m:
+        # fallback: try the parent .SAFE dir name
+        for parent in band_path.parents:
+            if parent.name.endswith(".SAFE"):
+                m2 = re.search(r"_([0-9]{8})T[0-9]{6}", parent.name)
+                if m2:
+                    m = m2
+                    break
+        if not m:
+            return None
+
+    return dt.datetime.strptime(m.group(1), "%Y%m%d").date()

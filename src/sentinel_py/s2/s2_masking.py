@@ -4,7 +4,7 @@ Functions to support Sentinel-2 Surface Reflectance masking.
 
 from pathlib import Path
 import re
-from typing import List, Optional
+from typing import List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 from logging import Logger
@@ -12,8 +12,10 @@ from osgeo import gdal
 import textwrap
 from lxml import etree
 import copy
+import datetime as dt
 
 from sentinel_py.common.gdal import add_python_pixelfunc_to_vrt
+from sentinel_py.common.utils import extract_s2_acq_date, in_season_window
 
 S2_RES_OPTS = [10, 20, 60]  # available Sentinel-2 resolutions in meters
 PB_OFFSET_CODE = textwrap.dedent(
@@ -90,66 +92,122 @@ def get_band_paths(
     data_dir: Path,
     bands: List[str],
     target_res_m: int,
+    years: Optional[Set[int]] = None,
+    period_start: Optional[Tuple[int, int]] = None,  # (month, day)
+    period_end: Optional[Tuple[int, int]] = None,    # (month, day)
     logger: Logger | None = None,
 ) -> pd.DataFrame:
     """
-    Given a data directory and a list of bands (e.g., ["B02", "B03", "B04"]),
-    return the DataFrame of corresponding Sentinel-2 Surface Reflectance .jp2 file paths.
+    Scan a directory tree for Sentinel-2 Surface Reflectance .jp2 files and
+    return a DataFrame of band paths filtered by acquisition date.
+
+    Parameters
+    ----------
+    data_dir : Path
+        Root directory containing Sentinel-2 L2A products (.SAFE directories).
+    bands : list of str
+        Band IDs to look for, e.g. ["B02", "B03", "B04"].
+    target_res_m : int
+        Desired resolution (10, 20, or 60). If no files are found at this
+        resolution for a given band, we fall back to other resolutions in
+        S2_RES_OPTS (in order).
+    years : set of int, optional
+        Only keep scenes whose acquisition year is in this set. If None,
+        no year filtering is applied.
+    period_start, period_end : (month, day), optional
+        Seasonal window as integer (MM, DD) tuples. If both are provided, only keep
+        scenes where in_season_window(acq_date, period_start, period_end)
+        is True.
+    logger : logging.Logger, optional
+        Logger for warnings/info.
+
+    Returns
+    -------
+    DataFrame
+        Columns:
+          - "band": band ID (e.g. "B02")
+          - "band_jp2_path": Path to the JP2 file
+          - "acq_date": datetime.date
+          - "resolution_m": int (actual resolution used)
     """
-    band_paths: dict[str, Path] = {}
+    records: list[dict] = []
 
     for band in bands:
-        # 1) Try target resolution
+        # Check if target resolution file exists
         pattern = f"**/R{target_res_m}m/*_{band}_{target_res_m}m.jp2"
         matches = list(data_dir.glob(pattern))
-
-        if not matches:
+        resolutions_to_try: List[int]
+        if matches:
+            resolutions_to_try = [target_res_m]
+        else:
             if logger:
                 logger.warning(
                     f"No files found for band {band} at {target_res_m}m in {data_dir}"
                 )
+            resolutions_to_try = [r for r in S2_RES_OPTS if r != target_res_m]
 
-            # 2) Try other resolutions in S2_RES_OPTS
-            alt_match: Path | None = None
-            for res_opt in S2_RES_OPTS:
-                if res_opt == target_res_m:
-                    continue
-                pattern = f"**/R{res_opt}m/*_{band}_{res_opt}m.jp2"
-                alt_matches = list(data_dir.glob(pattern))
-                if alt_matches:
-                    alt_match = alt_matches[0]
-                    if logger:
-                        logger.info(
-                            f"Found band {band} at {res_opt}m instead of {target_res_m}m"
-                        )
-                    break
+        # No files at target resolution for this band: try fallbacks
+        found_any = False
+        for res in resolutions_to_try:
+            pattern = f"**/R{res}m/*_{band}_{res}m.jp2"
+            res_matches = list(data_dir.glob(pattern))
+            if not res_matches:
+                continue
 
-            if alt_match is None:
-                msg = (
-                    f"No files found for band {band} at any of "
-                    f"{S2_RES_OPTS} m in {data_dir}"
+            # Fallback resolution found
+            if res != target_res_m and logger:
+                logger.info(
+                    f"Found band {band} at {res}m instead of {target_res_m}m"
                 )
-                if logger:
-                    logger.error(msg)
-                raise RuntimeError(msg)
+            found_any = True
+            for jp2_path in res_matches:
+                # Extract acquisition date
+                acq_date = extract_s2_acq_date(jp2_path)
+                if acq_date is None:
+                    if logger:
+                        logger.warning(f"Could not extract acq_date from {jp2_path}")
+                    continue
 
-            band_paths[band] = alt_match
-            continue
+                # Ignore scenes not in requested years
+                if years and acq_date.year not in years:
+                    continue
 
-        if len(matches) > 1:
+                # Ignore scenes not in seasonal window
+                if period_start and period_end:
+                    if not in_season_window(acq_date, period_start, period_end):
+                        continue
+
+                # Build record (row and cols)
+                records.append(
+                    {
+                        "band": band,
+                        "band_jp2_path": jp2_path,
+                        "acq_date": acq_date,
+                        "resolution_m": res,
+                    }
+                )
+
+            # If we found matches at target resolution, we do NOT look at fallback res
+            if res == target_res_m:
+                break
+
+        # If no files found at any resolution for this band, raise error
+        if not found_any:
             msg = (
-                f"Multiple files found for band {band} at {target_res_m}m "
-                f"in {data_dir}: {matches}"
+                f"No files found for band {band} at any of "
+                f"{S2_RES_OPTS} m in {data_dir}"
             )
             if logger:
                 logger.error(msg)
             raise RuntimeError(msg)
 
-        band_paths[band] = matches[0]
+    # No scenes matched the date filters; return an empty but typed DataFrame
+    if not records:
+        return pd.DataFrame(
+            columns=["band", "band_jp2_path", "acq_date", "resolution_m"]
+        )
 
-    df = pd.DataFrame.from_dict(band_paths, orient="index", columns=["band_jp2_path"])
-    df.index.name = "band"
-    df.reset_index(inplace=True)
+    df = pd.DataFrame.from_records(records)
     return df
 
 
@@ -239,55 +297,81 @@ def get_pb_offset_from_jp2(
 def create_pb_offset_vrt(
     band_jp2_path: Path,
     dn_offset: int,
-    out_vrt_path: Path | None = None,
+    out_vrt_dir: Path | None = None,
     *,
     dst_nodata: int = 65535,
     logger: Logger | None = None,
 ) -> Path:
     """
-    Wrap a Sentinel-2 band in a VRT that applies a PB offset via a pixel function.
-    Does not modify the JP2 in place.
+    Create a VRT that applies a PB-offset correction to a Sentinel-2 band.
+    The output is always placed in a directory (not a file path), and the
+    filename is automatically derived from the JP2 basename.
+
+    Output name: <basename>.pb_offset.vrt
+    Example:
+        T06WVB_20200616T213531_B03_20m.jp2
+        → <out_vrt_dir>/T06WVB_20200616T213531_B03_20m.pb_offset.vrt
+
+    Parameters
+    ----------
+    band_jp2_path : Path
+        Path to the original Sentinel-2 reflectance JP2 band.
+    dn_offset : int
+        PB offset (0 or 1000 for S2 L2A).
+    out_vrt_dir : Path or None
+        Directory in which VRTs will be written. If None, defaults to
+        ~/.sentinel-py/temp/.
+    dst_nodata : int
+        Nodata value injected when subtracting offset.
+    logger : Optional[Logger]
+        Logger for diagnostics.
+
+    Returns
+    -------
+    Path
+        Path to the created VRT file.
     """
     band_jp2_path = Path(band_jp2_path)
 
-    # Determine output VRT file path
-    if out_vrt_path is None:
-        out_vrt_path = (
-            Path.home()
-            / ".sentinel-py"
-            / "temp"
-            / band_jp2_path.with_suffix(".pb_offset.vrt").name
+    # Determine output VRT directory
+    if out_vrt_dir is None:
+        out_vrt_dir = (
+            Path.home() / ".sentinel-py" / "temp"
         )
         if logger:
-            logger.warning(f"No out_vrt_path provided; using default: {out_vrt_path}")
-    else:
-        out_vrt_path = Path(out_vrt_path)
-        # If a directory is explicitly provided, put the file in there
-        if out_vrt_path.exists() and out_vrt_path.is_dir():
-            out_vrt_path = out_vrt_path / band_jp2_path.with_suffix(".pb_offset.vrt").name
+            logger.warning(f"No out_vrt_dir provided; using default: {out_vrt_dir}")
+    out_vrt_dir = Path(out_vrt_dir)
+    out_vrt_dir.mkdir(parents=True, exist_ok=True)
 
-    out_vrt_path.parent.mkdir(parents=True, exist_ok=True)
+    # Construct output file path inside the directory
+    out_vrt_file = out_vrt_dir / band_jp2_path.with_suffix(".pb_offset.vrt").name
 
-    # Build a VRT from the source band
-    gdal.Translate(str(out_vrt_path), str(band_jp2_path), format="VRT")
+    # Build passthrough VRT
+    gdal.Translate(str(out_vrt_file), str(band_jp2_path), format="VRT")
 
-    # If no offset, keep passthrough VRT
+    # No offset is needed, so just return the passthrough VRT
     if dn_offset == 0:
         if logger:
             logger.info(
-                f"No PB offset needed for {band_jp2_path}. VRT created at {out_vrt_path}"
+                f"No PB offset needed for {band_jp2_path}. "
+                f"VRT created at {out_vrt_file}"
             )
-        return out_vrt_path
+        return out_vrt_file
 
-    # If offset needed, add pixel function to VRT
+    # Add Python pixel function to VRT to apply the offset
     add_python_pixelfunc_to_vrt(
-        out_vrt_path,
+        out_vrt_file,
         func_name="pb_offset",
         func_code=PB_OFFSET_CODE,
         args={"dn_offset": str(dn_offset), "nodata": str(dst_nodata)},
     )
+    if logger:
+        logger.info(
+            f"Applied PB offset={dn_offset} to {band_jp2_path}. "
+            f"VRT written to {out_vrt_file}"
+        )
 
-    return out_vrt_path
+    return out_vrt_file
 
 
 def create_masked_vrt(
@@ -336,6 +420,7 @@ def create_masked_vrt(
     # band 1 -> PB-offset band (band_vrt_path)
     # band 2 -> SCL JP2 (scl_jp2_path)
     tmp_vrt = out_vrt_path.with_suffix(out_vrt_path.suffix + ".tmp")
+    tmp_vrt = tmp_vrt.resolve()  # ensure full path
     tmp_vrt.unlink(missing_ok=True)
 
     gdal.BuildVRT(

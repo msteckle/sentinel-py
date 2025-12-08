@@ -27,7 +27,7 @@ sentinel-py s2 download \
   --eperiod "08-31" \
   --collection "SENTINEL-2" \
   --product "S2MSI2A" \
-  --bands B02 B03 B04 B05 B06 B07 B08 B8A B11 B12 \
+  --bands "B02 B03 B04 B05 B06 B07 B08 B8A B11 B12" \
   --res 20 \
   --include-scl \
   --res 20 \

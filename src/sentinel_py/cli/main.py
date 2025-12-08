@@ -170,7 +170,7 @@ def aoi(
     create_aoi_geojson(
         bbox=(xmin, ymin, xmax, ymax),
         crs=crs,
-        out_file=output_file,
+        output_file=output_file,
     )
 
 

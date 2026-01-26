@@ -62,12 +62,51 @@ MASK_CODE = textwrap.dedent(
         return str(x).strip().strip('"').strip("'")
 
     def scl_mask(in_ar, out_ar, *args, **kwargs):
-        # in_ar[0] = PB-offset band
-        # in_ar[1] = SCL
+        # in_ar[0] = band
+        # in_ar[1] = SCL (classes) OR binary mask (0/1), depending on kwargs["binary_mask"]
         A = in_ar[0].astype(np.uint16, copy=False)
         B = in_ar[1].astype(np.uint8,  copy=False)
 
         nd = _to_int(kwargs.get("nodata"), 65535)
+        classes = _to_csv_str(kwargs.get("classes"))
+        binary_mask = _to_int(kwargs.get("binary_mask"), 0)
+
+        global LUT
+        if LUT is None:
+            codes = [int(t) for t in re.findall(r"\\d+", classes)] if classes else []
+            LUT = np.zeros(256, dtype=bool)
+            if codes:
+                LUT[codes] = True
+
+        if binary_mask:
+            # B is 0 (keep) / 1 (mask)
+            mask = (B != 0)
+        else:
+            # Always mask SCL==0 and any code > 11
+            mask = (B == 0) | (B > 11)
+            if LUT is not None:
+                mask |= LUT[B]
+
+        out = A.copy()
+        out[mask] = nd
+        out_ar[:] = out
+    """
+)
+SCL_TO_BINARY_MASK_CODE = textwrap.dedent(
+    """
+    import numpy as np, re
+    LUT = None
+
+    def _to_csv_str(x):
+        if x is None:
+            return ""
+        if isinstance(x, bytes):
+            x = x.decode('utf-8', 'ignore')
+        return str(x).strip().strip('"').strip("'")
+
+    def scl_to_binary_mask(in_ar, out_ar, *args, **kwargs):
+        # in_ar[0] = SCL classes
+        B = in_ar[0].astype(np.uint8, copy=False)
         classes = _to_csv_str(kwargs.get("classes"))
 
         global LUT
@@ -77,16 +116,14 @@ MASK_CODE = textwrap.dedent(
             if codes:
                 LUT[codes] = True
 
-        # Always mask SCL==0 and any code > 11
         mask = (B == 0) | (B > 11)
         if LUT is not None:
             mask |= LUT[B]
 
-        out = A.copy()
-        out[mask] = nd
-        out_ar[:] = out
+        out_ar[:] = mask.astype(np.uint8)   # 1=mask, 0=keep
     """
 )
+
 
 def get_band_paths(
     data_dir: Path,
@@ -374,107 +411,195 @@ def create_pb_offset_vrt(
     return out_vrt_file
 
 
+def _grid_info(ds: gdal.Dataset) -> dict:
+    gt = ds.GetGeoTransform()
+    if gt is None:
+        raise RuntimeError("Dataset has no geotransform.")
+    xres = abs(gt[1])
+    yres = abs(gt[5])
+    xsize = ds.RasterXSize
+    ysize = ds.RasterYSize
+    xmin = gt[0]
+    ymax = gt[3]
+    xmax = xmin + xres * xsize
+    ymin = ymax - yres * ysize
+    return {
+        "gt": gt,
+        "xres": xres,
+        "yres": yres,
+        "xsize": xsize,
+        "ysize": ysize,
+        "bounds": (xmin, ymin, xmax, ymax),
+        "srs_wkt": ds.GetProjection() or "",
+    }
+
+
+def _add_python_pixelfunc_to_singleband_vrt(
+    vrt_path: Path,
+    *,
+    func_name: str,
+    func_code: str,
+    args: dict[str, str],
+    dst_nodata: int | None = None,
+) -> None:
+    tree = etree.parse(str(vrt_path))
+    root = tree.getroot()
+
+    # Modify band 1 to be derived with pixel function
+    band1 = root.find(".//VRTRasterBand[@band='1']")
+    if band1 is None:
+        raise RuntimeError(f"Expected band 1 in {vrt_path}")
+    band1.set("subClass", "VRTDerivedRasterBand")
+
+    # Set NoDataValue if provided
+    if dst_nodata is not None:
+        nd_elem = band1.find("NoDataValue")
+        if nd_elem is None:
+            nd_elem = etree.SubElement(band1, "NoDataValue")
+        nd_elem.text = str(dst_nodata)
+
+    # Remove any existing pixel-function elements
+    for tag in ("PixelFunctionLanguage", "PixelFunctionType", "PixelFunctionArguments", "PixelFunctionCode"):
+        for el in band1.findall(tag):
+            band1.remove(el)
+
+    # Add new pixel function elements
+    lang_el = etree.SubElement(band1, "PixelFunctionLanguage")
+    lang_el.text = "Python"
+    type_el = etree.SubElement(band1, "PixelFunctionType")
+    type_el.text = func_name
+    args_el = etree.SubElement(band1, "PixelFunctionArguments")
+    for k, v in args.items():
+        args_el.set(k, v)
+    code_el = etree.SubElement(band1, "PixelFunctionCode")
+    code_el.text = etree.CDATA(func_code)
+
+    # Write back modified VRT
+    tree.write(str(vrt_path), pretty_print=True, xml_declaration=True, encoding="UTF-8")
+
+
 def create_masked_vrt(
-    band_vrt_path: Path,
+    band_path: Path,
     scl_jp2_path: Path,
     masking_scl_values: List[int],
     out_vrt_path: Path | None = None,
     *,
     dst_nodata: int = 65535,
-    logger: Logger | None = None,
+    logger=None,
 ) -> Path:
     """
-    Create a VRT that masks a PB-offset band using the SCL band via a Python pixel function.
+    Create a VRT that masks `band_path` using the SCL layer.
 
-    Parameters
-    ----------
-    band_vrt_path : Path
-        Path to the PB-offset VRT (single-band).
-    scl_jp2_path : Path
-        Path to the Sentinel-2 SCL JP2.
-    masking_scl_values : list[int]
-        SCL codes to mask in addition to the default (0 and >11).
-    out_vrt_path : Path, optional
-        Output VRT path. If None, derive from band_vrt_path.
-    dst_nodata : int, optional
-        Nodata value to write into masked pixels.
-
-    Returns
-    -------
-    Path
-        Path to the masked VRT.
+    Because GDAL is version 3.4.3:
+    - Warp SCL to the band grid first:
+        * 10/20m band: nearest resampling of SCL classes
+        * 60m band: build binary 20m mask, then warp with max
+    - Build a 2-band VRT stack (band + aligned mask/SCL)
+    - Convert band 1 to derived and run scl_mask(band, scl_or_binarymask)
     """
-    # ensure paths are Path objects
-    band_vrt_path = Path(band_vrt_path)
+    band_path = Path(band_path)
     scl_jp2_path = Path(scl_jp2_path)
 
-    # set up output VRT path
+    # Determine output VRT path
     if out_vrt_path is None:
-        # e.g. "B02.pb_offset.vrt" -> "B02.pb_offset.masked.vrt"
-        out_vrt_path = band_vrt_path.with_suffix(band_vrt_path.suffix + ".masked.vrt")
-        logger.warning(f"No out_vrt_path provided. Using default: {out_vrt_path}")
+        out_vrt_path = band_path.with_suffix(band_path.suffix + ".masked.vrt")
+        if logger:
+            logger.warning(f"No out_vrt_path provided. Using default: {out_vrt_path}")
     out_vrt_path = Path(out_vrt_path)
     out_vrt_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # build a temporary VRT with two separate bands:
-    # band 1 -> PB-offset band (band_vrt_path)
-    # band 2 -> SCL JP2 (scl_jp2_path)
-    tmp_vrt = out_vrt_path.with_suffix(out_vrt_path.suffix + ".tmp")
-    tmp_vrt = tmp_vrt.resolve()  # ensure full path
-    tmp_vrt.unlink(missing_ok=True)
+    # Get band resolution
+    ds_band = gdal.Open(str(band_path))
+    if ds_band is None:
+        raise RuntimeError(f"Could not open band dataset: {band_path}")
+    g = _grid_info(ds_band)
+    band_res = g["xres"]
 
-    gdal.BuildVRT(
-        str(tmp_vrt),
-        [str(band_vrt_path), str(scl_jp2_path)],
-        separate=True,
+    # Prepare classes CSV
+    classes_csv = ",".join(map(str, sorted(set(masking_scl_values))))
+
+    # Temporary VRT paths
+    tmp_scl_binary_vrt = out_vrt_path.with_suffix(out_vrt_path.suffix + ".scl_binary.tmp.vrt")
+    tmp_scl_on_band_vrt = out_vrt_path.with_suffix(out_vrt_path.suffix + ".scl_on_band.tmp.vrt")
+    tmp_stack_vrt = out_vrt_path.with_suffix(out_vrt_path.suffix + ".stack.tmp.vrt")
+    for p in (tmp_scl_binary_vrt, tmp_scl_on_band_vrt, tmp_stack_vrt):
+        p.unlink(missing_ok=True)
+
+    # Decide SCL alignment strategy depending on band resolution
+    binary_mask = False  # True for 60m bands
+    warp_src = scl_jp2_path  # default
+    resample = "near"  # default, changed to "max" for 60m band
+
+    # If band is 60m, create binary mask first
+    if band_res > 20.0 + 1e-6:
+
+        binary_mask = True
+
+        # make single-band VRT of SCL with derived function scl_to_binary_mask
+        gdal.Translate(str(tmp_scl_binary_vrt), str(scl_jp2_path), format="VRT")
+        _add_python_pixelfunc_to_singleband_vrt(
+            tmp_scl_binary_vrt,
+            func_name="scl_to_binary_mask",
+            func_code=SCL_TO_BINARY_MASK_CODE,
+            args={"classes": classes_csv},
+            dst_nodata=None,
+        )
+        warp_src = tmp_scl_binary_vrt
+        resample = "max"
+
+    # Warp SCL/binarymask onto band grid as a VRT
+    warp_opts = gdal.WarpOptions(
+        format="VRT",
+        dstSRS=g["srs_wkt"] if g["srs_wkt"] else None,
+        outputBounds=g["bounds"],
+        xRes=g["xres"],
+        yRes=g["yres"],
+        targetAlignedPixels=True,
+        resampleAlg=resample,
+        # binary mask: treat outside as keep(0)
+        dstNodata=0 if binary_mask else None,
     )
+    out_ds = gdal.Warp(str(tmp_scl_on_band_vrt), str(warp_src), options=warp_opts)
+    if out_ds is None:
+        raise RuntimeError("gdal.Warp failed while aligning SCL to band grid.")
+    out_ds = None
 
-    # edit the VRT XML:
-    # - turn band 1 into a VRTDerivedRasterBand with a Python pixel function
-    # - make band 1 reference *both* sources (pb band + SCL)
-    # - drop band 2 from the final dataset
-    tree = etree.parse(str(tmp_vrt))
+    # Stack band + aligned SCL/mask
+    gdal.BuildVRT(str(tmp_stack_vrt), [str(band_path), str(tmp_scl_on_band_vrt)], separate=True)
+
+    # Edit VRT to:
+    # - append SimpleSource(s) from band2 into band1
+    # - remove band2
+    # - apply scl_mask pixel function on band1
+    tree = etree.parse(str(tmp_stack_vrt))
     root = tree.getroot()
 
     band1 = root.find(".//VRTRasterBand[@band='1']")
     band2 = root.find(".//VRTRasterBand[@band='2']")
     if band1 is None or band2 is None:
-        logger.error(f"Expected 2 bands in {tmp_vrt}, found less.")
-        raise RuntimeError(f"Expected 2 bands in {tmp_vrt}, found less.")
+        raise RuntimeError(f"Expected 2 bands in {tmp_stack_vrt}, found less.")
 
-    # copy SimpleSource(s) from band2 into band1
     sources2 = band2.findall("SimpleSource")
     if not sources2:
-        logger.error(f"No SimpleSource elements in band 2 of {tmp_vrt}")
-        raise RuntimeError(f"No SimpleSource elements in band 2 of {tmp_vrt}")
+        raise RuntimeError(f"No SimpleSource elements in band 2 of {tmp_stack_vrt}")
 
     for src in sources2:
         band1.append(copy.deepcopy(src))
 
-    # remove band2 from the dataset so we end with a single-band VRT
-    band2_parent = band2.getparent()
-    band2_parent.remove(band2)
+    band2.getparent().remove(band2)
 
-    # make band1 a derived band
     band1.set("subClass", "VRTDerivedRasterBand")
 
-    # ensure NoDataValue element is set correctly
     nd_elem = band1.find("NoDataValue")
     if nd_elem is None:
         nd_elem = etree.SubElement(band1, "NoDataValue")
     nd_elem.text = str(dst_nodata)
 
-    # remove any existing pixel-function elements (if present)
-    for tag in (
-        "PixelFunctionLanguage",
-        "PixelFunctionType",
-        "PixelFunctionArguments",
-        "PixelFunctionCode",
-    ):
+    # remove existing pixel-function elements
+    for tag in ("PixelFunctionLanguage", "PixelFunctionType", "PixelFunctionArguments", "PixelFunctionCode"):
         for el in band1.findall(tag):
             band1.remove(el)
 
-    # add new pixel-function elements
     lang_el = etree.SubElement(band1, "PixelFunctionLanguage")
     lang_el.text = "Python"
 
@@ -482,14 +607,21 @@ def create_masked_vrt(
     type_el.text = "scl_mask"
 
     args_el = etree.SubElement(band1, "PixelFunctionArguments")
-    classes_csv = ",".join(map(str, sorted(set(masking_scl_values))))
     args_el.set("nodata", str(dst_nodata))
     args_el.set("classes", classes_csv)
+    args_el.set("binary_mask", "1" if binary_mask else "0")
 
     code_el = etree.SubElement(band1, "PixelFunctionCode")
     code_el.text = etree.CDATA(MASK_CODE)
 
-    # write the final VRT
     tree.write(str(out_vrt_path), pretty_print=True, xml_declaration=True, encoding="UTF-8")
-    tmp_vrt.unlink(missing_ok=True)
+
+    # cleanup temps
+    tmp_stack_vrt.unlink(missing_ok=True)
+    tmp_scl_on_band_vrt.unlink(missing_ok=True)
+    tmp_scl_binary_vrt.unlink(missing_ok=True)
+
+    if logger:
+        logger.info(f"Masked VRT written to {out_vrt_path}")
+
     return out_vrt_path

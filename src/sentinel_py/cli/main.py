@@ -105,8 +105,12 @@ def aoi(
             "(e.g. '-150,68,-148,70'). Commas or spaces are accepted."
         ),
     ),
-    crs: str = typer.Option("EPSG:4326", help="CRS for AOI."),
-    output_file: Path = typer.Option("latlon_aoi.geojson", help="Output .geojson file."),
+    crs: str = typer.Option(
+        "EPSG:4326", help="CRS for AOI."
+    ),
+    output_file: Path = typer.Option(
+        "latlon_aoi.geojson", help="Output .geojson file."
+    ),
     log_path: Optional[Path] = typer.Option(
         None,
         help=(
@@ -347,7 +351,7 @@ def download(
     )
 
 
-def _process_one_band(
+def _bandwise_create_pb_offset_vrt(
     band_path: str,
     dn_offset: int,
     out_dir: str,
@@ -412,8 +416,7 @@ def dn_offset(
     from sentinel_py.common.utils import parse_years
     from sentinel_py.s2.s2_masking import (
         get_band_paths, 
-        get_pb_offset_from_jp2, 
-        create_pb_offset_vrt
+        get_pb_offset_from_jp2
     )
 
     # Set up logging if requested
@@ -470,7 +473,7 @@ def dn_offset(
     with ProcessPoolExecutor(max_workers=n_workers) as ex:
         future_to_band = {
             ex.submit(
-                _process_one_band,
+                _bandwise_create_pb_offset_vrt,
                 band_path,
                 dn_off,
                 output_dir,

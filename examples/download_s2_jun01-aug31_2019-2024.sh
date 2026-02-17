@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Paths
-GEOJSON="../data/aois/toolik_aoi.geojson"
+AOI="../data/aois/bioclimate_latlon/bioclimate_latlon_1.shp"
 LOGPATH="../data/logs/download"
 OUTPATH="../data/s2"
 
@@ -11,16 +11,9 @@ OUTPATH="../data/s2"
 export CDSE_USERNAME="morganrsteckler@gmail.com"
 export CDSE_PASSWORD_FILE="$HOME/.cdse/cdse_pw"  # ensure chmod 600 on this file or it won't read
 
-# Create an AOI
-sentinel-py aoi \
-  --bbox "-150 67 -148 69" \
-  --crs "EPSG:4326" \
-  --output-file $GEOJSON \
-  --log-path $LOGPATH \
-
 # Download all Sentinel-2 summer scenes for 2019–2024
 sentinel-py s2 download \
-  --input-aoi $GEOJSON \
+  --input-aoi $AOI \
   --output-dir $OUTPATH/raw \
   --years "2020 2021 2022 2023 2024" \
   --speriod "06-01" \

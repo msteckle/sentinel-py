@@ -93,23 +93,20 @@ def setup_logging(log_path: Path | None = None, verbose: bool = False) -> Path:
 @app.command(
     "aoi",
     help=(
-        "Create an Area Of Interest (AOI) GeoJSON from a bounding box tuple. "
-        'The bounding box is given as "xmin, ymin, xmax, ymax".'
+        "Create an Area Of Interest (AOI) GeoJSON given a bounding box string. "
+        "The output AOI is in EPGS:4326 because that is what CDSE expects for queries."
     ),
 )
 def aoi(
     bbox: str = typer.Option(
         ...,
         help=(
-            "Bounding box in form xmin,ymin,xmax,ymax "
-            "(e.g. '-150,68,-148,70'). Commas or spaces are accepted."
+            "Bounding box as a string in the form 'xmin ymin xmax ymax'. "
+            "Commas or spaces are accepted."
         ),
     ),
-    crs: str = typer.Option(
-        "EPSG:4326", help="CRS for AOI."
-    ),
     output_file: Path = typer.Option(
-        "latlon_aoi.geojson", help="Output .geojson file."
+        "aoi.geojson", help="Output .geojson file."
     ),
     log_path: Optional[Path] = typer.Option(
         None,
@@ -173,7 +170,6 @@ def aoi(
     # Call core function
     create_aoi_geojson(
         bbox=(xmin, ymin, xmax, ymax),
-        crs=crs,
         output_file=output_file,
     )
 
@@ -181,19 +177,18 @@ def aoi(
 @app.command(
     "grid",
     help=(
-        "Create a lat/lon grid overlaying an AOI GeoJSON file for a specified "
+        "Create a EPSG:4326 (lat/lon) grid overlaying an AOI file for a specified "
         "cell size in degrees. The grid can be used for future parallel processing."
     ),
 )
 def grid(
-    aoi_file: Path = typer.Option(..., exists=True, help="AOI .geojson file."),
+    aoi_file: Path = typer.Option(..., exists=True, help="AOI file readable by pyogrio."),
     dx_deg: float = typer.Option(..., help="Grid cell size in degrees (longitude)."),
     dy_deg: float = typer.Option(..., help="Grid cell size in degrees (latitude)."),
-    crs: str = typer.Option("EPSG:4326", help="CRS for AOI and grid."),
     clip_to_aoi: bool = typer.Option(True, help="Clip grid cells to AOI."),
     fill_aoi_holes: bool = typer.Option(True, help="Fill holes in AOI geometry."),
     fill_cell_holes: bool = typer.Option(True, help="Fill holes in grid cells."),
-    out_file: Path = typer.Option("latlon_grid.geojson", help="Output .geojson file."),
+    out_file: Path = typer.Option("grid.geojson", help="Output .geojson file."),
     log_path: Optional[Path] = typer.Option(
         None,
         help=(
@@ -229,7 +224,6 @@ def grid(
     overlay_latlon_grid(
         aoi=aoi_file,
         cell_size_deg=(dx_deg, dy_deg),
-        crs=crs,
         clip_to_aoi=clip_to_aoi,
         fill_aoi_holes=fill_aoi_holes,
         fill_cell_holes=fill_cell_holes,

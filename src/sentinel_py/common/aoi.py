@@ -1,15 +1,105 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Optional, Union, Tuple
 
 import numpy as np
 import geopandas as gpd
-from shapely.geometry import Polygon, MultiPolygon
+from shapely.geometry import Polygon, MultiPolygon, box
 from shapely.geometry.base import BaseGeometry
 
 
 GeometryLike = Union[BaseGeometry, gpd.GeoSeries, gpd.GeoDataFrame, str, Path]
+
+
+def _geom_wkt_len(geom: BaseGeometry) -> int:
+    return len(geom.wkt)
+
+
+def simplify_aoi_for_cdse(
+    aoi: BaseGeometry,
+    *,
+    logger: logging.Logger,
+    max_wkt_chars: int = 20000,
+    simplify_tolerances_deg: Tuple[float, ...] = (0.001, 0.0025, 0.005, 0.01, 0.02, 0.05),
+    allow_convex_hull: bool = True,
+    allow_bbox_fallback: bool = True,
+) -> BaseGeometry:
+    """
+    Reduce AOI complexity to avoid CDSE OData GET URL blowups.
+
+    Strategy:
+      - If already short enough: return as-is
+      - Try simplify(preserve_topology=True) with increasing tolerances (degrees)
+      - Optionally try convex hull
+      - Optionally fall back to bbox polygon
+
+    Notes:
+      - tolerances are in degrees because AOI is assumed EPSG:4326
+      - This is intended for *search footprint filtering*, not precision clipping.
+    """
+    # Some AOIs are invalid after reprojection / dateline wrap; buffer(0) fixes many
+    try:
+        if not aoi.is_valid:
+            aoi = aoi.buffer(0)
+    except Exception:
+        pass
+
+    orig_len = _geom_wkt_len(aoi)
+    if orig_len <= max_wkt_chars:
+        logger.info("AOI WKT length %d <= %d; no simplification needed.", orig_len, max_wkt_chars)
+        return aoi
+
+    logger.warning(
+        "AOI WKT length is %d chars (>%d). Simplifying for CDSE query stability.",
+        orig_len,
+        max_wkt_chars,
+    )
+
+    # Try successive simplifications
+    for tol in simplify_tolerances_deg:
+        try:
+            simplified = aoi.simplify(tol, preserve_topology=True)
+            if simplified.is_empty:
+                continue
+            # Fix again if simplification creates minor invalidities
+            if not simplified.is_valid:
+                simplified = simplified.buffer(0)
+
+            new_len = _geom_wkt_len(simplified)
+            logger.info("AOI simplified with tol=%.6f deg → WKT length %d", tol, new_len)
+
+            if new_len <= max_wkt_chars:
+                return simplified
+        except Exception as e:
+            logger.debug("AOI simplify failed at tol=%.6f: %s", tol, e)
+
+    # Convex hull is a very good “won’t miss anything” fallback
+    if allow_convex_hull:
+        try:
+            hull = aoi.convex_hull
+            hull_len = _geom_wkt_len(hull)
+            logger.warning("AOI convex hull WKT length %d", hull_len)
+            if hull_len <= max_wkt_chars:
+                return hull
+        except Exception as e:
+            logger.debug("AOI convex_hull failed: %s", e)
+
+    # Final fallback: bbox polygon (will over-download, but always works)
+    if allow_bbox_fallback:
+        try:
+            minx, miny, maxx, maxy = aoi.bounds
+            bbox = box(minx, miny, maxx, maxy)
+            bbox_len = _geom_wkt_len(bbox)
+            logger.warning("AOI bbox fallback WKT length %d", bbox_len)
+            return bbox
+        except Exception as e:
+            logger.debug("AOI bbox fallback failed: %s", e)
+
+    # If everything fails, return original and let query fail loudly
+    logger.error("Failed to simplify AOI below max_wkt_chars=%d; using original AOI.", max_wkt_chars)
+    return aoi
 
 
 def parse_bbox(aoi: str) -> Optional[Tuple[float, float, float, float]]:

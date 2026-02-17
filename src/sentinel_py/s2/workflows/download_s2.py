@@ -16,7 +16,7 @@ from sentinel_py.common.cdse_auth import AutoRefreshSession
 from sentinel_py.common.cdse_search import build_search_query, fetch_all_products
 from sentinel_py.s2.cdse_s2_nodes import select_s2_targets
 from sentinel_py.s2.cdse_s2_download import download_s2_targets
-from sentinel_py.common.aoi import load_aoi_as_geom
+from sentinel_py.common.aoi import load_aoi_as_geom, simplify_aoi_for_cdse
 
 
 CDSE_CATALOGUE = "https://catalogue.dataspace.copernicus.eu/odata/v1"
@@ -82,6 +82,9 @@ def download_s2_scenes(
     aoi = load_aoi_as_geom(aoi_path)
     if aoi is None:
         raise ValueError(f"Failed to load AOI from {aoi_path}")
+    
+    # Simplify the AOI to reduce complexity of CDSE URL query
+    aoi = simplify_aoi_for_cdse(aoi, logger=logger)
 
     # Ensure list of years has at least one entry
     years = list(years)

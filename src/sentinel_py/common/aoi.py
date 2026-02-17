@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Union, Tuple
+from typing import Optional, Union, Tuple
 
 import numpy as np
 import geopandas as gpd
@@ -10,6 +10,26 @@ from shapely.geometry.base import BaseGeometry
 
 
 GeometryLike = Union[BaseGeometry, gpd.GeoSeries, gpd.GeoDataFrame, str, Path]
+
+
+def parse_bbox(aoi: str) -> Optional[Tuple[float, float, float, float]]:
+    """
+    Return (xmin, ymin, xmax, ymax) if `aoi` looks like 4 floats, else None.
+    Accepts commas or whitespace.
+    """
+    try:
+        raw = aoi.replace(",", " ").split()
+        parts = [float(p) for p in raw]
+        if len(parts) != 4:
+            return None
+        xmin, ymin, xmax, ymax = parts
+
+        if xmin >= xmax or ymin >= ymax:
+            return None
+
+        return xmin, ymin, xmax, ymax
+    except Exception:
+        return None
 
 def create_aoi_geojson(
     bbox: Tuple[float, float, float, float],

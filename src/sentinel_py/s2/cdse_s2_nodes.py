@@ -291,9 +291,6 @@ def select_s2_targets(
         List of target paths to download, where each target is a tuple of path
         segments inside the SAFE structure
     """
-    # initialize logger if not provided
-    if logger is None:
-        logger = logging.getLogger(__name__)
 
     # find the SAFE root directory for this scene
     safe_root = find_scene_safe_directory(session, scene_id)

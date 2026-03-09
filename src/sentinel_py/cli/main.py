@@ -8,11 +8,11 @@ from enum import Enum
 import typer
 from typing import Annotated
 
-LOG_COMPLEXITY = logging.INFO
+from sentinel_py.common.logging import get_logger, DEFAULT_LOG_DIR
 
 
 ########################################################################################
-# Application creation and helper funcs
+# Application creation
 ########################################################################################
 
 # set up main app and subcommands
@@ -31,74 +31,6 @@ s2 = typer.Typer(
     pretty_exceptions_enable=False,
 )
 app.add_typer(s2, name="s2")
-
-
-DEFAULT_LOG_DIR = Path.home() / ".sentinel-py" / "logs"
-def setup_logging(logpath: Path = None, verbose: bool = False) -> Path:
-    """
-    Configure logging so that the *directory or prefix* is user-defined, but
-    the log file name is automatically generated.
-
-    Parameters
-    ----------
-    logpath : Path or None
-        - If None: logs go in ~/.sentinel-py/logs/sentinel_py_<timestamp>.log
-        - If a directory: the file is created inside it
-        - If a file-like path: acts as a prefix; timestamp and .log are appended
-    verbose : bool
-        True -> console logs at DEBUG level.
-
-    Returns
-    -------
-    Path
-        Fully resolved path to the created log file.
-    """
-    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # determine final log file path
-    if logpath is None:
-        # default location
-        log_dir = DEFAULT_LOG_DIR
-        log_dir.mkdir(parents=True, exist_ok=True)
-        logfile = log_dir / f"sentinel_py_{timestamp}.log"
-
-    else:
-        # normalize
-        logpath = Path(logpath)
-
-        if logpath.exists() and logpath.is_dir():
-            # user gave a directory → use it
-            logpath.mkdir(parents=True, exist_ok=True)
-            logfile = logpath / f"sentinel_py_{timestamp}.log"
-
-        else:
-            # user gave a prefix (e.g., logs/myrun)
-            parent = logpath.parent
-            if parent != Path('.'):
-                parent.mkdir(parents=True, exist_ok=True)
-            prefix = logpath.name
-            logfile = parent / f"{prefix}_{timestamp}.log"
-
-    # configure handlers
-    handlers: list[logging.Handler] = []
-
-    # console output handler
-    console = logging.StreamHandler(sys.stderr)
-    console.setLevel(logging.DEBUG if verbose else logging.WARNING)
-    handlers.append(console)
-
-    # log file handler
-    file_handler = logging.FileHandler(logfile)
-    file_handler.setLevel(LOG_COMPLEXITY)
-    handlers.append(file_handler)
-
-    logging.basicConfig(
-        level=logging.DEBUG,  # set root logger to lowest level; handlers will filter
-        handlers=handlers,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        force=True,
-    )
-    return logfile
 
 
 ########################################################################################
@@ -436,9 +368,7 @@ def download(
     from sentinel_py.s2.workflows.download_s2 import download_s2_scenes
 
     # set up logging if requested
-    actual_log_path = setup_logging(log, verbose)
-    typer.echo(f"Logging to: {actual_log_path}")
-    logger = logging.getLogger(__name__)
+    logger = get_logger(logpath=log, verbose=verbose) if log or verbose else None
 
     # parse years arg
     try:

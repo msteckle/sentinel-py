@@ -128,10 +128,6 @@ def download_s2_scenes(
     from sentinel_py.s2.cdse_s2_download import download_s2_targets
     from sentinel_py.common.aoi import aoi_as_geom
 
-    # set up logger
-    if logger is None:
-        logger = logging.getLogger(__name__)
-
     # convert AOI to geometry
     aoi = aoi_as_geom(aoi, crs)
 
@@ -184,7 +180,7 @@ def download_s2_scenes(
                     start_iso=start_iso,
                     end_iso=end_iso,
                 )
-                df = all_query_results(query_url)
+                df = all_query_results(query_url, logger=logger)
                 if df.empty:
                     logger.warning(
                         f"No products returned for window {start_iso} -> {end_iso} "
@@ -218,7 +214,7 @@ def download_s2_scenes(
     n_scenes = 0
     credentials: dict = {}
     token_cache: dict = {}
-    with logging_redirect_tqdm():
+    with logging_redirect_tqdm(loggers=[logger]):
         with tqdm(
             total=len(products),
             desc="Downloading scenes",
@@ -248,6 +244,7 @@ def download_s2_scenes(
                             bands=s2bands,
                             target_res_m=s2res,
                             include_scl=include_scl,
+                            logger=logger,
                         )
                         n_failures = download_s2_targets(
                             session=sess,

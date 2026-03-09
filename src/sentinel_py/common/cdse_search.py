@@ -63,8 +63,6 @@ def all_query_results(
     """
     Follow CDSE OData pagination and collect all products into a DataFrame.
     """
-    if logger is None:
-        logger = logging.getLogger(__name__)
     sess = session or requests.Session()
 
     items: list[dict] = []

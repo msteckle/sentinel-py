@@ -52,13 +52,10 @@ def download_s2_targets(
         The number of failed downloads (0 if all downloads succeeded or were cached).
     """
 
-    if logger is None:
-        logger = logging.getLogger(__name__)
-
     output_root = Path(output_root)
     n_failures = 0
 
-    def _download_one(segments: Sequence[str]) -> bool:
+    def _download_one(segments: Sequence[str], logger: logging.Logger) -> bool:
 
         # create the output path and ensure parent directories exist
         rel = os.path.join(*segments)
@@ -142,7 +139,7 @@ def download_s2_targets(
 
     # use a thread pool to download targets in parallel, tracking failures
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = [ex.submit(_download_one, segs) for segs in targets]
+        futs = [ex.submit(_download_one, segs, logger) for segs in targets]
         for fut in as_completed(futs):
             if not fut.result():
                 n_failures += 1

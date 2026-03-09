@@ -2,6 +2,33 @@ import requests
 import pandas as pd
 from shapely.geometry.base import BaseGeometry
 import logging
+import geopandas as gpd
+
+def batch_geometries(geoseries: gpd.GeoSeries, max_url_len: int = 6000) -> list[BaseGeometry]:
+    """
+    Split a GeoSeries into batches whose unioned WKT fits within max_url_len.
+    Handles any geometry type (points, polygons, etc.).
+    """
+
+    from shapely.ops import unary_union
+
+    batches = []
+    current_batch = []
+    for geom in geoseries:
+        current_batch.append(geom)
+        wkt = unary_union(current_batch).wkt
+        if len(wkt) > max_url_len:
+            if len(current_batch) > 1:
+                batches.append(unary_union(current_batch[:-1]))
+                current_batch = [geom]
+            else:
+                # single geometry already exceeds limit — add it anyway
+                batches.append(geom)
+                current_batch = []
+    if current_batch:
+        batches.append(unary_union(current_batch))
+    return batches
+
 
 def build_search_query(
     aoi: BaseGeometry,
@@ -23,7 +50,7 @@ def build_search_query(
         f"and OData.CSC.Intersects(area=geography'SRID=4326;{aoi_wkt}') "
         f"and ContentDate/Start gt {start_iso} and ContentDate/Start lt {end_iso}"
     )
-    return f"{catalogue_odata}/Products?$top=100&$filter={filter_expr}"
+    return f"{catalogue_odata}/Products?$top=1000&$filter={filter_expr}"
 
 
 def all_query_results(

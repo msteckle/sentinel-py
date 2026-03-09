@@ -93,6 +93,7 @@ def setup_logging(logpath: Path = None, verbose: bool = False) -> Path:
     handlers.append(file_handler)
 
     logging.basicConfig(
+        level=logging.DEBUG,  # set root logger to lowest level; handlers will filter
         handlers=handlers,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         force=True,
@@ -434,10 +435,9 @@ def download(
 ):
     from sentinel_py.s2.workflows.download_s2 import download_s2_scenes
 
-    # optional logging
-    if log is not None or verbose:
-        actual_log_path = setup_logging(log, verbose)
-        typer.echo(f"Logging to: {actual_log_path}")
+    # set up logging if requested
+    actual_log_path = setup_logging(log, verbose)
+    typer.echo(f"Logging to: {actual_log_path}")
     logger = logging.getLogger(__name__)
 
     # parse years arg

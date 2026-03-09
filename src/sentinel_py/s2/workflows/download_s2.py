@@ -3,67 +3,54 @@ Functions used to download Sentinel-2 scenes from CDSE over (optional) seasonal 
 """
 
 import logging
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Iterable
 import calendar
 
 import pandas as pd
-import geopandas as gpd
-from shapely.geometry.base import BaseGeometry
 
 from sentinel_py.common.cdse_auth import AutoRefreshSession
-from sentinel_py.common.cdse_search import build_search_query, fetch_all_products
+from sentinel_py.common.cdse_search import build_search_query, all_query_results
 from sentinel_py.s2.cdse_s2_nodes import select_s2_targets
 from sentinel_py.s2.cdse_s2_download import download_s2_targets
-from sentinel_py.common.aoi import load_aoi_as_geom, simplify_aoi_for_cdse
+from sentinel_py.common.aoi import aoi_as_geom
 
-
+# up top in case it ever changes:
 CDSE_CATALOGUE = "https://catalogue.dataspace.copernicus.eu/odata/v1"
 
-def _safe_date_with_adjust(
+def _fix_date(
     year: int, 
     month: int, 
     day: int, 
     logger: logging.Logger
 ) -> date:
     """
-    Return a valid date, adjusting the day if necessary.
+    Build datetime from year, month, day, and adjust if the day is invalid for the month
+    (e.g. Feb 30 -> Feb 28 or 29) and year (e.g. Feb 29 on non-leap year -> Feb 28).
     """
-    # ensure valid month
-    if not (1 <= month <= 12):
-        raise ValueError(f"Invalid month: {month}. Month must be between 1 and 12.")
 
-    # determine the last valid day in this month/year
-    last_day = calendar.monthrange(year, month)[1]
-
-    # ensure day is positive
-    if day <= 0:
-        raise ValueError(f"Invalid day: {day} is not a valid calendar day.")
-
-    # ensure day is not too large
-    if day <= last_day:
+    try:
         return date(year, month, day)
-
-    # if day is too large -> adjust
-    logger.warning(
-        f"Adjusting invalid date {year}-{month:02d}-{day:02d} -> "
-        f"{year}-{month:02d}-{last_day:02d}"
-    )
-    return date(year, month, last_day)
+    except ValueError as e:
+        logger.warning(
+            "Invalid date %04d-%02d-%02d: %s. Adjusting to last valid day of month.",
+            year, month, day, e
+        )
+        last_day = calendar.monthrange(year, month)[1]
+        return date(year, month, last_day)
 
 
 def download_s2_scenes(
-    aoi_path: Path,
-    output_root: Path,
-    *,
+    aoi: Path,
+    outdir: Path,
     years: Iterable[int],
-    period_start: tuple[int, int],  # (month, day)
-    period_end: tuple[int, int],  # (month, day)
-    collection_name: str,
-    product_type: str,
-    bands: Iterable[str],
-    target_res_m: int,
+    speriod: datetime,
+    eperiod: datetime,
+    s2collection: str,
+    s2product: str,
+    s2bands: Iterable[str],
+    s2res: int,
     include_scl: bool = True,
     max_workers_files: int = 4,
     logger: logging.Logger | None = None,
@@ -78,156 +65,143 @@ def download_s2_scenes(
     if logger is None:
         logger = logging.getLogger(__name__)
 
-    # Read the AOI and convert to shapely geometry
-    aoi = load_aoi_as_geom(aoi_path)
-    if aoi is None:
-        raise ValueError(f"Failed to load AOI from {aoi_path}")
-    
-    # Simplify the AOI to reduce complexity of CDSE URL query
-    aoi = simplify_aoi_for_cdse(aoi, logger=logger)
+    # convert aoi to just geometry
+    aoi = aoi_as_geom(aoi)
 
-    # Ensure list of years has at least one entry
+    # ensure list of years has at least one entry
     years = list(years)
     if not years:
-        raise ValueError("years must contain at least one year")
+        raise ValueError("Years must contain at least one year")
 
-    # Build date windows, with “warn and adjust” behavior
-    smonth, sday = period_start
-    emonth, eday = period_end
+    # handle bad start/end periods (e.g. Feb 30 -> Feb 28 or 29)
+    # also converts to date objects if they were passed as datetimes
     date_windows: list[tuple[date, date]] = []
     for year in years:
-        start = _safe_date_with_adjust(year, smonth, sday, logger)
-        end = _safe_date_with_adjust(year, emonth, eday, logger)
+        start = _fix_date(year, speriod.month, speriod.day, logger)
+        end = _fix_date(year, eperiod.month, eperiod.day, logger)
         if end < start:
             raise ValueError(
                 f"period_end {end} is before period_start {start} in year {year}."
             )
         date_windows.append((start, end))
-
-    logger.info(
-        "Downloading Sentinel-2 for years=%s, period=%02d-%02d to %02d-%02d",
-        years,
-        smonth,
-        sday,
-        emonth,
-        eday,
-    )
-
     iso_windows = [
         (f"{s.isoformat()}T00:00:00.000Z", f"{e.isoformat()}T23:59:59.999Z")
         for s, e in date_windows
     ]
 
-    # Start with empty creds; cdse_auth._fill_creds will pull from env.
+    # start with empty creds; cdse_auth._fill_creds will pull from environment
     credentials: dict = {}
     token_cache: dict = {}
     results: list[dict] = []
 
-    # Query products for each window
+    # query products for each time window
     all_rows: list[pd.DataFrame] = []
     for start_iso, end_iso in iso_windows:
+        logger.info("Querying CDSE for requested window: %s -> %s", start_iso, end_iso)
         query_url = build_search_query(
             aoi=aoi,
             catalogue_odata=CDSE_CATALOGUE,
-            collection_name=collection_name,
-            product_type=product_type,
+            collection_name=s2collection,
+            product_type=s2product,
             start_iso=start_iso,
             end_iso=end_iso,
         )
-        logger.info("Querying CDSE: %s", query_url)
 
-        df = fetch_all_products(query_url)
+        # get query results as dataframe
+        df = all_query_results(query_url)
         if df.empty:
             logger.warning(
-                "No products returned for window %s → %s", start_iso, end_iso
+                "No products returned for window %s -> %s", start_iso, end_iso
             )
-        df = df.assign(window_start=start_iso, window_end=end_iso)
-        all_rows.append(df)
+        else:
+            df = df.assign(window_start=start_iso, window_end=end_iso)
+            all_rows.append(df)
 
+    # combine all query results into single dataframe
     if not all_rows:
         logger.warning("No products found for given AOI and date windows.")
         return pd.DataFrame()
-
+    
+    # if products are found, log total count across all windows
     products = pd.concat(all_rows, ignore_index=True)
-    if products.empty:
-        logger.warning("Products DataFrame is empty after concatenation.")
-        return pd.DataFrame()
+    logger.info(
+        "Found %d total products across %d window(s)", len(products), len(iso_windows)
+    )
 
-    # Some logging about the products found
-    logger.info("Total products fetched: %d", len(products))
-    logger.info("Example columns: %s", products.columns.tolist()[:10])
-    logger.info("First 3 names: %s", products["Name"].head(3).to_list())
-
-    # Open a CDSE session that auto-refreshes tokens.
+    # iterate over products and download targets for each product
     with AutoRefreshSession(
         credentials=credentials,
         token_cache=token_cache,
         logger=logger,
     ) as sess:
+        # for each product, select targets and download
         for _, row in products.iterrows():
             scene_id = row.get("Id")
             scene_name = row.get("Name")
 
             if not scene_id or not scene_name:
-                logger.warning(
-                    "Skipping row with missing Id/Name: %s",
-                    row.to_dict(),
-                )
+                logger.warning("Skipping row with missing Id/Name: %s", row.to_dict())
                 continue
 
-            targets, safe_root, granule_dir, band_res_map = select_s2_targets(
-                session=sess,
-                scene_id=str(scene_id),
-                scene_name=str(scene_name),
-                bands=bands,
-                target_res_m=target_res_m,
-                include_scl=include_scl,
-            )
-
-            logger.info(
-                "Scene %s (%s): selected %d targets",
-                scene_name,
-                scene_id,
-                len(targets),
-            )
-
-            failures = download_s2_targets(
-                session=sess,
-                scene_id=str(scene_id),
-                targets=targets,
-                output_root=output_root,
-                max_workers=max_workers_files,
-                logger=logger,
-            )
-
-            if failures:
-                logger.warning(
-                    "Scene %s (%s): %d target(s) failed to download",
-                    scene_name,
-                    scene_id,
-                    len(failures),
+            try:
+                targets, safe_root, granule_dir, band_res_map = select_s2_targets(
+                    session=sess,
+                    scene_id=str(scene_id),
+                    scene_name=str(scene_name),
+                    bands=s2bands,
+                    target_res_m=s2res,
+                    include_scl=include_scl,
                 )
-                for f in failures:
-                    logger.debug(
-                        "  Failed target %s: %s",
-                        "/".join(f["segments"]),
-                        f["status"],
-                    )
 
-            results.append(
-                {
+                failures = download_s2_targets(
+                    session=sess,
+                    scene_id=str(scene_id),
+                    targets=targets,
+                    output_root=outdir,
+                    max_workers=max_workers_files,
+                    logger=logger,
+                )
+
+            except Exception as e:
+                logger.error(
+                    "Scene %s (%s): unexpected error during download: %s",
+                    scene_name, scene_id, e,
+                    exc_info=True,
+                )
+                results.append({
                     "scene_id": scene_id,
                     "scene_name": scene_name,
                     "window_start": row["window_start"],
                     "window_end": row["window_end"],
-                    "safe_root": safe_root,
-                    "granule_dir": granule_dir,
-                    "band_res_map": band_res_map,
-                    "n_targets": len(targets),
-                    "n_failures": len(failures),
-                    "failures": failures,
-                }
+                    "safe_root": None,
+                    "granule_dir": None,
+                    "band_res_map": None,
+                    "n_targets": 0,
+                    "n_failures": 1,
+                    "failures": [{"error": str(e)}],
+                })
+                continue
+
+            logger.info(
+                "Scene %s (%s): processed %d targets with %d failure(s)",
+                scene_name, scene_id, len(targets), len(failures),
             )
+
+            results.append({
+                "scene_id": scene_id,
+                "scene_name": scene_name,
+                "window_start": row["window_start"],
+                "window_end": row["window_end"],
+                "safe_root": safe_root,
+                "granule_dir": granule_dir,
+                "band_res_map": band_res_map,
+                "n_targets": len(targets),
+                "n_failures": len(failures),
+                "failures": failures,
+            })
+
+    if not results:
+        logger.warning("No scenes were successfully processed.")
 
     logger.info("Finished seasonal download: %d scene(s) processed.", len(results))
     return pd.DataFrame(results)

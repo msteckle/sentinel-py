@@ -25,12 +25,11 @@ S2B_MSIL2A_20230928T190039_N0509_R013_T10VFU_20230928T221830.SAFE/
     └── AUX_DATA/
 """
 
-import os
-from typing import Iterable, Sequence
+from typing import Iterable
 from urllib.parse import quote
 import requests
-from shapely.geometry.base import BaseGeometry
 from collections.abc import Iterable
+import logging
 
 
 CDSE_BASE = "https://download.dataspace.copernicus.eu"
@@ -174,7 +173,6 @@ def _select_band_file(
 ) -> int | None:
     """
     Find the best-resolution file for a band (including SCL) and append it to targets.
-
     Returns the chosen resolution (in meters), or None if not found.
     """
     # 1) Which resolutions even have this band?
@@ -264,6 +262,7 @@ def select_s2_targets(
     *,
     possible_resolutions: Iterable[int] = (10, 20, 60),
     include_scl: bool = False,
+    logger: logging.Logger | None = None,
 ) -> tuple[list[tuple[str, ...]], str, str | None, dict[str, int | None]]:
     """
     Select band files for a Sentinel-2 scene at or above the requested resolution.
@@ -299,7 +298,11 @@ def select_s2_targets(
         Mapping of band ID -> chosen resolution (in meters),
         including "SCL" if requested, or None if not found.
     """
-    # get the SAFE root directory name
+    # initialize logger if not provided
+    if logger is None:
+        logger = logging.getLogger(__name__)
+
+    # find the SAFE root directory for this scene
     safe_root = find_scene_safe_directory(session, scene_id)
     tile = extract_tile_from_name(scene_name)
     granule_dir = find_granule_directory(session, scene_id, safe_root, tile)
@@ -307,60 +310,75 @@ def select_s2_targets(
     targets: list[tuple[str, ...]] = []
     band_res_map: dict[str, int | None] = {}
 
-    if granule_dir:
-        # get all possible band files organized by resolution
+    # warn and skip band selection if no granule directory is found
+    if not granule_dir:
+        logger.warning(
+            "Scene %s (%s): no granule directory found, skipping band selection",
+            scene_name, scene_id,
+        )
+    # if granule directory is found, look for bands at each resolution
+    else:
+        # list files under GRANULE/IMG_DATA/Rxxm/ to see which bands/res are available
         nodes_by_res: dict[int, list[dict]] = {}
         for res in sorted(set(int(r) for r in possible_resolutions)):
             try:
                 nodes_by_res[res] = list_scene_children(
-                    session,
-                    scene_id,
-                    safe_root,
-                    "GRANULE",
-                    granule_dir,
-                    "IMG_DATA",
+                    session, scene_id, safe_root, "GRANULE", granule_dir, "IMG_DATA", 
                     f"R{res}m",
                 )
+            # if the Rxxm folder doesn't exist, log and treat as no files at that res
             except requests.HTTPError:
+                logger.debug(
+                    "Scene %s: no R%dm directory found (may not exist)", scene_name, res
+                )
                 nodes_by_res[res] = []
 
-        # reflectance bands
         for band in bands:
+            # for each band, find the best available resolution and corresponding file
             chosen_res = _select_band_file(
-                band,
-                target_res_m,
-                nodes_by_res,
-                safe_root,
-                granule_dir,
-                targets,
+                band, target_res_m, nodes_by_res, safe_root, granule_dir, targets,
             )
             band_res_map[band] = chosen_res
+            if chosen_res is None:
+                logger.warning(
+                    "Scene %s: band %s not found at any resolution", scene_name, band
+                )
+            elif chosen_res != target_res_m:
+                logger.debug(
+                    "Scene %s: band %s not available at %dm, using %dm",
+                    scene_name, band, target_res_m, chosen_res,
+                )
 
-        # SCL band (classification), if requested
         if include_scl:
             scl_res = _select_band_file(
-                "SCL",
-                target_res_m,  # if only 20m exists, choose_best_resolution() -> 20
-                nodes_by_res,
-                safe_root,
-                granule_dir,
-                targets,
+                "SCL", target_res_m, nodes_by_res, safe_root, granule_dir, targets,
             )
             band_res_map["SCL"] = scl_res
+            if scl_res is None:
+                logger.warning(
+                    "Scene %s: SCL band not found at any resolution", scene_name
+                )
 
-        # OPTIONAL: only include tile-level XML if it actually exists
         try:
             granule_children = list_scene_children(
                 session, scene_id, safe_root, "GRANULE", granule_dir
             )
         except requests.HTTPError:
+            logger.debug(
+                "Scene %s: could not list granule children for MTD_TL.xml check", 
+                scene_name
+            )
             granule_children = []
 
         if any(c.get("Name", "") == "MTD_TL.xml" for c in granule_children):
             targets.append((safe_root, "GRANULE", granule_dir, "MTD_TL.xml"))
+        else:
+            logger.debug("Scene %s: MTD_TL.xml not found in granule", scene_name)
 
-    # always include scene-level XML
     targets.append((safe_root, "MTD_MSIL2A.xml"))
-
+    logger.debug(
+        "Scene %s: selected %d targets, band_res_map=%s",
+        scene_name, len(targets), band_res_map,
+    )
     return targets, safe_root, granule_dir, band_res_map
 

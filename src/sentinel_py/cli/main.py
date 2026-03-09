@@ -18,22 +18,19 @@ from typing import Annotated
 app = typer.Typer(
     help="Sentinel data and workflow CLI.",
     no_args_is_help=True,
-    pretty_exceptions_enable=False
 )
 s1 = typer.Typer(
     help="Sentinel-1 download, processing, and analysis tools.",
-    pretty_exceptions_enable=False
 )
 app.add_typer(s1, name="s1")
 s2 = typer.Typer(
     help="Sentinel-2 download, processing, and analysis tools.",
-    pretty_exceptions_enable=False
 )
 app.add_typer(s2, name="s2")
 
 
 DEFAULT_LOG_DIR = Path.home() / ".sentinel-py" / "logs"
-def setup_logging(logpath: Path | None = None, verbose: bool = False) -> Path:
+def setup_logging(logpath: Path = None, verbose: bool = False) -> Path:
     """
     Configure logging so that the *directory or prefix* is user-defined, but
     the log file name is automatically generated.
@@ -119,7 +116,7 @@ class GridClipOpts(str, Enum):
 )
 def bbox2geojson(
     bounds: Annotated[
-        str | tuple[float, float, float, float],
+        tuple[float, float, float, float],
         typer.Argument(
             help="Bounding box bounds as xmin ymin xmax ymax."
         )
@@ -156,21 +153,12 @@ def bbox2geojson(
         typer.echo(f"Logging to: {actual_log_path}")
 
     # handle inputted bounds argument
-    if isinstance(bounds, str):
-        raw = bounds.replace(",", " ").split()
-        parts = [float(p) for p in raw]
-        if len(parts) != 4:
-            raise typer.BadParameter(
-                f"Expected 4 values for bounds, got {len(parts)}: {parts=}"
-            )
-        xmin, ymin, xmax, ymax = parts
-    else:
-        try:
-            xmin, ymin, xmax, ymax = bounds
-        except Exception as exc:
-            raise typer.BadParameter(
-                f"Expected 4 floats (xmin, ymin, xmax, ymax), got: {bounds=}"
-            ) from exc
+    try:
+        xmin, ymin, xmax, ymax = bounds
+    except Exception as exc:
+        raise typer.BadParameter(
+            f"Expected 4 floats (xmin, ymin, xmax, ymax), got: {bounds=}"
+        ) from exc
 
     # call core function
     bbox_to_geojson(
@@ -264,7 +252,7 @@ def grid(
         )
     ],
     px: Annotated[
-        float | tuple[float, float], 
+        tuple[float, float], 
         typer.Argument(
             help="Grid cell size in decimal degrees as float or tuple of (dx, dy).",
         )
@@ -327,21 +315,16 @@ def grid(
         typer.echo(f"Logging to: {actual_log_path}")
 
     # handle cell size input
-    if isinstance(px, float):
-        if not (0.0001 <= px <= 180.0):
-            raise typer.BadParameter("Cell size must be between 0.0001 and 180.0")
-        dx = dy = px
-    else:
-        try:
-            if not all(0.0001 <= v <= 180.0 for v in px):
-                raise typer.BadParameter(
-                    "Cell size values must be between 0.0001 and 180.0"
-                )
-            dx, dy = px
-        except Exception as exc:
+    try:
+        if not all(0.0001 <= v <= 180.0 for v in px):
             raise typer.BadParameter(
-                f"Expected px as float or tuple of (dx, dy), got: {px=}"
-            ) from exc
+                "Cell size values must be between 0.0001 and 180.0"
+            )
+        dx, dy = px
+    except Exception as exc:
+        raise typer.BadParameter(
+            f"Expected px as float or tuple of (dx, dy), got: {px=}"
+        ) from exc
 
     # call core function
     overlay_latlon_grid(
@@ -567,7 +550,7 @@ def dn_offset(
         help="List of bands to process.")] = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"],
     res: Annotated[int, typer.Option(
         help="Target resolution in meters: 10, 20, or 60.")] = 20,
-    log_path: Annotated[Path | None, typer.Option(
+    log_path: Annotated[Path, typer.Option(
         help="Optional log file path. If omitted, default logging config is used.")] = None,
     verbose: Annotated[bool, typer.Option(
         help="Enable verbose logging to the console.")] = False,

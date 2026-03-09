@@ -7,14 +7,11 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Iterable
 import calendar
+import geopandas as gpd
+import hashlib
+import json
 
 import pandas as pd
-
-from sentinel_py.common.cdse_auth import AutoRefreshSession
-from sentinel_py.common.cdse_search import build_search_query, all_query_results
-from sentinel_py.s2.cdse_s2_nodes import select_s2_targets
-from sentinel_py.s2.cdse_s2_download import download_s2_targets
-from sentinel_py.common.aoi import aoi_as_geom
 
 # up top in case it ever changes:
 CDSE_CATALOGUE = "https://catalogue.dataspace.copernicus.eu/odata/v1"
@@ -41,8 +38,25 @@ def _fix_date(
         return date(year, month, last_day)
 
 
+def _query_cache_key(
+    aoi: gpd.GeoSeries,
+    collection_name: str,
+    product_type: str,
+    iso_windows: list[tuple[str, str]],
+) -> str:
+    """Generate a hash key from query parameters for cache invalidation."""
+    payload = {
+        "collection": collection_name,
+        "product": product_type,
+        "windows": iso_windows,
+        "aoi_wkt": aoi.union_all().wkt,  # stable representation of the AOI
+    }
+    return hashlib.md5(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
 def download_s2_scenes(
     aoi: Path,
+    crs: str,
     outdir: Path,
     years: Iterable[int],
     speriod: datetime,
@@ -62,11 +76,21 @@ def download_s2_scenes(
       - CDSE_USERNAME
       - CDSE_PASSWORD or CDSE_PASSWORD_FILE
     """
+    from sentinel_py.common.cdse_auth import AutoRefreshSession
+    from sentinel_py.common.cdse_search import (
+        build_search_query, 
+        all_query_results,
+        batch_geometries,
+    )
+    from sentinel_py.s2.cdse_s2_nodes import select_s2_targets
+    from sentinel_py.s2.cdse_s2_download import download_s2_targets
+    from sentinel_py.common.aoi import aoi_as_geom
+
     if logger is None:
         logger = logging.getLogger(__name__)
 
     # convert aoi to just geometry
-    aoi = aoi_as_geom(aoi)
+    aoi = aoi_as_geom(aoi, crs)
 
     # ensure list of years has at least one entry
     years = list(years)
@@ -94,39 +118,55 @@ def download_s2_scenes(
     token_cache: dict = {}
     results: list[dict] = []
 
-    # query products for each time window
-    all_rows: list[pd.DataFrame] = []
-    for start_iso, end_iso in iso_windows:
-        logger.info("Querying CDSE for requested window: %s -> %s", start_iso, end_iso)
-        query_url = build_search_query(
-            aoi=aoi,
-            catalogue_odata=CDSE_CATALOGUE,
-            collection_name=s2collection,
-            product_type=s2product,
-            start_iso=start_iso,
-            end_iso=end_iso,
+    # set up visible caching for queries since they take a long time
+    cache_key = _query_cache_key(aoi, s2collection, s2product, iso_windows)
+    products_cache = Path.cwd() / "cache" / f"products_{cache_key}.parquet"
+    if products_cache.exists():
+        logger.info("Loading cached products from %s", products_cache)
+        products = pd.read_parquet(products_cache)
+    else:
+        # split aoi into batches that fit within URL length limit
+        aoi_batches = batch_geometries(aoi)
+        logger.info("AOI split into %d batch(es) for querying", len(aoi_batches))
+
+        # query products for each time window and aoi batch
+        all_rows: list[pd.DataFrame] = []
+        for start_iso, end_iso in iso_windows:
+            logger.info("Querying CDSE for requested window: %s -> %s", start_iso, end_iso)
+            for batch_geom in aoi_batches:
+                query_url = build_search_query(
+                    aoi=batch_geom,
+                    catalogue_odata=CDSE_CATALOGUE,
+                    collection_name=s2collection,
+                    product_type=s2product,
+                    start_iso=start_iso,
+                    end_iso=end_iso,
+                )
+                df = all_query_results(query_url)
+                if df.empty:
+                    logger.warning(
+                        "No products returned for window %s -> %s (batch %d of %d)",
+                        start_iso, end_iso, aoi_batches.index(batch_geom) + 1,
+                        len(aoi_batches),
+                    )
+                else:
+                    df = df.assign(window_start=start_iso, window_end=end_iso)
+                    all_rows.append(df)
+
+        if not all_rows:
+            logger.warning("No products found for given AOI and date windows.")
+            return pd.DataFrame()
+
+        products = pd.concat(all_rows, ignore_index=True).drop_duplicates(subset="Id")
+        logger.info(
+            "Found %d unique products across %d window(s) and %d batch(es)",
+            len(products), len(iso_windows), len(aoi_batches),
         )
 
-        # get query results as dataframe
-        df = all_query_results(query_url)
-        if df.empty:
-            logger.warning(
-                "No products returned for window %s -> %s", start_iso, end_iso
-            )
-        else:
-            df = df.assign(window_start=start_iso, window_end=end_iso)
-            all_rows.append(df)
-
-    # combine all query results into single dataframe
-    if not all_rows:
-        logger.warning("No products found for given AOI and date windows.")
-        return pd.DataFrame()
-    
-    # if products are found, log total count across all windows
-    products = pd.concat(all_rows, ignore_index=True)
-    logger.info(
-        "Found %d total products across %d window(s)", len(products), len(iso_windows)
-    )
+        # save to cache
+        outdir.mkdir(parents=True, exist_ok=True)
+        products.to_parquet(products_cache)
+        logger.info("Cached products to %s", products_cache)
 
     # iterate over products and download targets for each product
     with AutoRefreshSession(

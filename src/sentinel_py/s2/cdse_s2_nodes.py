@@ -287,16 +287,9 @@ def select_s2_targets(
 
     Returns
     -------
-    targets : list[tuple[str, ...]]
-        List of node path segments for each selected file
-        (SAFE root, GRANULE, IMG_DATA, Rxxm, filename).
-    safe_root : str
-        Name of the SAFE root directory.
-    granule_dir : str | None
-        Name of the selected GRANULE directory, if found.
-    band_res_map : dict[str, int | None]
-        Mapping of band ID -> chosen resolution (in meters),
-        including "SCL" if requested, or None if not found.
+    targets : list of tuple of str
+        List of target paths to download, where each target is a tuple of path
+        segments inside the SAFE structure
     """
     # initialize logger if not provided
     if logger is None:
@@ -313,8 +306,8 @@ def select_s2_targets(
     # warn and skip band selection if no granule directory is found
     if not granule_dir:
         logger.warning(
-            "Scene %s (%s): no granule directory found, skipping band selection",
-            scene_name, scene_id,
+            f"Scene {scene_name} ({scene_id}): no granule directory found, "
+            f"skipping band selection"
         )
     # if granule directory is found, look for bands at each resolution
     else:
@@ -328,9 +321,7 @@ def select_s2_targets(
                 )
             # if the Rxxm folder doesn't exist, log and treat as no files at that res
             except requests.HTTPError:
-                logger.debug(
-                    "Scene %s: no R%dm directory found (may not exist)", scene_name, res
-                )
+                logger.debug(f"Scene {scene_name}: no R{res}m directory found")
                 nodes_by_res[res] = []
 
         for band in bands:
@@ -341,14 +332,15 @@ def select_s2_targets(
             band_res_map[band] = chosen_res
             if chosen_res is None:
                 logger.warning(
-                    "Scene %s: band %s not found at any resolution", scene_name, band
+                    f"Scene {scene_name}: band {band} not found at any resolution"
                 )
             elif chosen_res != target_res_m:
                 logger.debug(
-                    "Scene %s: band %s not available at %dm, using %dm",
-                    scene_name, band, target_res_m, chosen_res,
+                    f"Scene {scene_name}: band {band} not available at {target_res_m}"
+                    f"m, using {chosen_res}m instead"
                 )
 
+        # optionally include SCL band at best available resolution
         if include_scl:
             scl_res = _select_band_file(
                 "SCL", target_res_m, nodes_by_res, safe_root, granule_dir, targets,
@@ -356,29 +348,30 @@ def select_s2_targets(
             band_res_map["SCL"] = scl_res
             if scl_res is None:
                 logger.warning(
-                    "Scene %s: SCL band not found at any resolution", scene_name
+                    f"Scene {scene_name}: SCL band not found at any resolution"
                 )
 
+        # if no bands were found, log a warning
         try:
             granule_children = list_scene_children(
                 session, scene_id, safe_root, "GRANULE", granule_dir
             )
         except requests.HTTPError:
             logger.debug(
-                "Scene %s: could not list granule children for MTD_TL.xml check", 
-                scene_name
+                f"Scene {scene_name}: could not list granule children for xml check"
             )
             granule_children = []
 
+        # if MTD_TL.xml exists under the granule, add it to targets for download
         if any(c.get("Name", "") == "MTD_TL.xml" for c in granule_children):
             targets.append((safe_root, "GRANULE", granule_dir, "MTD_TL.xml"))
         else:
-            logger.debug("Scene %s: MTD_TL.xml not found in granule", scene_name)
+            logger.debug(f"Scene {scene_name}: MTD_TL.xml not found in granule")
 
+    # regardless of whether we found a granule or bands, download the MTD_MSIL2A.xml
     targets.append((safe_root, "MTD_MSIL2A.xml"))
     logger.debug(
-        "Scene %s: selected %d targets, band_res_map=%s",
-        scene_name, len(targets), band_res_map,
+        f"Scene {scene_name}: selected {len(targets)} targets, {band_res_map=}"
     )
-    return targets, safe_root, granule_dir, band_res_map
+    return targets
 

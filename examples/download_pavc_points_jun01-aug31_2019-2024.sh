@@ -14,7 +14,6 @@ sentinel-py csv2geojson \
   --lon longitude \
   --lat latitude \
   --output /mnt/poseidon/remotesensing/6ru/sentinel-py/data/aois/pavc_lt25gps_mostrecent_outlier-removed.geojson \
-  --log $LOGPATH/geojson
 
 sentinel-py s2 download \
   --aoi /mnt/poseidon/remotesensing/6ru/sentinel-py/data/aois/pavc_lt25gps_mostrecent_outlier-removed.geojson \

@@ -26,7 +26,7 @@ def build_search_query(
     return f"{catalogue_odata}/Products?$top=100&$filter={filter_expr}"
 
 
-def fetch_all_products(
+def all_query_results(
     url: str,
     *,
     session: requests.Session | None = None,
@@ -38,11 +38,9 @@ def fetch_all_products(
     """
     if logger is None:
         logger = logging.getLogger(__name__)
-
     sess = session or requests.Session()
 
     items: list[dict] = []
-
     while url:
         logger.debug("Fetching page: %s", url)
         r = sess.get(url, timeout=timeout)

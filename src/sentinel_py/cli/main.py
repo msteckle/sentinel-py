@@ -94,7 +94,6 @@ def setup_logging(logpath: Path = None, verbose: bool = False) -> Path:
     handlers.append(file_handler)
 
     logging.basicConfig(
-        level=logging.DEBUG,
         handlers=handlers,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         force=True,

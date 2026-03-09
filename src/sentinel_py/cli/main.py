@@ -9,6 +9,8 @@ from enum import Enum
 import typer
 from typing import Annotated
 
+LOG_COMPLEXITY = logging.INFO
+
 
 ########################################################################################
 # Application creation and helper funcs
@@ -83,12 +85,12 @@ def setup_logging(logpath: Path = None, verbose: bool = False) -> Path:
 
     # console handler
     console = logging.StreamHandler(sys.stderr)
-    console.setLevel(logging.DEBUG if verbose else logging.INFO)
+    console.setLevel(logging.DEBUG if verbose else logging.WARNING)
     handlers.append(console)
 
     # file handler
     file_handler = logging.FileHandler(logfile)
-    file_handler.setLevel(logging.DEBUG)
+    file_handler.setLevel(LOG_COMPLEXITY)
     handlers.append(file_handler)
 
     logging.basicConfig(

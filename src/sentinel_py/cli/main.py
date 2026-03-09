@@ -1,36 +1,46 @@
 from pathlib import Path
-from typing import Optional, List
 import datetime as dt
 import logging
 import sys
 from venv import logger
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from enum import Enum
 
 import typer
-from typing_extensions import Annotated
+from typing import Annotated
 
-# Set up main app and subcommands
+
+########################################################################################
+# Application creation and helper funcs
+########################################################################################
+
+# set up main app and subcommands
 app = typer.Typer(
     help="Sentinel data and workflow CLI.",
     no_args_is_help=True,
+    pretty_exceptions_enable=False
 )
-s1 = typer.Typer(help="Sentinel-1 download, processing, and analysis tools.")
+s1 = typer.Typer(
+    help="Sentinel-1 download, processing, and analysis tools.",
+    pretty_exceptions_enable=False
+)
 app.add_typer(s1, name="s1")
-s2 = typer.Typer(help="Sentinel-2 download, processing, and analysis tools.")
+s2 = typer.Typer(
+    help="Sentinel-2 download, processing, and analysis tools.",
+    pretty_exceptions_enable=False
+)
 app.add_typer(s2, name="s2")
 
 
-# Default directory where log files are stored if --log-file is not given
 DEFAULT_LOG_DIR = Path.home() / ".sentinel-py" / "logs"
-
-def setup_logging(log_path: Path | None = None, verbose: bool = False) -> Path:
+def setup_logging(logpath: Path | None = None, verbose: bool = False) -> Path:
     """
     Configure logging so that the *directory or prefix* is user-defined, but
     the log file name is automatically generated.
 
     Parameters
     ----------
-    log_path : Path or None
+    logpath : Path or None
         - If None: logs go in ~/.sentinel-py/logs/sentinel_py_<timestamp>.log
         - If a directory: the file is created inside it
         - If a file-like path: acts as a prefix; timestamp and .log are appended
@@ -44,39 +54,39 @@ def setup_logging(log_path: Path | None = None, verbose: bool = False) -> Path:
     """
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Determine final log file path
-    if log_path is None:
-        # Default location
+    # determine final log file path
+    if logpath is None:
+        # default location
         log_dir = DEFAULT_LOG_DIR
         log_dir.mkdir(parents=True, exist_ok=True)
         logfile = log_dir / f"sentinel_py_{timestamp}.log"
 
     else:
-        # Normalize
-        log_path = Path(log_path)
+        # normalize
+        logpath = Path(logpath)
 
-        if log_path.exists() and log_path.is_dir():
-            # User gave a directory → use it
-            log_path.mkdir(parents=True, exist_ok=True)
-            logfile = log_path / f"sentinel_py_{timestamp}.log"
+        if logpath.exists() and logpath.is_dir():
+            # user gave a directory → use it
+            logpath.mkdir(parents=True, exist_ok=True)
+            logfile = logpath / f"sentinel_py_{timestamp}.log"
 
         else:
-            # User gave a prefix (e.g., logs/myrun)
-            parent = log_path.parent
+            # user gave a prefix (e.g., logs/myrun)
+            parent = logpath.parent
             if parent != Path('.'):
                 parent.mkdir(parents=True, exist_ok=True)
-            prefix = log_path.name
+            prefix = logpath.name
             logfile = parent / f"{prefix}_{timestamp}.log"
 
-    # Configure handlers
+    # configure handlers
     handlers: list[logging.Handler] = []
 
-    # Console handler
+    # console handler
     console = logging.StreamHandler(sys.stderr)
     console.setLevel(logging.DEBUG if verbose else logging.INFO)
     handlers.append(console)
 
-    # File handler
+    # file handler
     file_handler = logging.FileHandler(logfile)
     file_handler.setLevel(logging.DEBUG)
     handlers.append(file_handler)
@@ -90,87 +100,151 @@ def setup_logging(log_path: Path | None = None, verbose: bool = False) -> Path:
     return logfile
 
 
+########################################################################################
+# General commands
+########################################################################################
+
+class GridClipOpts(str, Enum):
+    intersect = "intersect"
+    within = "within"
+    all = "all"
+
+
 @app.command(
-    "aoi",
+    "bbox2geojson",
     help=(
-        "Create an Area Of Interest (AOI) GeoJSON given a bounding box string. "
-        "The output AOI is in EPGS:4326 because that is what CDSE expects for queries."
+        "Create a bounding box GeoJSON given xmin, ymin, xmax, ymax. "
+        "The output bbox will always be in EPSG:4326 (lat/lon)."
     ),
 )
-def aoi(
-    bbox: str = typer.Option(
-        ...,
-        help=(
-            "Bounding box as a string in the form 'xmin ymin xmax ymax'. "
-            "Commas or spaces are accepted."
-        ),
-    ),
-    output_file: Path = typer.Option(
-        "aoi.geojson", help="Output .geojson file."
-    ),
-    log_path: Optional[Path] = typer.Option(
-        None,
-        help=(
-            "Optional log file path. If omitted and --verbose is used, logs are "
-            f"written to {DEFAULT_LOG_DIR}. Use --verbose for console output."
-        ),
-    ),
-    verbose: bool = typer.Option(
-        False,
-        "--verbose",
-        "-v",
-        help="Enable verbose logging to the console.",
-    ),
+def bbox2geojson(
+    bounds: Annotated[
+        str | tuple[float, float, float, float],
+        typer.Argument(
+            help="Bounding box bounds as xmin ymin xmax ymax."
+        )
+    ],
+    output: Annotated[
+        Path,
+        typer.Argument(
+            help="Output file path for the bbox GeoJSON.",
+            dir_okay=False,
+        )
+    ] = Path("bbox.geojson"),
+    log: Annotated[
+        Path,
+        typer.Option(
+            help=(
+                "Log file path. If omitted and --verbose is used, logs are written to "
+                f"{DEFAULT_LOG_DIR}. Use --verbose for console output.",
+            ),
+        )
+    ] = None,
+    verbose: Annotated[
+        bool, 
+        typer.Option(
+            "--verbose", "-v",
+            help="Enable verbose logging to the console.",
+        )
+    ] = False,
 ):
-    """
-    Create an AOI polygon from a bounding box and optionally write it to GeoJSON.
-    """
-    from sentinel_py.common.aoi import create_aoi_geojson
+    from sentinel_py.common.aoi import bbox_to_geojson
 
-    # Optional logging: enabled only if user requests file or verbose output
-    if log_path is not None or verbose:
-        actual_log_path = setup_logging(log_path, verbose)
+    # set up logging
+    if log is not None or verbose:
+        actual_log_path = setup_logging(log, verbose)
         typer.echo(f"Logging to: {actual_log_path}")
 
-    # Parse user-provided bbox string: accept commas OR spaces
-    try:
-        raw = bbox.replace(",", " ").split()
+    # handle inputted bounds argument
+    if isinstance(bounds, str):
+        raw = bounds.replace(",", " ").split()
         parts = [float(p) for p in raw]
         if len(parts) != 4:
-            raise ValueError
+            raise typer.BadParameter(
+                f"Expected 4 values for bounds, got {len(parts)}: {parts=}"
+            )
         xmin, ymin, xmax, ymax = parts
-    except Exception:
-        typer.secho(
-            (
-                "Error: bbox must be 4 floats like 'xmin,ymin,xmax,ymax' "
-                "(e.g. '-150,68,-148,70')."
-            ),
-            fg=typer.colors.RED,
-            err=True,
-        )
-        raise typer.Exit(code=1)
+    else:
+        try:
+            xmin, ymin, xmax, ymax = bounds
+        except Exception as exc:
+            raise typer.BadParameter(
+                f"Expected 4 floats (xmin, ymin, xmax, ymax), got: {bounds=}"
+            ) from exc
 
-    # Validate coordinates
-    if xmin >= xmax:
-        typer.secho(
-            "Error: xmin must be less than xmax.",
-            fg=typer.colors.RED,
-            err=True,
-        )
-        raise typer.Exit(code=1)
-
-    if ymin >= ymax:
-        typer.secho(
-            "Error: ymin must be less than ymax.",
-            fg=typer.colors.RED,
-            err=True,
-        )
-        raise typer.Exit(code=1)
-
-    # Call core function
-    create_aoi_geojson(
+    # call core function
+    bbox_to_geojson(
         bbox=(xmin, ymin, xmax, ymax),
-        output_file=output_file,
+        crs="EPSG:4326",
+        output=output,
+    )
+
+
+@app.command(
+    "csv2geojson",
+    help=(
+        "Create a GeoJSON from a CSV with latitude and longitude columns. "
+        "The output GeoJSON will be in EPSG:4326 (lat/lon)."
+    )
+)
+def csv2geojson(
+    csv: Annotated[
+        Path,
+        typer.Argument(
+            help="Path to input CSV file.",
+            exists=True,
+            dir_okay=False,
+        )
+    ],
+    lon: Annotated[
+        str,
+        typer.Argument(
+            help="Name of the longitude column in the CSV."
+        )
+    ],
+    lat: Annotated[
+        str,
+        typer.Argument(
+            help="Name of the latitude column in the CSV."
+        )
+    ],
+    output: Annotated[
+        Path,
+        typer.Argument(
+            help="Output file path for the GeoJSON.",
+            dir_okay=False,
+        )
+    ] = Path("points.geojson"),
+    log: Annotated[
+        Path,
+        typer.Option(
+            help=(
+                "Log file path. If omitted and --verbose is used, logs are written to "
+                f"{DEFAULT_LOG_DIR}. Use --verbose for console output.",
+            ),
+        )
+    ] = None,
+    verbose: Annotated[
+        bool, 
+        typer.Option(
+            "--verbose", "-v",
+            help="Enable verbose logging to the console.",
+        )
+    ] = False,
+):
+    from sentinel_py.common.aoi import csv_to_geojson
+
+    # set up logging
+    if log is not None or verbose:
+        actual_log_path = setup_logging(log, verbose)
+        typer.echo(f"Logging to: {actual_log_path}")
+
+    # call core function
+    csv_to_geojson(
+        csv_path=csv,
+        lat=lat,
+        lon=lon,
+        output=output,
     )
 
 
@@ -182,83 +256,148 @@ def aoi(
     ),
 )
 def grid(
-    aoi_file: Path = typer.Option(..., exists=True, help="AOI file readable by pyogrio."),
-    dx_deg: float = typer.Option(..., help="Grid cell size in degrees (longitude)."),
-    dy_deg: float = typer.Option(..., help="Grid cell size in degrees (latitude)."),
-    clip_to_aoi: bool = typer.Option(True, help="Clip grid cells to AOI."),
-    fill_aoi_holes: bool = typer.Option(True, help="Fill holes in AOI geometry."),
-    fill_cell_holes: bool = typer.Option(True, help="Fill holes in grid cells."),
-    out_file: Path = typer.Option("grid.geojson", help="Output .geojson file."),
-    log_path: Optional[Path] = typer.Option(
-        None,
-        help=(
-            "Optional log file path. If omitted and --verbose is used, logs are "
-            f"written to {DEFAULT_LOG_DIR}. Use --verbose for console output."
-        ),
-    ),
-    verbose: bool = typer.Option(
-        False,
-        "--verbose",
-        "-v",
-        help="Enable verbose logging to the console.",
-    ),
+    aoi: Annotated[
+        Path, 
+        typer.Argument(
+            exists=True, 
+            help="Path to area of interest legible by pyogrio."
+        )
+    ],
+    px: Annotated[
+        float | tuple[float, float], 
+        typer.Argument(
+            help="Grid cell size in decimal degrees as float or tuple of (dx, dy).",
+        )
+    ],
+    crs: Annotated[
+        str,
+        typer.Option(
+            help=(
+                "CRS of the input aoi file. Default is EPSG:4326 (lat/lon degrees). "
+                "The output grid will always be in EPSG:4326."
+            )
+        )
+    ] = "EPSG:4326",
+    fill_holes: Annotated[
+        bool, 
+        typer.Option(
+            help="Fill holes in aoi geometry."
+        )
+    ] = True,
+    clip: Annotated[
+        GridClipOpts, 
+        typer.Option(
+            case_sensitive=False,
+            help=(
+                "How grid cells are subselected based on their spatial relationship to "
+                "the aoi geometry. Options: 'intersect' (keep cells that intersect the "
+                "aoi), 'within' (keep cells fully within the aoi), or 'all' (keep all "
+                "cells within the bounding box of the aoi)."
+            ),
+        )
+    ] = GridClipOpts.intersect,
+    output: Annotated[
+        Path,
+        typer.Option(
+            help="Output .geojson file.",
+        )
+    ] = Path("grid.geojson"),
+    log: Annotated[
+        Path,
+        typer.Option(
+            help=(
+                "Log file path. If omitted and --verbose is used, logs are written to "
+                f"{DEFAULT_LOG_DIR}. Use --verbose for console output."
+            ),
+        )
+    ] = None,
+    verbose: Annotated[
+        bool, 
+        typer.Option(
+            "--verbose", "-v",
+            help="Enable verbose logging to the console.",
+        )
+    ] = False,
 ):
-    """
-    Create a regular lat/lon grid over an AOI and optionally write to GeoJSON.
-    """
     from sentinel_py.common.aoi import overlay_latlon_grid
 
-    if dx_deg <= 0 or dy_deg <= 0:
-        typer.secho(
-            "Error: dx_deg and dy_deg must be positive.",
-            fg=typer.colors.RED,
-            err=True,
-        )
-        raise typer.Exit(code=1)
-
-    # Optional logging
-    if log_path is not None or verbose:
-        actual_log_path = setup_logging(log_path, verbose)
+    # optional logging
+    if log is not None or verbose:
+        actual_log_path = setup_logging(log, verbose)
         typer.echo(f"Logging to: {actual_log_path}")
 
+    # handle cell size input
+    if isinstance(px, float):
+        if not (0.0001 <= px <= 180.0):
+            raise typer.BadParameter("Cell size must be between 0.0001 and 180.0")
+        dx = dy = px
+    else:
+        try:
+            if not all(0.0001 <= v <= 180.0 for v in px):
+                raise typer.BadParameter(
+                    "Cell size values must be between 0.0001 and 180.0"
+                )
+            dx, dy = px
+        except Exception as exc:
+            raise typer.BadParameter(
+                f"Expected px as float or tuple of (dx, dy), got: {px=}"
+            ) from exc
+
+    # call core function
     overlay_latlon_grid(
-        aoi=aoi_file,
-        cell_size_deg=(dx_deg, dy_deg),
-        clip_to_aoi=clip_to_aoi,
-        fill_aoi_holes=fill_aoi_holes,
-        fill_cell_holes=fill_cell_holes,
-        out_file=out_file,
+        aoi=aoi,
+        cell_size_deg=(dx, dy),
+        crs=crs,
+        fill_holes=fill_holes,
+        clip=clip,
+        output=output,
     )
 
 
-@app.command(
-    "translate",
-    help=(
-        "Wrapper around gdal.Translate to convert raster files to different formats. " \
-        "E.g., convert VRT to GeoTIFF."
-    ),
-)
-def translate(
-    src_file: Annotated[Path, typer.Option(
-        help="Source raster file path.")],
-    dst_file: Annotated[Path, typer.Option(
-        help="Destination raster file path.")],
-    options: Annotated[List[str], typer.Option(
-        help=(
-            "List of gdal.Translate options as strings. "
-            "E.g., --options '-of VRT' '-co COMPRESS=LZW'"
-        ))] | None = None,
-):
-    """
-    GDAL Translate with Python PixelFunction support enabled.
-    """
-    from sentinel_py.common.gdal import gdaltranslate
+########################################################################################
+# Sentinel-2 commands
+########################################################################################
 
-    gdaltranslate(
-        src_file=src_file,
-        dst_file=dst_file,
-        options=options,
-    )
+class CDSECollections(str, Enum):
+    """CDSE collection names that can be downloaded with this CLI."""
+    sentinel2 = "SENTINEL-2"
+    # sentinel1 = "SENTINEL-1"  # not implemented yet, but could be
+
+
+class CDSESentinel2Products(str, Enum):
+    """CDSE Sentinel-2 product types that can be downloaded with this CLI."""
+    msi2a = "S2MSI2A"
+    # msi1c = "S2MSI1C"  # not implemented yet, but could be
+
+
+class CDSESentinel2Bands(str, Enum):
+    """CDSE Sentinel-2 bands that can be downloaded with this CLI."""
+    b02 = "B02"
+    b03 = "B03"
+    b04 = "B04"
+    b05 = "B05"
+    b06 = "B06"
+    b07 = "B07"
+    b08 = "B08"
+    b8a = "B8A"
+    b09 = "B09"
+    b10 = "B10"
+    b11 = "B11"
+    b12 = "B12"
+
+    @classmethod
+    def default_bands(cls) -> list["CDSESentinel2Bands"]:
+        """Default bands to download if not specified in `download` command."""
+        return [
+            cls.b02, cls.b03, cls.b04, cls.b05, cls.b06, 
+            cls.b07, cls.b08, cls.b8a, cls.b11, cls.b12
+        ]
+
+
+class CDSESentinel2Res(str, Enum):
+    r10m = "10m"
+    r20m = "20m"
+    r60m = "60m"
 
 
 @s2.command(
@@ -269,76 +408,110 @@ def translate(
     ),
 )
 def download(
-    input_aoi: Annotated[Path, typer.Option(
-        help="AOI file (GeoJSON, shapefile, etc.).")],
-    output_dir: Annotated[Path, typer.Option(
-        help="Output directory for downloaded data.")],
-    years: Annotated[str, typer.Option(
-        help="""Space-separated list of years in quotes. E.g., "2020 2021 2022".""")],
-    speriod: Annotated[str, typer.Option(
-        help="Start of seasonal window as MM-DD. E.g. --period-start 06-01)")],
-    eperiod: Annotated[str, typer.Option(
-        help="End of seasonal window as MM-DD. E.g. --period-end 08-31)")],
-    collection: Annotated[str, typer.Option(
-        help="CDSE collection name.")] = "SENTINEL-2",
-    product: Annotated[str, typer.Option(
-        help="Product type within the collection.")] = "S2MSI2A",
-    bands: Annotated[List[str], typer.Option(
-        help="List of bands to download.")] = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"],
-    include_scl: Annotated[bool, typer.Option(
-        help="Include the SCL band in the download.")] = True,
-    res: Annotated[int, typer.Option(
-        help="Target resolution in meters: 10, 20, or 60.")] = 20,
-    max_workers: Annotated[int, typer.Option(
-        help="Maximum number of worker threads for file downloads.")] = 4,
-    log_path: Annotated[Path, typer.Option(
-        help=f"Optional log file path. If omitted, logs are written to {DEFAULT_LOG_DIR} automatically.")] = None,
-    verbose: Annotated[bool, typer.Option(
-        help="Enable verbose logging to the console.")] = False,
+    aoi: Annotated[
+        Path, 
+        typer.Argument(
+            help="The aoi file (GeoJSON, shapefile, etc.).",
+            exists=True,
+            dir_okay=False,
+        )
+    ],
+    outdir: Annotated[
+        Path, 
+        typer.Argument(
+            help="Output directory for downloaded data.",
+            file_okay=False,
+        )
+    ],
+    years: Annotated[
+        list[int], 
+        typer.Argument(
+            help="Years of data to download.",
+        )
+    ],
+    speriod: Annotated[
+        dt.datetime, 
+        typer.Option(
+            help="Start month and day of seasonal download window.",
+            formats=["%m-%d", "%m/%d", "%m %d", "%b-%d", "%b %d", "%B-%d", "%B %d"],
+        )
+    ] = dt.datetime.strptime("01-01", "%m-%d"),
+    eperiod: Annotated[
+        dt.datetime,
+        typer.Option(
+            help="End month and day of seasonal download window.",
+            formats=["%m-%d", "%m/%d", "%m %d", "%b-%d", "%b %d", "%B-%d", "%B %d"],
+        )
+    ] = dt.datetime.strptime("12-31", "%m-%d"),
+    collection: Annotated[
+        CDSECollections, 
+        typer.Option(
+            help="CDSE collection name."
+        )
+    ] = CDSECollections.sentinel2,
+    product: Annotated[
+        CDSESentinel2Products, 
+        typer.Option(
+            help="Product type within the collection."
+        )
+    ] = CDSESentinel2Products.msi2a,
+    bands: Annotated[
+        list[CDSESentinel2Bands], 
+        typer.Option(
+            help="List of bands to download."
+        )
+    ] = CDSESentinel2Bands.default_bands(),
+    include_scl: Annotated[
+        bool, 
+        typer.Option(
+            help="Whether to include the SCL band in the download."
+        )
+    ] = True,
+    res: Annotated[
+        CDSESentinel2Res, 
+        typer.Option(
+            help="Target resolution in meters: 10, 20, or 60."
+        )
+    ] = CDSESentinel2Res.r20m,
+    max_workers: Annotated[
+        int, 
+        typer.Option(
+            help="Maximum number of worker threads for file downloads."
+        )
+    ] = 4,
+    log: Annotated[
+        Path,
+        typer.Option(
+            help=(
+                "Log file path. If omitted and --verbose is used, logs are written to "
+                f"{DEFAULT_LOG_DIR}. Use --verbose for console output."
+            ),
+        )
+    ] = None,
+    verbose: Annotated[
+        bool, 
+        typer.Option(
+            "--verbose", "-v",
+            help="Enable verbose logging to the console.",
+        )
+    ] = False,
 ):
-    """
-    Download Sentinel-2 scenes for a seasonal window over an AOI.
-    """
     from sentinel_py.s2.workflows.download_s2 import download_s2_scenes
 
-    # Unpack years from space-separated string
-    try:
-        years = [int(y) for y in years.split()]
-    except ValueError:
-        typer.secho(
-            """Error: --years must be space-separated integers, e.g. --years "2020 2021 2022".""",
-            fg=typer.colors.RED,
-            err=True,
-        )
-        raise typer.Exit(code=1)
-    
-    # Unpack month/day from period_start and period_end
-    try:
-        smonth, sday = [int(part) for part in speriod.split("-")]
-        emonth, eday = [int(part) for part in eperiod.split("-")]
-    except ValueError:
-        typer.secho(
-            """Error: --speriod and --eperiod must be in MM-DD format, e.g. --speriod 06-01.""",
-            fg=typer.colors.RED,
-            err=True,
-        )
-        raise typer.Exit(code=1)
-
-    # Always log for downloads (they are longer and more complex)
-    actual_log_path = setup_logging(log_path, verbose)
+    # always log for downloads
+    actual_log_path = setup_logging(log, verbose)
     typer.echo(f"Logging to: {actual_log_path}")
-    
     logger = logging.getLogger("sentinel_py.s2.workflows.download_s2")
     download_s2_scenes(
-        aoi_path=input_aoi,
-        output_root=output_dir,
+        aoi=aoi,
+        outdir=outdir,
         years=years,
-        period_start=(smonth, sday),
-        period_end=(emonth, eday),
-        collection_name=collection,
-        product_type=product,
-        bands=bands,
-        target_res_m=res,
+        speriod=speriod,
+        eperiod=eperiod,
+        s2collection=collection,
+        s2product=product,
+        s2bands=bands,
+        s2res=res,
         include_scl=include_scl,
         max_workers_files=max_workers,
         logger=logger,
@@ -390,7 +563,7 @@ def dn_offset(
         help="Start of seasonal window as MM-DD. E.g. --speriod 06-01")],
     eperiod: Annotated[str, typer.Option(
         help="End of seasonal window as MM-DD. E.g. --eperiod 08-31")],
-    bands: Annotated[List[str], typer.Option(
+    bands: Annotated[list[str], typer.Option(
         help="List of bands to process.")] = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"],
     res: Annotated[int, typer.Option(
         help="Target resolution in meters: 10, 20, or 60.")] = 20,

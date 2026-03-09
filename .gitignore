@@ -15,3 +15,6 @@ data/s2
 data/logs
 data/tests
 data/aois
+
+# Cache
+examples/cache

@@ -134,8 +134,6 @@ def download_s2_targets(
         for fut in as_completed(futs):
             segments, status = fut.result()
             if status != "ok":
-                seg_str = "/".join(segments)
-                logger.error("Failure downloading %s: %s", seg_str, status)
                 failures.append({"segments": tuple(segments), "status": status})
 
     if failures:

@@ -18,13 +18,16 @@ from typing import Annotated
 app = typer.Typer(
     help="Sentinel data and workflow CLI.",
     no_args_is_help=True,
+    pretty_exceptions_enable=False,
 )
 s1 = typer.Typer(
     help="Sentinel-1 download, processing, and analysis tools.",
+    pretty_exceptions_enable=False,
 )
 app.add_typer(s1, name="s1")
 s2 = typer.Typer(
     help="Sentinel-2 download, processing, and analysis tools.",
+    pretty_exceptions_enable=False,
 )
 app.add_typer(s2, name="s2")
 
@@ -112,18 +115,18 @@ class GridClipOpts(str, Enum):
     help=(
         "Create a bounding box GeoJSON given xmin, ymin, xmax, ymax. "
         "The output bbox will always be in EPSG:4326 (lat/lon)."
-    ),
+    )
 )
 def bbox2geojson(
     bounds: Annotated[
         tuple[float, float, float, float],
-        typer.Argument(
+        typer.Option(
             help="Bounding box bounds as xmin ymin xmax ymax."
         )
     ],
     output: Annotated[
         Path,
-        typer.Argument(
+        typer.Option(
             help="Output file path for the bbox GeoJSON.",
             dir_okay=False,
         )
@@ -133,7 +136,7 @@ def bbox2geojson(
         typer.Option(
             help=(
                 "Log file path. If omitted and --verbose is used, logs are written to "
-                f"{DEFAULT_LOG_DIR}. Use --verbose for console output.",
+                f"{DEFAULT_LOG_DIR}. Use --verbose for console output."
             ),
         )
     ] = None,
@@ -178,7 +181,7 @@ def bbox2geojson(
 def csv2geojson(
     csv: Annotated[
         Path,
-        typer.Argument(
+        typer.Option(
             help="Path to input CSV file.",
             exists=True,
             dir_okay=False,
@@ -186,19 +189,25 @@ def csv2geojson(
     ],
     lon: Annotated[
         str,
-        typer.Argument(
+        typer.Option(
             help="Name of the longitude column in the CSV."
         )
     ],
     lat: Annotated[
         str,
-        typer.Argument(
+        typer.Option(
             help="Name of the latitude column in the CSV."
         )
     ],
+    crs: Annotated[
+        str,
+        typer.Option(
+            help="CRS of the lat/lon coordinates in the CSV."
+        )
+    ] = "EPSG:4326",
     output: Annotated[
         Path,
-        typer.Argument(
+        typer.Option(
             help="Output file path for the GeoJSON.",
             dir_okay=False,
         )
@@ -208,7 +217,7 @@ def csv2geojson(
         typer.Option(
             help=(
                 "Log file path. If omitted and --verbose is used, logs are written to "
-                f"{DEFAULT_LOG_DIR}. Use --verbose for console output.",
+                f"{DEFAULT_LOG_DIR}. Use --verbose for console output."
             ),
         )
     ] = None,
@@ -229,9 +238,10 @@ def csv2geojson(
 
     # call core function
     csv_to_geojson(
-        csv_path=csv,
-        lat=lat,
+        csv=csv,
         lon=lon,
+        lat=lat,
+        crs=crs,
         output=output,
     )
 
@@ -246,14 +256,14 @@ def csv2geojson(
 def grid(
     aoi: Annotated[
         Path, 
-        typer.Argument(
+        typer.Option(
             exists=True, 
             help="Path to area of interest legible by pyogrio."
         )
     ],
     px: Annotated[
         tuple[float, float], 
-        typer.Argument(
+        typer.Option(
             help="Grid cell size in decimal degrees as float or tuple of (dx, dy).",
         )
     ],
@@ -283,7 +293,7 @@ def grid(
                 "cells within the bounding box of the aoi)."
             ),
         )
-    ] = GridClipOpts.intersect,
+    ] = GridClipOpts.intersect.value,
     output: Annotated[
         Path,
         typer.Option(
@@ -378,9 +388,9 @@ class CDSESentinel2Bands(str, Enum):
 
 
 class CDSESentinel2Res(str, Enum):
-    r10m = "10m"
-    r20m = "20m"
-    r60m = "60m"
+    r10m = "10"
+    r20m = "20"
+    r60m = "60"
 
 
 @s2.command(
@@ -388,12 +398,12 @@ class CDSESentinel2Res(str, Enum):
     help=(
         "Download Sentinel-2 scenes using OData API query parameters. "
         "Data are downloaded from the Copernicus Data Space Ecosystem (CDSE)."
-    ),
+    )
 )
 def download(
     aoi: Annotated[
         Path, 
-        typer.Argument(
+        typer.Option(
             help="The aoi file (GeoJSON, shapefile, etc.).",
             exists=True,
             dir_okay=False,
@@ -401,17 +411,23 @@ def download(
     ],
     outdir: Annotated[
         Path, 
-        typer.Argument(
+        typer.Option(
             help="Output directory for downloaded data.",
             file_okay=False,
         )
     ],
     years: Annotated[
-        list[int], 
-        typer.Argument(
-            help="Years of data to download.",
+        str,
+        typer.Option(
+            help="Space or comma-separated list of years."
         )
     ],
+    crs: Annotated[
+        str,
+        typer.Option(
+            help="CRS of the input aoi file. Default is EPSG:4326 (lat/lon degrees)."
+        )
+    ] = "EPSG:4326",
     speriod: Annotated[
         dt.datetime, 
         typer.Option(
@@ -468,18 +484,30 @@ def download(
             help=(
                 "Log file path. If omitted and --verbose is used, logs are written to "
                 f"{DEFAULT_LOG_DIR}. Use --verbose for console output."
-            ),
+            )
         )
     ] = None,
     verbose: Annotated[
         bool, 
         typer.Option(
             "--verbose", "-v",
-            help="Enable verbose logging to the console.",
+            help="Enable verbose logging to the console."
         )
     ] = False,
 ):
     from sentinel_py.s2.workflows.download_s2 import download_s2_scenes
+
+    # parse years arg
+    try:
+        years = [int(y) for y in years.replace(",", " ").split()]
+    except ValueError as e:
+        raise typer.BadParameter(f"Could not parse years: {e}")
+
+    # parse query args
+    collection = collection.value if hasattr(collection, "value") else collection
+    product = product.value if hasattr(product, "value") else product
+    res = int(res.value if hasattr(res, "value") else res)
+    bands = [b.value if hasattr(b, "value") else b for b in bands]
 
     # always log for downloads
     actual_log_path = setup_logging(log, verbose)
@@ -487,6 +515,7 @@ def download(
     logger = logging.getLogger("sentinel_py.s2.workflows.download_s2")
     download_s2_scenes(
         aoi=aoi,
+        crs=crs,
         outdir=outdir,
         years=years,
         speriod=speriod,
@@ -529,7 +558,7 @@ def _bandwise_create_pb_offset_vrt(
     help=(
         "Determine per-band DN offsets for Sentinel-2 Level-2A products "
         "so later temporal composites and mosaics are radiometrically consistent."
-    ),
+    )
 )
 def dn_offset(
     input_dir: Annotated[Path, typer.Option(

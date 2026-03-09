@@ -2,7 +2,6 @@ from pathlib import Path
 import datetime as dt
 import logging
 import sys
-from venv import logger
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from enum import Enum
 
@@ -83,12 +82,12 @@ def setup_logging(logpath: Path = None, verbose: bool = False) -> Path:
     # configure handlers
     handlers: list[logging.Handler] = []
 
-    # console handler
+    # console output handler
     console = logging.StreamHandler(sys.stderr)
     console.setLevel(logging.DEBUG if verbose else logging.WARNING)
     handlers.append(console)
 
-    # file handler
+    # log file handler
     file_handler = logging.FileHandler(logfile)
     file_handler.setLevel(LOG_COMPLEXITY)
     handlers.append(file_handler)
@@ -132,29 +131,8 @@ def bbox2geojson(
             dir_okay=False,
         )
     ] = Path("bbox.geojson"),
-    log: Annotated[
-        Path,
-        typer.Option(
-            help=(
-                "Log file path. If omitted and --verbose is used, logs are written to "
-                f"{DEFAULT_LOG_DIR}. Use --verbose for console output."
-            ),
-        )
-    ] = None,
-    verbose: Annotated[
-        bool, 
-        typer.Option(
-            "--verbose", "-v",
-            help="Enable verbose logging to the console.",
-        )
-    ] = False,
 ):
     from sentinel_py.common.aoi import bbox_to_geojson
-
-    # set up logging
-    if log is not None or verbose:
-        actual_log_path = setup_logging(log, verbose)
-        typer.echo(f"Logging to: {actual_log_path}")
 
     # handle inputted bounds argument
     try:
@@ -213,29 +191,8 @@ def csv2geojson(
             dir_okay=False,
         )
     ] = Path("points.geojson"),
-    log: Annotated[
-        Path,
-        typer.Option(
-            help=(
-                "Log file path. If omitted and --verbose is used, logs are written to "
-                f"{DEFAULT_LOG_DIR}. Use --verbose for console output."
-            ),
-        )
-    ] = None,
-    verbose: Annotated[
-        bool, 
-        typer.Option(
-            "--verbose", "-v",
-            help="Enable verbose logging to the console.",
-        )
-    ] = False,
 ):
     from sentinel_py.common.aoi import csv_to_geojson
-
-    # set up logging
-    if log is not None or verbose:
-        actual_log_path = setup_logging(log, verbose)
-        typer.echo(f"Logging to: {actual_log_path}")
 
     # call core function
     csv_to_geojson(
@@ -301,29 +258,8 @@ def grid(
             help="Output .geojson file.",
         )
     ] = Path("grid.geojson"),
-    log: Annotated[
-        Path,
-        typer.Option(
-            help=(
-                "Log file path. If omitted and --verbose is used, logs are written to "
-                f"{DEFAULT_LOG_DIR}. Use --verbose for console output."
-            ),
-        )
-    ] = None,
-    verbose: Annotated[
-        bool, 
-        typer.Option(
-            "--verbose", "-v",
-            help="Enable verbose logging to the console.",
-        )
-    ] = False,
 ):
     from sentinel_py.common.aoi import overlay_latlon_grid
-
-    # optional logging
-    if log is not None or verbose:
-        actual_log_path = setup_logging(log, verbose)
-        typer.echo(f"Logging to: {actual_log_path}")
 
     # handle cell size input
     try:
@@ -502,6 +438,7 @@ def download(
     if log is not None or verbose:
         actual_log_path = setup_logging(log, verbose)
         typer.echo(f"Logging to: {actual_log_path}")
+    logger = logging.getLogger(__name__)
 
     # parse years arg
     try:

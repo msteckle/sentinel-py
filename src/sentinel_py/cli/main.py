@@ -477,7 +477,7 @@ def download(
         typer.Option(
             help="Maximum number of worker threads for file downloads."
         )
-    ] = 4,
+    ] = 2,
     log: Annotated[
         Path,
         typer.Option(
@@ -497,6 +497,11 @@ def download(
 ):
     from sentinel_py.s2.workflows.download_s2 import download_s2_scenes
 
+    # optional logging
+    if log is not None or verbose:
+        actual_log_path = setup_logging(log, verbose)
+        typer.echo(f"Logging to: {actual_log_path}")
+
     # parse years arg
     try:
         years = [int(y) for y in years.replace(",", " ").split()]
@@ -509,10 +514,6 @@ def download(
     res = int(res.value if hasattr(res, "value") else res)
     bands = [b.value if hasattr(b, "value") else b for b in bands]
 
-    # always log for downloads
-    actual_log_path = setup_logging(log, verbose)
-    typer.echo(f"Logging to: {actual_log_path}")
-    logger = logging.getLogger("sentinel_py.s2.workflows.download_s2")
     download_s2_scenes(
         aoi=aoi,
         crs=crs,

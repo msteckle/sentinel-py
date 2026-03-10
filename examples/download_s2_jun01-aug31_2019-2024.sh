@@ -15,7 +15,7 @@ export CDSE_PASSWORD_FILE="$HOME/.cdse/cdse_pw"  # ensure chmod 600 on this file
 sentinel-py s2 download \
   --aoi $AOI \
   --outdir $OUTPATH/raw \
-  --years 2020 2021 2022 2023 2024 \
+  --years "2020 2021 2022 2023 2024" \
   --speriod 06-01 \
   --eperiod 08-31 \
-  --log-path $LOGPATH \
+  --log $LOGPATH \

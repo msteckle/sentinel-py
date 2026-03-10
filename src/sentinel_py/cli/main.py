@@ -347,7 +347,7 @@ def download(
     max_workers: Annotated[
         int, 
         typer.Option(
-            help="Maximum number of worker threads for file downloads."
+            help="Maximum number of worker threads for scene processing."
         )
     ] = 2,
     log: Annotated[
@@ -396,7 +396,7 @@ def download(
         s2bands=bands,
         s2res=res,
         include_scl=include_scl,
-        max_workers_files=max_workers,
+        max_scene_workers=max_workers,
         logger=logger,
     )
 

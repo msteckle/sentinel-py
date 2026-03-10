@@ -10,7 +10,12 @@ import calendar
 import geopandas as gpd
 import hashlib
 import json
-from rich.progress import Progress
+from rich.progress import (
+    Progress, 
+    MofNCompleteColumn, 
+    TimeElapsedColumn, 
+    TimeRemainingColumn
+)
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -304,7 +309,12 @@ def download_s2_scenes(
 
     # run scenes in parallel to ensure downloads never go idle while waiting for the 
     # next scene's targets to be selected.
-    with Progress() as progress:
+    with Progress(
+        *Progress.get_default_columns(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+    ) as progress:
         task = progress.add_task("Downloading scenes", total=len(scenes))
         with AutoRefreshSession(
             credentials=credentials,

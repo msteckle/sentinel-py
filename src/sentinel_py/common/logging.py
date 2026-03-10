@@ -2,6 +2,8 @@ import logging
 from rich.logging import RichHandler
 import datetime as dt
 from pathlib import Path
+import smtplib
+from email.message import EmailMessage
 
 
 DEFAULT_LOG_DIR = Path.home() / ".sentinel-py" / "logs"

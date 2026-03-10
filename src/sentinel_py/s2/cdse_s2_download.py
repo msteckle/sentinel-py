@@ -3,7 +3,8 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from collections.abc import Iterable, Sequence
-
+import contextlib
+import threading
 import requests
 
 from sentinel_py.s2.cdse_s2_nodes import scene_node_url
@@ -17,7 +18,8 @@ def download_s2_targets(
     *,
     chunk_mb: int = 4,
     timeout: int = 300,
-    max_workers: int = 2,
+    max_workers: int = 4,  # max concurrent downloads allowed by OData
+    download_semaphore: threading.Semaphore | None = None,
     logger: logging.Logger | None = None,
 ) -> int:
     """
@@ -41,7 +43,7 @@ def download_s2_targets(
     timeout : int, optional
         The timeout in seconds for HTTP requests (default is 300 seconds).
     max_workers : int, optional
-        The maximum number of parallel download threads (default is 2).
+        The maximum number of parallel download threads (default is 4).
     logger : logging.Logger, optional
         A logger for recording download progress and errors (default is None, which uses
         the module logger).
@@ -69,75 +71,77 @@ def download_s2_targets(
         logger.debug(f"Fetching {seg_str} -> {outpath}")
 
         # attempt the download with retries and error handling
-        try:
-            resp = session.get(url, stream=True, timeout=timeout)
-        except Exception as ex:
-            logger.error(f"Request failed for {url}: {ex}")
-            return False
-        if resp.status_code != 200:
-            logger.error(f"HTTP {resp.status_code} for {url}")
-            return False
-
-        # check content length for completeness (if provided) before writing
-        content_length = resp.headers.get("Content-Length")
-        expected_bytes: int | None = None
-        if content_length is not None:
+        sem = download_semaphore or contextlib.nullcontext()
+        with sem:
             try:
-                expected_bytes = int(content_length)
-            except (TypeError, ValueError):
-                logger.warning(f"Invalid Content-Length {content_length} for {url}")
-        if expected_bytes is None:
-            logger.warning(f"No Content-Length for {url}; skipping completeness check")
-
-        # if the file already exists and matches expected size, skip download
-        if outpath.exists() and expected_bytes is not None:
-            local_size = outpath.stat().st_size
-            if local_size == expected_bytes:
-                logger.info(
-                    f"Cached (skipping download): {outpath} (size={local_size} bytes)"
-                )
-                resp.close()
-                return True
-            else:
-                logger.info(
-                    f"Re-downloading {outpath}: local size {local_size} != remote size "
-                    f"{expected_bytes} (diff={abs(expected_bytes - local_size)} bytes)"
-                )
-
-        # remove any existing temp file before writing
-        tmp.unlink(missing_ok=True)
-        bytes_written = 0
-
-        # stream the response content to a temp file
-        try:
-            with open(tmp, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=chunk_mb * 1024 * 1024):
-                    if not chunk:
-                        continue
-                    f.write(chunk)
-                    bytes_written += len(chunk)
-
-            # verify completeness if expected size is known
-            if expected_bytes is not None and bytes_written != expected_bytes:
-                logger.error(
-                    f"Incomplete download for {url}: expected {expected_bytes} bytes, "
-                    f"got {bytes_written}"
-                )
-                tmp.unlink(missing_ok=True)
+                resp = session.get(url, stream=True, timeout=timeout)
+            except Exception as ex:
+                logger.error(f"Request failed for {url}: {ex}")
+                return False
+            if resp.status_code != 200:
+                logger.error(f"HTTP {resp.status_code} for {url}")
                 return False
 
-            # atomically move the temp file to the final destination
-            os.replace(tmp, outpath)
-            logger.info(f"Downloaded OK: {outpath} ({bytes_written} bytes)")
-            return True
+            # check content length for completeness (if provided) before writing
+            content_length = resp.headers.get("Content-Length")
+            expected_bytes: int | None = None
+            if content_length is not None:
+                try:
+                    expected_bytes = int(content_length)
+                except (TypeError, ValueError):
+                    logger.warning(f"Invalid Content-Length {content_length} for {url}")
+            if expected_bytes is None:
+                logger.warning(f"No Content-Length for {url}; skipping completeness check")
 
-        # clean up temp file on any exception and log the error
-        except Exception as ex:
+            # if the file already exists and matches expected size, skip download
+            if outpath.exists() and expected_bytes is not None:
+                local_size = outpath.stat().st_size
+                if local_size == expected_bytes:
+                    logger.info(
+                        f"Cached (skipping download): {outpath} (size={local_size} bytes)"
+                    )
+                    resp.close()
+                    return True
+                else:
+                    logger.info(
+                        f"Re-downloading {outpath}: local size {local_size} != remote size "
+                        f"{expected_bytes} (diff={abs(expected_bytes - local_size)} bytes)"
+                    )
+
+            # remove any existing temp file before writing
             tmp.unlink(missing_ok=True)
-            logger.error(f"Write error for {outpath}: {ex}")
-            return False
+            bytes_written = 0
 
-    # use a thread pool to download targets in parallel, tracking failures
+            # stream the response content to a temp file
+            try:
+                with open(tmp, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=chunk_mb * 1024 * 1024):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        bytes_written += len(chunk)
+
+                # verify completeness if expected size is known
+                if expected_bytes is not None and bytes_written != expected_bytes:
+                    logger.error(
+                        f"Incomplete download for {url}: expected {expected_bytes} bytes, "
+                        f"got {bytes_written}"
+                    )
+                    tmp.unlink(missing_ok=True)
+                    return False
+
+                # atomically move the temp file to the final destination
+                os.replace(tmp, outpath)
+                logger.info(f"Downloaded OK: {outpath} ({bytes_written} bytes)")
+                return True
+
+            # clean up temp file on any exception and log the error
+            except Exception as ex:
+                tmp.unlink(missing_ok=True)
+                logger.error(f"Write error for {outpath}: {ex}")
+                return False
+
+    # use a thread pool to download targets (images) in parallel, tracking failures
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = [ex.submit(_download_one, segs, logger) for segs in targets]
         for fut in as_completed(futs):

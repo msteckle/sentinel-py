@@ -1,7 +1,5 @@
 from pathlib import Path
 import datetime as dt
-import logging
-import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from enum import Enum
 
@@ -43,6 +41,7 @@ class GridClipOpts(str, Enum):
     all = "all"
 
 
+# sentinel-py bbox2geojson -------------------------------------------------------------
 @app.command(
     "bbox2geojson",
     help=(
@@ -63,7 +62,7 @@ def bbox2geojson(
             help="Output file path for the bbox GeoJSON.",
             dir_okay=False,
         )
-    ] = Path("bbox.geojson"),
+    ] = Path("bbox2geojson.geojson"),
 ):
     from sentinel_py.common.aoi import bbox_to_geojson
 
@@ -83,6 +82,7 @@ def bbox2geojson(
     )
 
 
+# sentinel-py csv2geojson --------------------------------------------------------------
 @app.command(
     "csv2geojson",
     help=(
@@ -123,7 +123,7 @@ def csv2geojson(
             help="Output file path for the GeoJSON.",
             dir_okay=False,
         )
-    ] = Path("points.geojson"),
+    ] = Path("csv2geojson.geojson"),
 ):
     from sentinel_py.common.aoi import csv_to_geojson
 
@@ -137,6 +137,7 @@ def csv2geojson(
     )
 
 
+# sentinel-py grid ---------------------------------------------------------------------
 @app.command(
     "grid",
     help=(
@@ -263,6 +264,7 @@ class CDSESentinel2Res(str, Enum):
     r60m = "60"
 
 
+# sentinel-py s2 download --------------------------------------------------------------
 @s2.command(
     "download",
     help=(
@@ -367,8 +369,8 @@ def download(
 ):
     from sentinel_py.s2.workflows.download_s2 import download_s2_scenes
 
-    # set up logging if requested
-    logger = get_logger(logpath=log, verbose=verbose) if log or verbose else None
+    # set up logging
+    logger = get_logger(name="download_logger", logpath=log, verbose=verbose)
 
     # parse years arg
     try:

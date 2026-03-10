@@ -5,14 +5,14 @@ Functions used to download Sentinel-2 scenes from CDSE over (optional) seasonal 
 import logging
 from datetime import date, datetime
 from pathlib import Path
-import sys
 from typing import Iterable
 import calendar
 import geopandas as gpd
 import hashlib
 import json
-from tqdm import tqdm
-from tqdm.contrib.logging import logging_redirect_tqdm
+from rich.progress import Progress
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 
@@ -60,6 +60,17 @@ def _query_cache_key(
     return hashlib.md5(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
+def _params_fingerprint(
+    bands: list[str], target_res_m: int, include_scl: bool
+) -> str:
+    """Generate a hash key from download parameters for cache invalidation."""
+    payload = json.dumps(
+        {"bands": sorted(bands), "res": target_res_m, "scl": include_scl},
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
 def download_s2_scenes(
     aoi: Path,
     crs: str,
@@ -72,8 +83,8 @@ def download_s2_scenes(
     s2bands: Iterable[str],
     s2res: int,
     include_scl: bool = True,
-    max_workers_files: int = 2,
-    logger: logging.Logger | None = None,
+    max_scene_workers: int = 4,
+    logger: logging.Logger | None = None
 ) -> None:
     """
     Download Sentinel-2 scenes for a seasonal window repeated over one or more years.
@@ -109,9 +120,9 @@ def download_s2_scenes(
     include_scl : bool, optional
         Whether to include the Scene Classification Layer (SCL) in the downloads.
         Default is True.
-    max_workers_files : int, optional
-        Maximum number of parallel download threads for files within each scene. 
-        Default is 2.
+    max_scene_workers : int, optional
+        Maximum number of parallel download threads for scenes. 
+        Default is 4.
     logger : logging.Logger, optional
         Logger for recording progress and errors. If None, the module logger is used.
         Default is None.
@@ -128,7 +139,11 @@ def download_s2_scenes(
     from sentinel_py.s2.cdse_s2_download import download_s2_targets
     from sentinel_py.common.aoi import aoi_as_geom
 
-    # convert AOI to geometry
+    # ----------------------------------------------------------------------------------
+    # Prepare for querying CDSE Catalogue (search/discovery API)
+    # ----------------------------------------------------------------------------------
+
+    # ensure AOI is geometry object
     aoi = aoi_as_geom(aoi, crs)
 
     # validate and build date windows for each year, adjusting invalid dates as needed
@@ -149,17 +164,24 @@ def download_s2_scenes(
         for s, e in date_windows
     ]
 
-    # generate cache key and check for cached products before querying CDSE
+    # ----------------------------------------------------------------------------------
+    # Query the CDSE Catalogue (search/discovery API)
+    # ----------------------------------------------------------------------------------
+
+    # generate cache key based on the query parameters
+    # if a parquet with the cache key exists, it means all the products for that
+    # query have already been found and cached, so we can skip the querying step
     cache_key = _query_cache_key(aoi, s2collection, s2product, iso_windows)
     cache_dir = Path.cwd() / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    products_cache = cache_dir / f"products_{cache_key}.parquet"
+    scenes_cache = cache_dir / f"products_{cache_key}.parquet"
 
-    # if cached products exist, load them
-    if products_cache.exists():
-        logger.info(f"Loading cached products from {products_cache}")
-        products = pd.read_parquet(products_cache)
-    # otherwise, proceed with download
+    # if cached products exist, don't bother querying
+    if scenes_cache.exists():
+        logger.info(f"Loading cached products from {scenes_cache}")
+        scenes = pd.read_parquet(scenes_cache)
+
+    # otherwise, proceed with querying
     else:
         # batch the AOI if the query has too many characters
         aoi_batches = batch_geometries(aoi)
@@ -183,94 +205,121 @@ def download_s2_scenes(
                 df = all_query_results(query_url, logger=logger)
                 if df.empty:
                     logger.warning(
-                        f"No products returned for window {start_iso} -> {end_iso} "
+                        f"No scenes returned for window {start_iso} -> {end_iso} "
                         f"(batch {i + 1} of {len(aoi_batches)})")
                 else:
                     logger.info(
-                        f"Query returned {len(df)} products for window {start_iso} -> "
+                        f"Query returned {len(df)} scenes for window {start_iso} -> "
                         f"{end_iso} (batch {i + 1} of {len(aoi_batches)})"
                     )
                     df = df.assign(window_start=start_iso, window_end=end_iso)
                     all_rows.append(df)
 
-        # if no products were found, log a warning and return
+        # if no scenes were found, log a warning and return
         if not all_rows:
-            logger.warning("No products found for given AOI and date windows.")
+            logger.warning("No scenes found for given AOI and date windows.")
             return
 
-        # concatenate results, drop duplicates, and cache the products found
-        products = pd.concat(all_rows, ignore_index=True).drop_duplicates(subset="Id")
+        # concatenate results, drop duplicates, and cache the scenes found
+        scenes = pd.concat(all_rows, ignore_index=True).drop_duplicates(subset="Id")
         logger.info(
-            f"Found {len(products)} unique products across {len(iso_windows)} "
+            f"Found {len(scenes)} unique scenes across {len(iso_windows)} "
             f"window(s) and {len(aoi_batches)} batch(es)"
         )
 
-        # cache the products dataframe for future re-runs
+        # cache the scenes dataframe for future re-runs
         outdir.mkdir(parents=True, exist_ok=True)
-        products.to_parquet(products_cache)
-        logger.info(f"Cached products to {products_cache}")
+        scenes.to_parquet(scenes_cache)
+        logger.info(f"Cached scenes to {scenes_cache}")
+
+    # ----------------------------------------------------------------------------------
+    # Find and download targets (images) for each scene found in the query step
+    # ----------------------------------------------------------------------------------
 
     # set up session for downloads (with auto-refreshing credentials) and download
     n_scenes = 0
     credentials: dict = {}
     token_cache: dict = {}
-    with logging_redirect_tqdm(loggers=[logger]):
-        with tqdm(
-            total=len(products),
-            desc="Downloading scenes",
-            unit="scene",
-            disable=not sys.stdout.isatty(),
-        ) as pbar:
-            with AutoRefreshSession(
-                credentials=credentials,
-                token_cache=token_cache,
+    download_semaphore = threading.Semaphore(4)  # limit concurrent downloads
+    params_hash = _params_fingerprint(list(s2bands), s2res, include_scl)
+
+    # function to download one target
+    def _process_scene(sess, row):
+        scene_id = row.get("Id")
+        scene_name = row.get("Name")
+
+        if not scene_id or not scene_name:
+            logger.warning(f"Skipping row with missing Id/Name: {row.to_dict()}")
+            return None
+        
+        try:
+            targets_cache = cache_dir / f"targets_{scene_id}_{params_hash}.json"
+            # --------------------------------------------------------------------------
+            # Select the targets we want to download for this scene
+            # if they've already been found and cached, we can skip the selection step
+            if targets_cache.exists():
+                targets = [tuple(t) for t in json.loads(targets_cache.read_text())]
+                logger.debug(
+                    f"Scene {scene_name}: loaded {len(targets)} cached targets"
+                )
+            # if no cache exists, select the targets for this scene
+            else:
+                targets = select_s2_targets(
+                    session=sess,
+                    scene_id=str(scene_id),
+                    scene_name=str(scene_name),
+                    bands=s2bands,
+                    target_res_m=s2res,
+                    include_scl=include_scl,
+                    logger=logger,
+                )
+                targets_cache.write_text(json.dumps(targets))
+
+            # --------------------------------------------------------------------------
+            # Download the targets (4 at a time) that were cached or just selected
+            n_failures = download_s2_targets(
+                session=sess,
+                scene_id=str(scene_id),
+                targets=targets,
+                output_root=outdir,
+                download_semaphore=download_semaphore,
                 logger=logger,
-            ) as sess:
-                for _, row in products.iterrows():
-                    scene_id = row.get("Id")
-                    scene_name = row.get("Name")
+            )
+        except Exception as e:
+            logger.error(
+                f"Scene {scene_name} ({scene_id}): unexpected error: {e}",
+                exc_info=True,
+            )
+            return None
 
-                    if not scene_id or not scene_name:
-                        logger.warning(
-                            f"Skipping row with missing Id/Name: {row.to_dict()}"
-                        )
-                        continue
+        logger.info(
+            f"Scene {scene_name} ({scene_id}): processed {len(targets)} "
+            f"targets with {n_failures} failure(s)"
+        )
+        return scene_name
 
-                    try:
-                        targets = select_s2_targets(
-                            session=sess,
-                            scene_id=str(scene_id),
-                            scene_name=str(scene_name),
-                            bands=s2bands,
-                            target_res_m=s2res,
-                            include_scl=include_scl,
-                            logger=logger,
-                        )
-                        n_failures = download_s2_targets(
-                            session=sess,
-                            scene_id=str(scene_id),
-                            targets=targets,
-                            output_root=outdir,
-                            max_workers=max_workers_files,
-                            logger=logger,
-                        )
-                    except Exception as e:
-                        logger.error(
-                            f"Scene {scene_name} ({scene_id}): unexpected error: {e}",
-                            exc_info=True,
-                        )
-                        continue
+    # ----------------------------------------------------------------------------------
+    # Download targets (images) for each scene in parallel
+    # ----------------------------------------------------------------------------------
 
-                    logger.info(
-                        f"Scene {scene_name} ({scene_id}): processed {len(targets)} "
-                        f"targets with {n_failures} failure(s)"
-                    )
-                    n_scenes += 1
-
-                    pbar.update(1)
-                    pbar.set_postfix(
-                        processed=n_scenes, 
-                        failures=len(products) - n_scenes
-                    )
+    # run scenes in parallel to ensure downloads never go idle while waiting for the 
+    # next scene's targets to be selected.
+    with Progress() as progress:
+        task = progress.add_task("Downloading scenes", total=len(scenes))
+        with AutoRefreshSession(
+            credentials=credentials,
+            token_cache=token_cache,
+            logger=logger,
+        ) as sess:
+            with ThreadPoolExecutor(max_workers=max_scene_workers) as scene_executor:
+                futs = {
+                    scene_executor.submit(_process_scene, sess, row): row
+                    for _, row in scenes.iterrows()
+                }
+                for fut in as_completed(futs):
+                    result = fut.result()
+                    if result is not None:
+                        n_scenes += 1
+                    progress.advance(task)
 
     logger.info(f"Finished seasonal download: {n_scenes} scene(s) processed.")

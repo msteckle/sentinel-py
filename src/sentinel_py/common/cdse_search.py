@@ -4,7 +4,10 @@ from shapely.geometry.base import BaseGeometry
 import logging
 import geopandas as gpd
 
-def batch_geometries(geoseries: gpd.GeoSeries, max_url_len: int = 6000) -> list[BaseGeometry]:
+def batch_geometries(
+    geoseries: gpd.GeoSeries, 
+    max_url_len: int = 6000
+) -> list[BaseGeometry]:
     """
     Split a GeoSeries into batches whose unioned WKT fits within max_url_len.
     Handles any geometry type (points, polygons, etc.).
@@ -67,7 +70,7 @@ def all_query_results(
 
     items: list[dict] = []
     while url:
-        logger.debug("Fetching page: %s", url)
+        logger.debug(f"Fetching page: {url}")
         r = sess.get(url, timeout=timeout)
         r.raise_for_status()
         j = r.json()

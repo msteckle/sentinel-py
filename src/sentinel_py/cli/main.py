@@ -450,7 +450,7 @@ def dn_offset(
         help="List of bands to process.")] = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"],
     res: Annotated[int, typer.Option(
         help="Target resolution in meters: 10, 20, or 60.")] = 20,
-    log_path: Annotated[Path, typer.Option(
+    log: Annotated[Path, typer.Option(
         help="Optional log file path. If omitted, default logging config is used.")] = None,
     verbose: Annotated[bool, typer.Option(
         help="Enable verbose logging to the console.")] = False,
@@ -469,11 +469,8 @@ def dn_offset(
         get_pb_offset_from_jp2
     )
 
-    # Set up logging if requested
-    if log_path is not None or verbose:
-        actual_log_path = setup_logging(log_path, verbose)
-        typer.echo(f"Logging to: {actual_log_path}")
-    logger = logging.getLogger(__name__)
+    # set up logging
+    logger = get_logger(name="download_logger", logpath=log, verbose=verbose)
 
     # Ensure output directory exists
     output_dir = Path(output_dir)

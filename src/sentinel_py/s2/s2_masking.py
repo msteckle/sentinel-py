@@ -2,17 +2,16 @@
 Functions to support Sentinel-2 Surface Reflectance masking.
 """
 
-from pathlib import Path
-import re
-from typing import List, Optional, Set, Tuple
-import numpy as np
-import pandas as pd
-from logging import Logger
-from osgeo import gdal
-import textwrap
-from lxml import etree
 import copy
-import datetime as dt
+import re
+import textwrap
+from logging import Logger
+from pathlib import Path
+from typing import List, Optional, Set, Tuple
+
+import pandas as pd
+from lxml import etree
+from osgeo import gdal
 
 from sentinel_py.common.gdal import add_python_pixelfunc_to_vrt
 from sentinel_py.common.utils import extract_s2_acq_date, in_season_window
@@ -131,7 +130,7 @@ def get_band_paths(
     target_res_m: int,
     years: Optional[Set[int]] = None,
     period_start: Optional[Tuple[int, int]] = None,  # (month, day)
-    period_end: Optional[Tuple[int, int]] = None,    # (month, day)
+    period_end: Optional[Tuple[int, int]] = None,  # (month, day)
     logger: Logger | None = None,
 ) -> pd.DataFrame:
     """
@@ -193,9 +192,7 @@ def get_band_paths(
 
             # Fallback resolution found
             if res != target_res_m and logger:
-                logger.info(
-                    f"Found band {band} at {res}m instead of {target_res_m}m"
-                )
+                logger.info(f"Found band {band} at {res}m instead of {target_res_m}m")
             found_any = True
             for jp2_path in res_matches:
                 # Extract acquisition date
@@ -372,9 +369,7 @@ def create_pb_offset_vrt(
 
     # Determine output VRT directory
     if out_vrt_dir is None:
-        out_vrt_dir = (
-            Path.home() / ".sentinel-py" / "temp"
-        )
+        out_vrt_dir = Path.home() / ".sentinel-py" / "temp"
         if logger:
             logger.warning(f"No out_vrt_dir provided; using default: {out_vrt_dir}")
     out_vrt_dir = Path(out_vrt_dir)
@@ -459,7 +454,12 @@ def _add_python_pixelfunc_to_singleband_vrt(
         nd_elem.text = str(dst_nodata)
 
     # Remove any existing pixel-function elements
-    for tag in ("PixelFunctionLanguage", "PixelFunctionType", "PixelFunctionArguments", "PixelFunctionCode"):
+    for tag in (
+        "PixelFunctionLanguage",
+        "PixelFunctionType",
+        "PixelFunctionArguments",
+        "PixelFunctionCode",
+    ):
         for el in band1.findall(tag):
             band1.remove(el)
 
@@ -519,8 +519,12 @@ def create_masked_vrt(
     classes_csv = ",".join(map(str, sorted(set(masking_scl_values))))
 
     # Temporary VRT paths
-    tmp_scl_binary_vrt = out_vrt_path.with_suffix(out_vrt_path.suffix + ".scl_binary.tmp.vrt")
-    tmp_scl_on_band_vrt = out_vrt_path.with_suffix(out_vrt_path.suffix + ".scl_on_band.tmp.vrt")
+    tmp_scl_binary_vrt = out_vrt_path.with_suffix(
+        out_vrt_path.suffix + ".scl_binary.tmp.vrt"
+    )
+    tmp_scl_on_band_vrt = out_vrt_path.with_suffix(
+        out_vrt_path.suffix + ".scl_on_band.tmp.vrt"
+    )
     tmp_stack_vrt = out_vrt_path.with_suffix(out_vrt_path.suffix + ".stack.tmp.vrt")
     for p in (tmp_scl_binary_vrt, tmp_scl_on_band_vrt, tmp_stack_vrt):
         p.unlink(missing_ok=True)
@@ -532,7 +536,6 @@ def create_masked_vrt(
 
     # If band is 60m, create binary mask first
     if band_res > 20.0 + 1e-6:
-
         binary_mask = True
 
         # make single-band VRT of SCL with derived function scl_to_binary_mask
@@ -565,7 +568,9 @@ def create_masked_vrt(
     out_ds = None
 
     # Stack band + aligned SCL/mask
-    gdal.BuildVRT(str(tmp_stack_vrt), [str(band_path), str(tmp_scl_on_band_vrt)], separate=True)
+    gdal.BuildVRT(
+        str(tmp_stack_vrt), [str(band_path), str(tmp_scl_on_band_vrt)], separate=True
+    )
 
     # Edit VRT to:
     # - append SimpleSource(s) from band2 into band1
@@ -596,7 +601,12 @@ def create_masked_vrt(
     nd_elem.text = str(dst_nodata)
 
     # remove existing pixel-function elements
-    for tag in ("PixelFunctionLanguage", "PixelFunctionType", "PixelFunctionArguments", "PixelFunctionCode"):
+    for tag in (
+        "PixelFunctionLanguage",
+        "PixelFunctionType",
+        "PixelFunctionArguments",
+        "PixelFunctionCode",
+    ):
         for el in band1.findall(tag):
             band1.remove(el)
 
@@ -614,7 +624,9 @@ def create_masked_vrt(
     code_el = etree.SubElement(band1, "PixelFunctionCode")
     code_el.text = etree.CDATA(MASK_CODE)
 
-    tree.write(str(out_vrt_path), pretty_print=True, xml_declaration=True, encoding="UTF-8")
+    tree.write(
+        str(out_vrt_path), pretty_print=True, xml_declaration=True, encoding="UTF-8"
+    )
 
     # cleanup temps
     tmp_stack_vrt.unlink(missing_ok=True)

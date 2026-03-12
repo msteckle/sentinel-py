@@ -1,17 +1,16 @@
 from __future__ import annotations
 
+import itertools
 import logging
 from pathlib import Path
-from typing import Optional, Union, Tuple, Literal
-import itertools
+from typing import Literal, Optional, Tuple, Union
 
-import numpy as np
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 import shapely
 from shapely.geometry import GeometryCollection, MultiPolygon, Polygon, box
-from shapely.geometry.base import BaseGeometry, BaseMultipartGeometry
-
+from shapely.geometry.base import BaseGeometry
 
 GeometryLike = Union[BaseGeometry, gpd.GeoSeries, gpd.GeoDataFrame, str, Path]
 
@@ -20,12 +19,47 @@ def _geom_wkt_len(geom: BaseGeometry) -> int:
     return len(geom.wkt)
 
 
+def batch_geometries(
+    geoseries: gpd.GeoSeries, max_url_len: int = 6000
+) -> list[BaseGeometry]:
+    """
+    Split a GeoSeries into batches whose unioned WKT fits within max_url_len.
+    Handles any geometry type (points, polygons, etc.).
+    """
+
+    from shapely.ops import unary_union
+
+    batches = []
+    current_batch = []
+    for geom in geoseries:
+        current_batch.append(geom)
+        wkt = unary_union(current_batch).wkt
+        if len(wkt) > max_url_len:
+            if len(current_batch) > 1:
+                batches.append(unary_union(current_batch[:-1]))
+                current_batch = [geom]
+            else:
+                # single geometry already exceeds limit — add it anyway
+                batches.append(geom)
+                current_batch = []
+    if current_batch:
+        batches.append(unary_union(current_batch))
+    return batches
+
+
 def simplify_aoi_for_cdse(
     aoi: BaseGeometry,
     *,
     logger: logging.Logger,
     max_wkt_chars: int = 20000,
-    simplify_tolerances_deg: Tuple[float, ...] = (0.001, 0.0025, 0.005, 0.01, 0.02, 0.05),
+    simplify_tolerances_deg: Tuple[float, ...] = (
+        0.001,
+        0.0025,
+        0.005,
+        0.01,
+        0.02,
+        0.05,
+    ),
     allow_convex_hull: bool = True,
     allow_bbox_fallback: bool = True,
 ) -> BaseGeometry:
@@ -51,7 +85,11 @@ def simplify_aoi_for_cdse(
 
     orig_len = _geom_wkt_len(aoi)
     if orig_len <= max_wkt_chars:
-        logger.info("AOI WKT length %d <= %d; no simplification needed.", orig_len, max_wkt_chars)
+        logger.info(
+            "AOI WKT length %d <= %d; no simplification needed.",
+            orig_len,
+            max_wkt_chars,
+        )
         return aoi
 
     logger.warning(
@@ -71,7 +109,9 @@ def simplify_aoi_for_cdse(
                 simplified = simplified.buffer(0)
 
             new_len = _geom_wkt_len(simplified)
-            logger.info("AOI simplified with tol=%.6f deg → WKT length %d", tol, new_len)
+            logger.info(
+                "AOI simplified with tol=%.6f deg → WKT length %d", tol, new_len
+            )
 
             if new_len <= max_wkt_chars:
                 return simplified
@@ -101,7 +141,10 @@ def simplify_aoi_for_cdse(
             logger.debug("AOI bbox fallback failed: %s", e)
 
     # If everything fails, return original and let query fail loudly
-    logger.error("Failed to simplify AOI below max_wkt_chars=%d; using original AOI.", max_wkt_chars)
+    logger.error(
+        "Failed to simplify AOI below max_wkt_chars=%d; using original AOI.",
+        max_wkt_chars,
+    )
     return aoi
 
 
@@ -123,6 +166,7 @@ def parse_bbox(aoi: str) -> Optional[Tuple[float, float, float, float]]:
         return xmin, ymin, xmax, ymax
     except Exception:
         return None
+
 
 def bbox_to_geojson(
     bbox: Tuple[float, float, float, float],
@@ -236,10 +280,10 @@ def aoi_as_gdf(aoi: GeometryLike, crs: str = "EPSG:4326") -> gpd.GeoDataFrame:
     elif isinstance(aoi, BaseGeometry):
         bounds = aoi.bounds  # (minx, miny, maxx, maxy)
         if not (
-            -180 <= bounds[0] <= 180 and
-            -180 <= bounds[2] <= 180 and
-            -90  <= bounds[1] <= 90  and
-            -90  <= bounds[3] <= 90
+            -180 <= bounds[0] <= 180
+            and -180 <= bounds[2] <= 180
+            and -90 <= bounds[1] <= 90
+            and -90 <= bounds[3] <= 90
         ):
             raise ValueError(
                 "Shapely geometry has no CRS metadata and coordinates do not appear to "
@@ -331,7 +375,7 @@ def overlay_latlon_grid(
         If True, interior holes in the AOI geometry are removed before building
         the grid. This prevents donut-shaped gaps inside the grid.
     clip : str, optional
-        One of "intersect", "within", or "all" to select grid cells that intersect, 
+        One of "intersect", "within", or "all" to select grid cells that intersect,
         are fully within, or all cells in the AOI outer bounding box.
 
     Returns
@@ -371,7 +415,13 @@ def overlay_latlon_grid(
 
     # build cells as GeoDataFrame; geometry is box from (x,y) to (x+dx, y+dy)
     cells = [
-        {"row": j, "col": i, "minx": x, "miny": y, "geometry": box(x, y, x+dx, y+dy)}
+        {
+            "row": j,
+            "col": i,
+            "minx": x,
+            "miny": y,
+            "geometry": box(x, y, x + dx, y + dy),
+        }
         for (j, y), (i, x) in itertools.product(enumerate(ys), enumerate(xs))
     ]
     grid = gpd.GeoDataFrame(cells, crs=crs)

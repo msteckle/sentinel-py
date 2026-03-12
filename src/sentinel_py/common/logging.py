@@ -1,10 +1,12 @@
-import logging
-from rich.logging import RichHandler
 import datetime as dt
+import logging
 from pathlib import Path
 
+from rich.logging import RichHandler
 
 DEFAULT_LOG_DIR = Path.home() / ".sentinel-py" / "logs"
+
+
 def get_logger(
     name: str = __name__,
     logpath: Path = None,
@@ -48,6 +50,7 @@ def get_logger(
 
     # File handler
     fh = logging.FileHandler(logfile, mode="w")
+    fh.stream = open(logfile, "w", buffering=1)
     fh.setLevel(logging.DEBUG if verbose else logging.INFO)
     fh.setFormatter(formatter)
 

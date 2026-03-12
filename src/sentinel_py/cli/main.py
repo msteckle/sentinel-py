@@ -1,13 +1,20 @@
-from pathlib import Path
 import datetime as dt
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from enum import Enum
-
-import typer
+from pathlib import Path
 from typing import Annotated
 
-from sentinel_py.common.logging import get_logger, DEFAULT_LOG_DIR
+import typer
 
+from sentinel_py.common.enums import (
+    CDSECollections,
+    CDSEOrbitDirs,
+    S1Swaths,
+    validate_product,
+    validate_sensor_mode,
+    validate_serial_id,
+)
+from sentinel_py.common.logging import DEFAULT_LOG_DIR, get_logger
 
 ########################################################################################
 # Application creation
@@ -35,6 +42,7 @@ app.add_typer(s2, name="s2")
 # General commands
 ########################################################################################
 
+
 class GridClipOpts(str, Enum):
     intersect = "intersect"
     within = "within"
@@ -47,21 +55,19 @@ class GridClipOpts(str, Enum):
     help=(
         "Create a bounding box GeoJSON given xmin, ymin, xmax, ymax. "
         "The output bbox will always be in EPSG:4326 (lat/lon)."
-    )
+    ),
 )
 def bbox2geojson(
     bounds: Annotated[
         tuple[float, float, float, float],
-        typer.Option(
-            help="Bounding box bounds as xmin ymin xmax ymax."
-        )
+        typer.Option(help="Bounding box bounds as xmin ymin xmax ymax."),
     ],
     output: Annotated[
         Path,
         typer.Option(
             help="Output file path for the bbox GeoJSON.",
             dir_okay=False,
-        )
+        ),
     ] = Path("bbox2geojson.geojson"),
 ):
     from sentinel_py.common.aoi import bbox_to_geojson
@@ -88,7 +94,7 @@ def bbox2geojson(
     help=(
         "Create a GeoJSON from a CSV with latitude and longitude columns. "
         "The output GeoJSON will be in EPSG:4326 (lat/lon)."
-    )
+    ),
 )
 def csv2geojson(
     csv: Annotated[
@@ -97,32 +103,19 @@ def csv2geojson(
             help="Path to input CSV file.",
             exists=True,
             dir_okay=False,
-        )
+        ),
     ],
-    lon: Annotated[
-        str,
-        typer.Option(
-            help="Name of the longitude column in the CSV."
-        )
-    ],
-    lat: Annotated[
-        str,
-        typer.Option(
-            help="Name of the latitude column in the CSV."
-        )
-    ],
+    lon: Annotated[str, typer.Option(help="Name of the longitude column in the CSV.")],
+    lat: Annotated[str, typer.Option(help="Name of the latitude column in the CSV.")],
     crs: Annotated[
-        str,
-        typer.Option(
-            help="CRS of the lat/lon coordinates in the CSV."
-        )
+        str, typer.Option(help="CRS of the lat/lon coordinates in the CSV.")
     ] = "EPSG:4326",
     output: Annotated[
         Path,
         typer.Option(
             help="Output file path for the GeoJSON.",
             dir_okay=False,
-        )
+        ),
     ] = Path("csv2geojson.geojson"),
 ):
     from sentinel_py.common.aoi import csv_to_geojson
@@ -147,17 +140,14 @@ def csv2geojson(
 )
 def grid(
     aoi: Annotated[
-        Path, 
-        typer.Option(
-            exists=True, 
-            help="Path to area of interest legible by pyogrio."
-        )
+        Path,
+        typer.Option(exists=True, help="Path to area of interest legible by pyogrio."),
     ],
     px: Annotated[
-        tuple[float, float], 
+        tuple[float, float],
         typer.Option(
             help="Grid cell size in decimal degrees as float or tuple of (dx, dy).",
-        )
+        ),
     ],
     crs: Annotated[
         str,
@@ -166,16 +156,13 @@ def grid(
                 "CRS of the input aoi file. Default is EPSG:4326 (lat/lon degrees). "
                 "The output grid will always be in EPSG:4326."
             )
-        )
+        ),
     ] = "EPSG:4326",
     fill_holes: Annotated[
-        bool, 
-        typer.Option(
-            help="Fill holes in aoi geometry."
-        )
+        bool, typer.Option(help="Fill holes in aoi geometry.")
     ] = True,
     clip: Annotated[
-        GridClipOpts, 
+        GridClipOpts,
         typer.Option(
             case_sensitive=False,
             help=(
@@ -184,13 +171,13 @@ def grid(
                 "aoi), 'within' (keep cells fully within the aoi), or 'all' (keep all "
                 "cells within the bounding box of the aoi)."
             ),
-        )
+        ),
     ] = GridClipOpts.intersect.value,
     output: Annotated[
         Path,
         typer.Option(
             help="Output .geojson file.",
-        )
+        ),
     ] = Path("grid.geojson"),
 ):
     from sentinel_py.common.aoi import overlay_latlon_grid
@@ -218,187 +205,276 @@ def grid(
     )
 
 
-########################################################################################
-# Sentinel-2 commands
-########################################################################################
-
-class CDSECollections(str, Enum):
-    """CDSE collection names that can be downloaded with this CLI."""
-    sentinel2 = "SENTINEL-2"
-    # sentinel1 = "SENTINEL-1"  # not implemented yet, but could be
-
-
-class CDSESentinel2Products(str, Enum):
-    """CDSE Sentinel-2 product types that can be downloaded with this CLI."""
-    msi2a = "S2MSI2A"
-    # msi1c = "S2MSI1C"  # not implemented yet, but could be
-
-
-class CDSESentinel2Bands(str, Enum):
-    """CDSE Sentinel-2 bands that can be downloaded with this CLI."""
-    b02 = "B02"
-    b03 = "B03"
-    b04 = "B04"
-    b05 = "B05"
-    b06 = "B06"
-    b07 = "B07"
-    b08 = "B08"
-    b8a = "B8A"
-    b09 = "B09"
-    b10 = "B10"
-    b11 = "B11"
-    b12 = "B12"
-
-    @classmethod
-    def default_bands(cls) -> list["CDSESentinel2Bands"]:
-        """Default bands to download if not specified in `download` command."""
-        return [
-            cls.b02, cls.b03, cls.b04, cls.b05, cls.b06, 
-            cls.b07, cls.b08, cls.b8a, cls.b11, cls.b12
-        ]
-
-
-class CDSESentinel2Res(str, Enum):
-    r10m = "10"
-    r20m = "20"
-    r60m = "60"
-
-
-# sentinel-py s2 download --------------------------------------------------------------
-@s2.command(
-    "download",
+# sentinel-py query --------------------------------------------------------------------
+@app.command(
+    "query",
     help=(
-        "Download Sentinel-2 scenes using OData API query parameters. "
-        "Data are downloaded from the Copernicus Data Space Ecosystem (CDSE)."
-    )
+        "Query CDSE scenes using OData API query parameters. "
+        "Query results are retrieved from the Copernicus Data Space Ecosystem (CDSE)."
+    ),
 )
-def download(
+def query(
     aoi: Annotated[
-        Path, 
+        Path,
         typer.Option(
-            help="The aoi file (GeoJSON, shapefile, etc.).",
+            help="The aoi file used to filter the query (GeoJSON, shapefile, etc.).",
             exists=True,
             dir_okay=False,
-        )
+        ),
     ],
-    outdir: Annotated[
-        Path, 
+    cache_dir: Annotated[
+        Path,
         typer.Option(
-            help="Output directory for downloaded data.",
+            help=("Directory for caching query results. Must exist and be writable. "),
             file_okay=False,
-        )
-    ],
-    years: Annotated[
-        str,
-        typer.Option(
-            help="Space or comma-separated list of years."
-        )
+        ),
     ],
     crs: Annotated[
         str,
-        typer.Option(
-            help="CRS of the input aoi file. Default is EPSG:4326 (lat/lon degrees)."
-        )
-    ] = "EPSG:4326",
+        typer.Option(help="CRS of the input aoi file."),
+    ],
+    years: Annotated[
+        str, typer.Option(help="Space- or comma-separated list of years.")
+    ],
     speriod: Annotated[
-        dt.datetime, 
+        dt.datetime,
         typer.Option(
-            help="Start month and day of seasonal download window.",
+            help="Start month and day of seasonal query window.",
             formats=["%m-%d", "%m/%d", "%m %d", "%b-%d", "%b %d", "%B-%d", "%B %d"],
-        )
+        ),
     ] = dt.datetime.strptime("01-01", "%m-%d"),
     eperiod: Annotated[
         dt.datetime,
         typer.Option(
-            help="End month and day of seasonal download window.",
+            help="End month and day of seasonal query window.",
             formats=["%m-%d", "%m/%d", "%m %d", "%b-%d", "%b %d", "%B-%d", "%B %d"],
-        )
+        ),
     ] = dt.datetime.strptime("12-31", "%m-%d"),
     collection: Annotated[
-        CDSECollections, 
-        typer.Option(
-            help="CDSE collection name."
-        )
+        CDSECollections, typer.Option(help="Filter by CDSE Collection.")
     ] = CDSECollections.sentinel2,
     product: Annotated[
-        CDSESentinel2Products, 
+        str, typer.Option(help="Filter by product of collection.")
+    ] = None,
+    orbit: Annotated[
+        CDSEOrbitDirs,
+        typer.Option(help=("Filter by 'ASCENDING' or 'DESCENDING'.")),
+    ] = None,
+    cloud_thresh: Annotated[
+        float,
         typer.Option(
-            help="Product type within the collection."
-        )
-    ] = CDSESentinel2Products.msi2a,
-    bands: Annotated[
-        list[CDSESentinel2Bands], 
+            help=("Filter by cloud cover percentage threshold (>0-100)."),
+            min=0.0,
+            max=100.0,
+        ),
+    ] = None,
+    burst_mode: Annotated[
+        bool,
+        typer.Option(help=("True/False to filter by burst mode (Sentinel-1).")),
+    ] = False,
+    burst_id: Annotated[
+        int,
+        typer.Option(help=("Filter by burst ID (Sentinel-1).")),
+    ] = None,
+    swath_id: Annotated[
+        S1Swaths,
+        typer.Option(help=("Filter by swath identifier (Sentinel-1).")),
+    ] = None,
+    rel_orbit_num: Annotated[
+        int,
         typer.Option(
-            help="List of bands to download."
-        )
-    ] = CDSESentinel2Bands.default_bands(),
-    include_scl: Annotated[
-        bool, 
+            help=("Filter by relative orbit number. Max 143 for S2; Max 175 for S1."),
+            min=1,
+            max=175,
+        ),
+    ] = None,
+    ops_mode: Annotated[
+        str,
+        typer.Option(help=("Filter by operation mode.")),
+    ] = None,
+    platform_serial_id: Annotated[
+        str,
+        typer.Option(help=("Filter by platform serial identifier.")),
+    ] = None,
+    top: Annotated[
+        int,
         typer.Option(
-            help="Whether to include the SCL band in the download."
-        )
+            help=(
+                "Number of results to return per page in the OData query. Default is "
+                "1000."
+            )
+        ),
+    ] = 1000,
+    count: Annotated[
+        bool,
+        typer.Option(
+            help=("Whether to continue the OData query when page top is reached.")
+        ),
     ] = True,
-    res: Annotated[
-        CDSESentinel2Res, 
-        typer.Option(
-            help="Target resolution in meters: 10, 20, or 60."
-        )
-    ] = CDSESentinel2Res.r20m,
-    max_workers: Annotated[
-        int, 
-        typer.Option(
-            help="Maximum number of worker threads for scene processing."
-        )
-    ] = 2,
     log: Annotated[
         Path,
         typer.Option(
             help=(
-                "Log file path. If omitted and --verbose is used, logs are written to "
-                f"{DEFAULT_LOG_DIR}. Use --verbose for console output."
+                "Log file path for query execution logs. If omitted, logs are saved to "
+                f"{DEFAULT_LOG_DIR} if --verbose is used, otherwise no logs are saved."
             )
-        )
+        ),
     ] = None,
     verbose: Annotated[
-        bool, 
-        typer.Option(
-            "--verbose", "-v",
-            help="Enable verbose logging to the console."
-        )
+        bool, typer.Option(help="Enable verbose logging to the console and log file.")
     ] = False,
 ):
-    from sentinel_py.s2.workflows.download_s2 import download_s2_scenes
+
+    from sentinel_py.common.download import query_cdse
+    from sentinel_py.common.logging import get_logger
 
     # set up logging
     logger = get_logger(name="download_logger", logpath=log, verbose=verbose)
 
-    # parse years arg
+    # parse years
     try:
         years = [int(y) for y in years.replace(",", " ").split()]
     except ValueError as e:
         raise typer.BadParameter(f"Could not parse years: {e}")
 
-    # parse query args
+    # parse query single item args
     collection = collection.value if hasattr(collection, "value") else collection
-    product = product.value if hasattr(product, "value") else product
-    res = int(res.value if hasattr(res, "value") else res)
-    bands = [b.value if hasattr(b, "value") else b for b in bands]
+    orbit = orbit.value if hasattr(orbit, "value") else orbit
+    swath_id = swath_id.value if hasattr(swath_id, "value") else swath_id
 
-    download_s2_scenes(
+    # parse query args that depend on collection choice
+    valid_product = validate_product(CDSECollections(collection), product)
+    valid_serial_id = validate_serial_id(
+        CDSECollections(collection), platform_serial_id
+    )
+    valid_sensor_mode = validate_sensor_mode(CDSECollections(collection), ops_mode)
+
+    # query
+    query_cdse(
+        collection=collection,
+        product=valid_product,
+        years=years,
+        speriod=speriod.date(),
+        eperiod=eperiod.date(),
         aoi=aoi,
         crs=crs,
-        outdir=outdir,
-        years=years,
-        speriod=speriod,
-        eperiod=eperiod,
-        s2collection=collection,
-        s2product=product,
-        s2bands=bands,
-        s2res=res,
-        include_scl=include_scl,
-        max_scene_workers=max_workers,
+        cache_dir=cache_dir,
+        orbit=orbit,
+        cloud_thresh=cloud_thresh,
+        burst_mode=burst_mode,
+        burst_id=burst_id,
+        swath_id=swath_id,
+        rel_orbit_num=rel_orbit_num,
+        ops_mode=valid_sensor_mode,
+        platform_serial_id=valid_serial_id,
+        top=top,
+        count=count,
         logger=logger,
     )
+
+
+# sentinel-py download -----------------------------------------------------------------
+@app.command(
+    "download",
+    help=("Download from S3 given a cache of CDSE query results. Not implemented yet."),
+)
+def download(
+    mission: Annotated[
+        str, typer.Option(help="Mission name to filter the query cache for download.")
+    ],
+    bands: Annotated[
+        str, typer.Option(help="Space- or comma-separated list of bands to download.")
+    ],
+    outdir: Annotated[
+        Path,
+        typer.Option(
+            help=("Output directory for downloaded files. Must exist and be writable."),
+            file_okay=False,
+        ),
+    ],
+    res: Annotated[
+        int,
+        typer.Option(
+            help=(
+                "Target resolution in meters for the bands to download. Only used "
+                "for Sentinel-2. Options: 10, 20, or 60."
+            ),
+        ),
+    ],
+    config: Annotated[
+        Path,
+        typer.Option(
+            help=("Path to .s5cfg file with AWS credentials for S3 download access.")
+        ),
+    ],
+    cache_dir: Annotated[
+        Path,
+        typer.Option(
+            help=(
+                "Directory for caching target file information. Must exist and be "
+                "writable."
+            ),
+            file_okay=False,
+        ),
+    ],
+    query: Annotated[
+        Path,
+        typer.Option(
+            help=("Path to a cache of CDSE query results stored as a parquet.")
+        ),
+    ] = None,
+    parallel_scenes: Annotated[
+        int, typer.Option(help="Number of scenes to download in parallel.")
+    ] = 2,
+    parallel_bands: Annotated[
+        int,
+        typer.Option(help="Number of bands to download in parallel within each scene."),
+    ] = 4,
+    log: Annotated[
+        Path,
+        typer.Option(
+            help=(
+                "Log file path for download execution logs. If omitted, logs are saved "
+                f"to {DEFAULT_LOG_DIR}."
+            )
+        ),
+    ] = None,
+    verbose: Annotated[
+        bool, typer.Option(help="Enable verbose logging to the console and log file.")
+    ] = False,
+):
+
+    from sentinel_py.common.download import (
+        find_latest_scenes_cache,
+        resolve_and_download,
+    )
+
+    # set up logging
+    logger = get_logger(name="download_logger", logpath=log, verbose=verbose)
+
+    # load most recent query cache if not provided
+    if query is None:
+        query = find_latest_scenes_cache(Path(cache_dir))
+        if not query:
+            raise typer.BadParameter(f"No scenes.parquet found in {cache_dir}")
+        logger.info(f"Using most recent query cache: {query}")
+
+    resolve_and_download(
+        scenes_cache=query,
+        mission=mission,
+        bands=[b.strip() for b in bands.replace(",", " ").split()],
+        resolution=res,
+        output_dir=outdir,
+        config_file=config,
+        parallel_scenes=parallel_scenes,
+        parallel_bands=parallel_bands,
+        logger=logger,
+    )
+
+
+########################################################################################
+# Sentinel-2 commands
+########################################################################################
 
 
 def _bandwise_create_pb_offset_vrt(
@@ -412,6 +488,7 @@ def _bandwise_create_pb_offset_vrt(
     Uses only simple, picklable arguments.
     """
     from sentinel_py.s2.s2_masking import create_pb_offset_vrt
+
     band_p = Path(band_path)
     out_d = Path(out_dir)
     vrt = create_pb_offset_vrt(
@@ -429,45 +506,69 @@ def _bandwise_create_pb_offset_vrt(
     help=(
         "Determine per-band DN offsets for Sentinel-2 Level-2A products "
         "so later temporal composites and mosaics are radiometrically consistent."
-    )
+    ),
 )
 def dn_offset(
-    input_dir: Annotated[Path, typer.Option(
-        exists=True,
-        file_okay=False,
-        dir_okay=True,
-        help="Directory with Sentinel-2 L2A products.",
-    )],
-    output_dir: Annotated[Path, typer.Option(
-        help="Output directory for DN offset VRT files.")],
-    years: Annotated[str, typer.Option(
-        help='Space-separated list of years in quotes. E.g., "2020 2021 2022".')],
-    speriod: Annotated[str, typer.Option(
-        help="Start of seasonal window as MM-DD. E.g. --speriod 06-01")],
-    eperiod: Annotated[str, typer.Option(
-        help="End of seasonal window as MM-DD. E.g. --eperiod 08-31")],
-    bands: Annotated[list[str], typer.Option(
-        help="List of bands to process.")] = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"],
-    res: Annotated[int, typer.Option(
-        help="Target resolution in meters: 10, 20, or 60.")] = 20,
-    log: Annotated[Path, typer.Option(
-        help="Optional log file path. If omitted, default logging config is used.")] = None,
-    verbose: Annotated[bool, typer.Option(
-        help="Enable verbose logging to the console.")] = False,
-    n_workers: Annotated[int, typer.Option(
-        help="Number of parallel workers.")] = 4,
-    dst_nodata: Annotated[int, typer.Option(
-        help="Nodata value to write into PB-offset VRTs.")] = 65535,
+    input_dir: Annotated[
+        Path,
+        typer.Option(
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            help="Directory with Sentinel-2 L2A products.",
+        ),
+    ],
+    output_dir: Annotated[
+        Path, typer.Option(help="Output directory for DN offset VRT files.")
+    ],
+    years: Annotated[
+        str,
+        typer.Option(
+            help='Space-separated list of years in quotes. E.g., "2020 2021 2022".'
+        ),
+    ],
+    speriod: Annotated[
+        str,
+        typer.Option(help="Start of seasonal window as MM-DD. E.g. --speriod 06-01"),
+    ],
+    eperiod: Annotated[
+        str, typer.Option(help="End of seasonal window as MM-DD. E.g. --eperiod 08-31")
+    ],
+    bands: Annotated[list[str], typer.Option(help="List of bands to process.")] = [
+        "B02",
+        "B03",
+        "B04",
+        "B05",
+        "B06",
+        "B07",
+        "B08",
+        "B8A",
+        "B11",
+        "B12",
+    ],
+    res: Annotated[
+        int, typer.Option(help="Target resolution in meters: 10, 20, or 60.")
+    ] = 20,
+    log: Annotated[
+        Path,
+        typer.Option(
+            help="Optional log file path. If omitted, default logging config is used."
+        ),
+    ] = None,
+    verbose: Annotated[
+        bool, typer.Option(help="Enable verbose logging to the console.")
+    ] = False,
+    n_workers: Annotated[int, typer.Option(help="Number of parallel workers.")] = 4,
+    dst_nodata: Annotated[
+        int, typer.Option(help="Nodata value to write into PB-offset VRTs.")
+    ] = 65535,
 ):
     """
     In parallel, compute per-band DN offsets for Sentinel-2 L2A products
     and write PB-offset VRTs.
     """
     from sentinel_py.common.utils import parse_years
-    from sentinel_py.s2.s2_masking import (
-        get_band_paths, 
-        get_pb_offset_from_jp2
-    )
+    from sentinel_py.s2.s2_masking import get_band_paths, get_pb_offset_from_jp2
 
     # set up logging
     logger = get_logger(name="download_logger", logpath=log, verbose=verbose)

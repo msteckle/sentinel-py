@@ -1,1 +1,0 @@
-from .download_s2 import download_s2_scenes

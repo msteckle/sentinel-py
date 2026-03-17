@@ -25,7 +25,6 @@ from rich.progress import (
 )
 
 # fix some phidown limitations
-_phidown_search.CopernicusDataSearcher._validate_aoi_wkt = lambda self: None
 _phidown_search.REQUEST_TIMEOUT_SECONDS = 120
 
 S2_BAND_RESOLUTIONS: dict[str, list[int]] = {
@@ -469,9 +468,14 @@ def _find_s2_scene_targets(
         cmd = f'ls "{pattern}"'
         try:
             output = run_s5cmd_with_config(cmd, config_file=config_file)
+        except FileNotFoundError as e:
+            raise RuntimeError(
+                f"s5cmd not found: ensure s5cmd is installed and in PATH: {e}"
+            ) from e
         except Exception:
             logger.warning(
-                f"  ERR {rb.band}@{rb.resolution}m: not found in {scene_name}"
+                f"  ERR {rb.band}@{rb.resolution}m: not found in {scene_name}",
+                exc_info=True,
             )
             continue
 
@@ -804,10 +808,13 @@ def resolve_and_download(
     all_results: list[DownloadResult] = []
     new_target_rows: list[dict] = []
     lock = threading.Lock()
+    cancel = threading.Event()
     s3_paths = dict(zip(scenes["Name"], scenes["S3Path"]))
 
     # Uncached scenes: resolve + download ----------------------------------------------
     def _resolve_and_dl(row: pd.Series) -> DownloadResult:
+        if cancel.is_set():
+            return DownloadResult(scene_name=row["Name"])
         name = row["Name"]
         raw_s3_path = row["S3Path"]
         s3_path = raw_s3_path.removeprefix("/eodata")
@@ -896,20 +903,27 @@ def resolve_and_download(
                 futures = {
                     pool.submit(_resolve_and_dl, r): r["Name"] for r in uncached_rows
                 }
+                fatal_error = None
                 for future in as_completed(futures):
                     name = futures[future]
                     try:
                         result = future.result()
                         all_results.append(result)
+                    except RuntimeError as exc:
+                        cancel.set()
+                        fatal_error = exc
+                        for f in futures:
+                            f.cancel()
+                        break
                     except Exception as exc:
                         logger.error(f"Scene {name} failed: {exc}")
                         all_results.append(
                             DownloadResult(scene_name=name, failed=["SCENE_ERROR"])
                         )
 
-                    # Add to targets cache as they come in -----------------------------
+                    # these run per-future, inside the loop
                     with lock:
-                        if len(new_target_rows) >= 1000:  # ~100 scenes × 10 bands
+                        if len(new_target_rows) >= 1000:
                             new_df = pd.DataFrame(new_target_rows)
                             if targets_file.exists():
                                 existing = pd.read_parquet(targets_file)
@@ -923,6 +937,9 @@ def resolve_and_download(
                             logger.info(f"Flushed {len(new_df)} targets to cache")
 
                     progress.advance(task_id)
+
+                if fatal_error:
+                    raise fatal_error
 
     # final flush for any remaining targets that didn't hit the 1000 threshold
     with lock:
@@ -949,6 +966,8 @@ def resolve_and_download(
         if grouped:
 
             def _dl_cached(name_targets: tuple[str, list[dict]]) -> DownloadResult:
+                if cancel.is_set():
+                    return DownloadResult(scene_name=name_targets[0])
                 name, targets = name_targets
                 s3_path = s3_paths.get(name, "").removeprefix("/eodata")
                 return _download_scene_from_targets(
@@ -975,17 +994,27 @@ def resolve_and_download(
 
                 with ThreadPoolExecutor(max_workers=parallel_scenes) as pool:
                     futures = {pool.submit(_dl_cached, ng): ng[0] for ng in grouped}
+                    fatal_error = None
                     for future in as_completed(futures):
                         name = futures[future]
                         try:
                             result = future.result()
                             all_results.append(result)
+                        except RuntimeError as exc:
+                            cancel.set()
+                            fatal_error = exc
+                            for f in futures:
+                                f.cancel()
+                            break
                         except Exception as exc:
-                            logger.error(f"Cached scene {name} failed: {exc}")
+                            logger.error(f"Scene {name} failed: {exc}")
                             all_results.append(
                                 DownloadResult(scene_name=name, failed=["SCENE_ERROR"])
                             )
                         progress.advance(task_id)
+
+                    if fatal_error:
+                        raise fatal_error
 
     # Summary --------------------------------------------------------------------------
     total_ok = sum(len(r.succeeded) for r in all_results)

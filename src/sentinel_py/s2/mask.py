@@ -7,14 +7,13 @@ import re
 import textwrap
 from logging import Logger
 from pathlib import Path
-from typing import List, Optional, Set, Tuple
+from typing import List, Mapping, Optional, Set, Tuple
 
 import pandas as pd
-from lxml import etree
+from lxml import etree  # type: ignore
 from osgeo import gdal
 
-from sentinel_py.common.gdal import add_python_pixelfunc_to_vrt
-from sentinel_py.common.utils import extract_s2_acq_date, in_season_window
+from utils import extract_s2_acq_date, in_season_window
 
 S2_RES_OPTS = [10, 20, 60]  # available Sentinel-2 resolutions in meters
 PB_OFFSET_CODE = textwrap.dedent(
@@ -122,6 +121,63 @@ SCL_TO_BINARY_MASK_CODE = textwrap.dedent(
         out_ar[:] = mask.astype(np.uint8)   # 1=mask, 0=keep
     """
 )
+
+
+def add_python_pixelfunc_to_vrt(
+    vrt_path: Path,
+    func_name: str,
+    func_code: str,
+    *,
+    band: int = 1,
+    args: Mapping[str, str] | None = None,
+) -> None:
+    """
+    Edit a VRT in-place to turn a band into a Python PixelFunction band.
+
+    - Keeps all existing georef, metadata, SimpleSource, etc.
+    - Sets subClass="VRTDerivedRasterBand"
+    - Injects PixelFunctionLanguage/Type/Arguments/Code.
+    """
+    vrt_path = Path(vrt_path)
+    tree = etree.parse(str(vrt_path))
+    root = tree.getroot()
+
+    band_el = root.find(f".//VRTRasterBand[@band='{band}']")
+    if band_el is None:
+        raise RuntimeError(f"No VRTRasterBand band='{band}' found in {vrt_path}")
+
+    # Make it a derived band
+    band_el.set("subClass", "VRTDerivedRasterBand")
+
+    # Remove any existing pixel-function-related elements
+    for tag in (
+        "PixelFunctionLanguage",
+        "PixelFunctionType",
+        "PixelFunctionArguments",
+        "PixelFunctionCode",
+    ):
+        for el in band_el.findall(tag):
+            band_el.remove(el)
+
+    # Language
+    lang_el = etree.SubElement(band_el, "PixelFunctionLanguage")
+    lang_el.text = "Python"
+
+    # Type
+    type_el = etree.SubElement(band_el, "PixelFunctionType")
+    type_el.text = func_name
+
+    # Arguments
+    args_el = etree.SubElement(band_el, "PixelFunctionArguments")
+    for k, v in (args or {}).items():
+        args_el.set(k, str(v))
+
+    # Code
+    code_el = etree.SubElement(band_el, "PixelFunctionCode")
+    code_el.text = etree.CDATA(func_code)
+
+    # Write back in place
+    tree.write(str(vrt_path), pretty_print=True, xml_declaration=True, encoding="UTF-8")
 
 
 def get_band_paths(

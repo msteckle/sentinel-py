@@ -52,6 +52,9 @@ RESOLUTIONS = [10, 20, 60]
 # Bands that allow coarser fallback (SCL is the main one)
 COARSER_FALLBACK_BANDS = {"SCL"}
 
+# Columns used as the unique key for an image row in all_downloaded_images.parquet
+IMAGE_KEY_COLS = ["safedir", "band_name", "resolution_m"]
+
 ########################################################################################
 # Variable helpers
 ########################################################################################
@@ -80,11 +83,28 @@ def _fix_date(year: int, month: int, day: int, logger: logging.Logger) -> date:
 # Cache helpers
 ########################################################################################
 
+"""
+Sentinel-py caches:
+- Query results (the .SAFE scenes found for a particular CDSE query)
+    - Each unique query gets its own cache directory named by a hash of the parameters
+    that the user specified (AOI, date windows, collection/product, etc); this way, if
+    you want to re-run a query with the same parameters, you get the cached results 
+    immediately without hitting the CDSE API again.
+- Download results
+    - The downloaded images (jp2 files) for all queries are cached into a single parquet
+    file with information about the .SAFE directory name, full S3 path, relative S3 
+    path, band, resolution, expected size (from S3), and actual size (from disk after 
+    download). This allows the download step to verify if the expected images already 
+    exist on disk and are valid (actual size matches expected), and if so, skip the 
+    download while still recording the actual size (if it doesn't already exist) in the 
+    cache for future runs.
+"""
+
 
 def query_cache_key(
     aoi_wkt: str,
     collection_name: str,
-    product_type: str,
+    product_type: Optional[str],
     iso_windows: list[tuple[str, str]],
     orbit: str | None = None,
     cloud_thresh: float | None = None,
@@ -94,7 +114,10 @@ def query_cache_key(
     ops_mode: str | None = None,
     platform_serial_id: str | None = None,
 ) -> str:
-    """Generate a hash key from query parameters."""
+    """
+    Generate a hash key from query parameters. This hash key will be used as the name of
+    the cache directory for the query results.
+    """
     payload = {
         "collection": collection_name,
         "product": product_type,
@@ -112,14 +135,19 @@ def query_cache_key(
 
 
 def query_cache_dir(cache_root: Path, cache_key: str) -> Path:
-    """Get or create the cache directory for a query."""
+    """
+    Get or create the cache directory for a query given a parent directory and cache
+    key.
+    """
     d = cache_root / cache_key
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def save_query_info(query_dir: Path, **kwargs) -> None:
-    """Save query parameters as human-readable JSON."""
+def save_query_as_json(query_dir: Path, **kwargs) -> None:
+    """
+    Save query parameters as a human-readable JSON inside the query cache directory.
+    """
     info = {k: str(v) if isinstance(v, (Path, date)) else v for k, v in kwargs.items()}
     info["created"] = datetime.now().isoformat()
     (query_dir / "query_info.json").write_text(
@@ -128,7 +156,9 @@ def save_query_info(query_dir: Path, **kwargs) -> None:
 
 
 def find_latest_scenes_cache(cache_root: Path) -> Optional[Path]:
-    """Find the most recently modified scenes.parquet across all query dirs."""
+    """
+    Find the most recently modified scenes.parquet across all query cache directories.
+    """
     candidates = sorted(
         cache_root.glob("*/scenes.parquet"),
         key=lambda p: p.stat().st_mtime,
@@ -137,12 +167,29 @@ def find_latest_scenes_cache(cache_root: Path) -> Optional[Path]:
 
 
 def write_protected_parquet(df: pd.DataFrame, path: Path) -> None:
-    """Write parquet and set read-only to prevent accidental deletion."""
+    """Write a parquet file and set it as read-only to prevent accidental deletion."""
     # temporarily make writable if it already exists as read-only
     if path.exists():
         path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
     df.to_parquet(path)
     path.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+
+
+def _merge_image_rows(existing: pd.DataFrame, new_rows: list[dict]) -> pd.DataFrame:
+    """Merge new/updated image row to the downloaded images cache."""
+    if not new_rows:
+        return existing
+    new_df = pd.DataFrame(new_rows)
+    if existing.empty:
+        return new_df
+    # align columns so concat + drop_duplicates behaves predictably
+    all_cols = list(dict.fromkeys([*existing.columns, *new_df.columns]))
+    existing = existing.reindex(columns=all_cols)
+    new_df = new_df.reindex(columns=all_cols)
+    combined = pd.concat([existing, new_df], ignore_index=True)
+    # keep="last" so new rows win over existing ones for the same key
+    combined = combined.drop_duplicates(subset=IMAGE_KEY_COLS, keep="last")
+    return combined.reset_index(drop=True)
 
 
 ########################################################################################
@@ -152,7 +199,7 @@ def write_protected_parquet(df: pd.DataFrame, path: Path) -> None:
 
 def query_cdse(
     collection: str,
-    product: str,
+    product: Optional[str],
     years: list[int],
     speriod: date,
     eperiod: date,
@@ -180,12 +227,21 @@ def query_cdse(
     count: bool = False,
     logger: logging.Logger | None = None,
 ) -> pd.DataFrame:
+    """
+    Using the phidown CompernicusDataSearcher, query the CDSE Catalogue for scenes
+    matching the given parameters. Results are cached to avoid redundant queries, and a
+    progress bar is displayed during the query process. Reference phidown docs for
+    details on the parameters: https://esa-philab.github.io/phidown/api/phidown/search/index.html#phidown.search.CopernicusDataSearcher
+    """
 
-    from sentinel_py.common.aoi import aoi_as_geom, batch_geometries
+    from sentinel_py.aoi import aoi_as_geom, batch_geometries
 
     # ----------------------------------------------------------------------------------
-    # Prepare for querying CDSE Catalogue (search/discovery API)
+    # Clean up and validate parameters, and prepare query windows
     # ----------------------------------------------------------------------------------
+
+    # define logger if none provided
+    logger = logger or logging.getLogger(__name__)
 
     # ensure AOI is geometry object
     aoi_geom = aoi_as_geom(aoi, crs)
@@ -209,9 +265,7 @@ def query_cdse(
         for s, e in date_windows
     ]
 
-    # generate cache key based on the query parameters
-    # if a parquet with the cache key exists, it means all the products for that
-    # query have already been found and cached, so we can skip the querying step
+    # generate scene cache key based on the query parameters
     cache_key = query_cache_key(
         aoi_geom.union_all().wkt, collection, product, iso_windows
     )
@@ -221,114 +275,121 @@ def query_cdse(
     # if cached products exist, don't bother querying
     if scenes_cache.exists():
         logger.info(f"Loading cached products from {scenes_cache}")
-        scenes = pd.read_parquet(scenes_cache)
+        return pd.read_parquet(scenes_cache)
 
     # otherwise, proceed with querying
-    else:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+    # if AOI is too large/complex, the CDSE API may reject it. To mitigate this, we
+    # split the AOI into batches of geometries and query each batch separately,
+    # then combine the results.
+    aoi_batches = batch_geometries(aoi_geom)
+    logger.info(f"AOI split into {len(aoi_batches)} batch(es) for querying")
 
-        aoi_batches = batch_geometries(aoi_geom)
-        logger.info(f"AOI split into {len(aoi_batches)} batch(es) for querying")
+    def _run_query(
+        start_iso: str, end_iso: str, batch_idx: int, batch_geom
+    ) -> pd.DataFrame:
+        searcher = CopernicusDataSearcher()
+        searcher.query_by_filter(
+            collection_name=collection,
+            product_type=product,
+            orbit_direction=orbit,
+            cloud_cover_threshold=cloud_thresh,
+            attributes=attrs,
+            aoi_wkt=batch_geom.wkt,
+            start_date=start_iso,
+            end_date=end_iso,
+            burst_mode=burst_mode,
+            burst_id=burst_id,
+            absolute_burst_id=abs_burst_id,
+            swath_identifier=swath_id,
+            parent_product_name=parent_product_name,
+            parent_product_type=parent_product_type,
+            parent_product_id=parent_product_id,
+            datatake_id=datatake_id,
+            relative_orbit_number=rel_orbit_num,
+            operational_mode=ops_mode,
+            polarisation_channels=pol_channels,
+            platform_serial_identifier=platform_serial_id,
+            top=top,
+            count=count,
+        )
+        df = searcher.execute_query()
+        num_rows = len(df) if df is not None else 0
+        logger.info(
+            f"Window {start_iso} -> {end_iso}, batch {batch_idx + 1}/"
+            f"{len(aoi_batches)}: {num_rows} scene(s)"
+        )
+        return df if df is not None else pd.DataFrame()
 
-        def _run_query(
-            start_iso: str, end_iso: str, batch_idx: int, batch_geom
-        ) -> pd.DataFrame:
-            searcher = CopernicusDataSearcher()
-            searcher.query_by_filter(
-                collection_name=collection,
-                product_type=product,
-                orbit_direction=orbit,
-                cloud_cover_threshold=cloud_thresh,
-                attributes=attrs,
-                aoi_wkt=batch_geom.wkt,
-                start_date=start_iso,
-                end_date=end_iso,
-                burst_mode=burst_mode,
-                burst_id=burst_id,
-                absolute_burst_id=abs_burst_id,
-                swath_identifier=swath_id,
-                parent_product_name=parent_product_name,
-                parent_product_type=parent_product_type,
-                parent_product_id=parent_product_id,
-                datatake_id=datatake_id,
-                relative_orbit_number=rel_orbit_num,
-                operational_mode=ops_mode,
-                polarisation_channels=pol_channels,
-                platform_serial_identifier=platform_serial_id,
-                top=top,
-                count=count,
-            )
-            df = searcher.execute_query()
-            logger.info(
-                f"Window {start_iso} -> {end_iso}, batch {batch_idx + 1}/"
-                f"{len(aoi_batches)}: {len(df)} scene(s)"
-            )
-            return df
+    # build all (window × batch) tasks
+    tasks = [
+        (start_iso, end_iso, i, batch_geom)
+        for start_iso, end_iso in iso_windows
+        for i, batch_geom in enumerate(aoi_batches)
+    ]
 
-        # build all (window × batch) tasks
-        tasks = [
-            (start_iso, end_iso, i, batch_geom)
-            for start_iso, end_iso in iso_windows
-            for i, batch_geom in enumerate(aoi_batches)
-        ]
+    all_rows: list[pd.DataFrame] = []
+    max_workers = min(len(tasks), 8)
 
-        all_rows: list[pd.DataFrame] = []
-        max_workers = min(len(tasks), 8)
+    # run queries in parallel with a progress bar, and collect results
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+    ) as progress:
+        task_id = progress.add_task("Querying CDSE", total=len(tasks))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_run_query, *task): task for task in tasks}
+            for future in as_completed(futures):
+                try:
+                    df = future.result()
+                    if not df.empty:
+                        all_rows.append(df)
+                except Exception as e:
+                    task = futures[future]
+                    logger.error(
+                        f"Query failed for window {task[0]} -> {task[1]}, "
+                        f"batch {task[2] + 1}: {e}"
+                    )
+                progress.advance(task_id)
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-        ) as progress:
-            task_id = progress.add_task("Querying CDSE", total=len(tasks))
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                futures = {pool.submit(_run_query, *task): task for task in tasks}
-                for future in as_completed(futures):
-                    try:
-                        df = future.result()
-                        if not df.empty:
-                            all_rows.append(df)
-                    except Exception as e:
-                        task = futures[future]
-                        logger.error(
-                            f"Query failed for window {task[0]} -> {task[1]}, "
-                            f"batch {task[2] + 1}: {e}"
-                        )
+    # if no scenes found across all windows and batches, return empty scenes dataframe
+    if not all_rows:
+        logger.warning("No scenes found for given AOI and date windows.")
+        return pd.DataFrame()
 
-            if not all_rows:
-                logger.warning("No scenes found for given AOI and date windows.")
-                return pd.DataFrame()
+    # otherwise, combine results, drop duplicates, and cache to scenes.parquet
+    scenes = pd.concat(all_rows, ignore_index=True).drop_duplicates(subset="Id")
+    scenes = scenes[["Id", "Name", "S3Path", "ContentDate", "GeoFootprint"]]
+    logger.info(
+        f"Found {len(scenes)} unique scenes across {len(iso_windows)} "
+        f"window(s) and {len(aoi_batches)} batch(es)"
+    )
 
-            scenes = pd.concat(all_rows, ignore_index=True).drop_duplicates(subset="Id")
-            scenes = scenes[["Id", "Name", "S3Path", "ContentDate", "GeoFootprint"]]
-            logger.info(
-                f"Found {len(scenes)} unique scenes across {len(iso_windows)} "
-                f"window(s) and {len(aoi_batches)} batch(es)"
-            )
-
-            try:
-                scenes.to_parquet(scenes_cache)
-                save_query_info(
-                    query_dir,
-                    collection=collection,
-                    product=product,
-                    years=years,
-                    period=f"{speriod.month:02d}-{speriod.day:02d} to {eperiod.month:02d}-{eperiod.day:02d}",
-                    aoi=str(aoi),
-                    cloud_cover=cloud_thresh,
-                    orbit=orbit,
-                    num_scenes=len(scenes),
-                )
-                logger.info(f"Cached scenes to {scenes_cache}")
-            except Exception as e:
-                logger.error(f"Failed to cache scenes to {scenes_cache}: {e}")
-
-            progress.advance(task_id)
+    # save scenes.parquet and query_info.json within query-specific cache directory
+    try:
+        scenes.to_parquet(scenes_cache)
+        save_query_as_json(
+            query_dir,
+            collection=collection,
+            product=product,
+            years=years,
+            period=f"{speriod.month:02d}-{speriod.day:02d} to {eperiod.month:02d}-{eperiod.day:02d}",
+            aoi=str(aoi),
+            cloud_cover=cloud_thresh,
+            orbit=orbit,
+            num_scenes=len(scenes),
+        )
+        logger.info(f"Cached scenes to {scenes_cache}")
+    except Exception as e:
+        logger.error(f"Failed to cache scenes to {scenes_cache}: {e}")
 
     return scenes
+
+
+# after X number of days we could overwrite the cache
 
 
 ########################################################################################
@@ -341,7 +402,12 @@ def query_cdse(
 # --------------------------------------------------------------------------------------
 @dataclass
 class ResolvedBand:
-    """A band resolved to an existing resolution."""
+    """
+    An object that stores the band name, the resolved resolution, whether a fallback
+    resolution was used, and the original requested resolution (if fallback was used).
+    Also has a property to get the resolution directory name (e.g. "R20m") for
+    S2 images.
+    """
 
     band: str
     resolution: int
@@ -363,7 +429,12 @@ class ResolvedBand:
 
 def _resolve_s2_band(band: str, requested_res: int) -> ResolvedBand:
     """
-    Resolve a single S2 band to an existing resolution.
+    Return a ResolvedBand object containing information about the band name, the
+    requested resolution, the resolved (fixed) resolution, and whether a fallback
+    resolution was used. If someone requests a resolution that we know (without
+    hitting S3) isn't available for that band, we can immediately resolve to the
+    closest available resolution and log a warning to continue working and prevent
+    hitting errors later.
     """
     available = S2_BAND_RESOLUTIONS[band]
 
@@ -410,7 +481,10 @@ def _resolve_s2_band(band: str, requested_res: int) -> ResolvedBand:
 def _resolve_s2_bands(
     bands: list[str], requested_res: int, logger: logging.Logger
 ) -> list[ResolvedBand]:
-    """Resolve a list of S2 bands to existing resolutions."""
+    """
+    Resolve a list of S2 bands for a requested resolution to known existing
+    resolutions. Returns a list of ResolvedBand objects (see above).
+    """
     bands = [b.upper() for b in bands]
     resolved = [_resolve_s2_band(b, requested_res) for b in bands]
 
@@ -425,12 +499,12 @@ def _resolve_s2_bands(
 
 
 # --------------------------------------------------------------------------------------
-# Determine the targets we want to download for a scene, and cache the results
+# Determine the images we want to download for a scene, and cache the results
 # --------------------------------------------------------------------------------------
 
 
 def _parse_s5cmd_ls_line(line: str) -> Optional[tuple[int, str]]:
-    """Parse an s5cmd ls output line → (size, rel_path) or None."""
+    """Get size, rel_path, or None from s5cmd `ls` output line."""
     parts = line.strip().split()
     if len(parts) >= 4:
         try:
@@ -442,7 +516,7 @@ def _parse_s5cmd_ls_line(line: str) -> Optional[tuple[int, str]]:
     return None
 
 
-def _find_s2_scene_targets(
+def _find_s2_scene_images(
     scene_name: str,
     s3_path: str,
     resolved: list[ResolvedBand],
@@ -450,13 +524,16 @@ def _find_s2_scene_targets(
     logger: logging.Logger,
 ) -> list[dict]:
     """
-    Find S2 scene targets by querying S3 directly for each resolved band.
+    Find S2 images in a scene (.SAFE directory) by querying S3 directly given resolved
+    bands.
     """
     s3_path = s3_path.removeprefix("/eodata")
     is_l1c = "MSIL1C" in scene_name.upper()
-    targets = []
+    images = []
 
+    # loop through each resolved band
     for rb in resolved:
+        # get the S3 pattern to query based on whether it's L1C or L2A
         if is_l1c:
             pattern = f"s3://eodata{s3_path}/GRANULE/*/IMG_DATA/*_{rb.band}.jp2"
         else:
@@ -465,6 +542,7 @@ def _find_s2_scene_targets(
                 f"R{rb.resolution}m/*_{rb.band}_{rb.resolution}m.jp2"
             )
 
+        # find images for a scene and band by querying S3 directly using `s5cmd ls`
         cmd = f'ls "{pattern}"'
         try:
             output = run_s5cmd_with_config(cmd, config_file=config_file)
@@ -479,6 +557,7 @@ def _find_s2_scene_targets(
             )
             continue
 
+        # parse the results of `s5cmd ls` and append information about the images
         found = False
         for line in output.strip().splitlines():
             parsed = _parse_s5cmd_ls_line(line)
@@ -486,43 +565,53 @@ def _find_s2_scene_targets(
                 expected_size, rel_path = parsed
                 if not rel_path.startswith("GRANULE/"):
                     rel_path = f"GRANULE/{rel_path}"
-                targets.append(
+                images.append(
                     {
-                        "Name": scene_name,
-                        "S3Path": s3_path,
-                        "band": rb.band,
-                        "resolution": rb.resolution if not is_l1c else 0,
-                        "rel_path": rel_path,
-                        "expected_size": expected_size,
+                        "safedir": scene_name,
+                        "s3_path": s3_path,
+                        "band_name": rb.band,
+                        "resolution_m": rb.resolution if not is_l1c else 0,
+                        "img_path_in_safedir": rel_path,
+                        "s3_expected_size": expected_size,
+                        "local_actual_size": None,
                     }
                 )
                 found = True
                 break
 
+        # if no images found for this band, log a warning
+        # (sometimes what CDSE says is available doesn't actually exist in S3)
         if not found:
             logger.warning(f"  ERR {rb.band}: not found in {scene_name}")
 
-    return targets
+    return images
 
 
-def _find_s1_scene_targets(
+def _find_s1_scene_images(
     scene_name: str,
     s3_path: str,
     polarisations: list[str],
     config_file: str,
     logger: logging.Logger,
 ) -> list[dict]:
-    """Resolve S1 polarisation targets by querying S3 directly for each pol."""
+    """Find S1 images in a scene by querying S3 directly for each polarisation."""
     s3_path = s3_path.removeprefix("/eodata")
-    targets = []
+    images = []
 
     for pol in [p.upper() for p in polarisations]:
         pattern = f"s3://eodata{s3_path}/measurement/*-{pol.lower()}-*.tiff"
         cmd = f'ls "{pattern}"'
         try:
             output = run_s5cmd_with_config(cmd, config_file=config_file)
+        except FileNotFoundError as e:
+            raise RuntimeError(
+                f"s5cmd not found: ensure s5cmd is installed and in PATH: {e}"
+            ) from e
         except Exception:
-            logger.warning(f"  ERR {pol}: not found in {scene_name}")
+            logger.warning(
+                f"  ERR {pol}: not found in {scene_name}",
+                exc_info=True,
+            )
             continue
 
         found = False
@@ -532,14 +621,15 @@ def _find_s1_scene_targets(
                 expected_size, rel_path = parsed
                 if not rel_path.startswith("measurement/"):
                     rel_path = f"measurement/{rel_path}"
-                targets.append(
+                images.append(
                     {
-                        "Name": scene_name,
-                        "S3Path": s3_path,
-                        "band": pol,
-                        "resolution": 0,
-                        "rel_path": rel_path,
-                        "expected_size": expected_size,
+                        "safedir": scene_name,
+                        "s3_path": s3_path,
+                        "band_name": pol,
+                        "resolution_m": 0,
+                        "img_path_in_safedir": rel_path,
+                        "s3_expected_size": expected_size,
+                        "local_actual_size": None,
                     }
                 )
                 found = True
@@ -548,11 +638,11 @@ def _find_s1_scene_targets(
         if not found:
             logger.warning(f"  ERR {pol}: not found in {scene_name}")
 
-    return targets
+    return images
 
 
 # --------------------------------------------------------------------------------------
-# Download one target file
+# Download one image file
 # --------------------------------------------------------------------------------------
 
 
@@ -576,21 +666,23 @@ def download_s3_file(
 
 
 # --------------------------------------------------------------------------------------
-# Download multiple target files for one scene
+# Download multiple image files for one scene
 # --------------------------------------------------------------------------------------
 
 
 @dataclass
 class DownloadResult:
     """
-    Result of downloading targets for a single scene, with lists of succeeded, failed,
-    and skipped targets (identified by band@resolution).
+    Result of downloading images for a single scene, with lists of succeeded, failed,
+    and skipped images (identified by band@resolution), plus updated image rows
+    (with actual_size populated) ready to be merged into the images cache.
     """
 
     scene_name: str
     succeeded: list[str] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
+    updated_images: list[dict] = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -601,61 +693,115 @@ class DownloadResult:
         return len(self.failed) == 0
 
 
-def _download_scene_from_targets(
+def _download_scene_from_images(
     scene_name: str,
     s3_path: str,
-    targets: list[dict],
+    images: list[dict],
     output_dir: Path,
     config_file: str,
     parallel_bands: int,
     logger: logging.Logger,
 ) -> DownloadResult:
-    """Download pre-resolved targets for a single scene, preserving SAFE structure."""
+    """
+    Download pre-resolved images for a single scene, preserving SAFE structure.
+
+    For each image we compare s3_expected_size (from S3) against local_actual_size (on
+    disk). Rules:
+
+      * Cache already knows local_actual_size == s3_expected_size; trust it, skip
+        without stat-ing the file.
+      * File on disk and its size matches s3_expected_size; skip. If the cache's
+        local_actual_size is missing or stale, emit an updated row so it gets
+        persisted.
+      * File on disk but size != s3_expected_size, so warn and re-download.
+      * File missing, download.
+
+    After any successful download, local_actual_size is re-measured from disk and
+    attached to an updated image row. Those rows are returned via
+    DownloadResult.updated_images so the caller can merge them into the
+    images cache (keyed on Name/band/resolution, so they overwrite the
+    existing entry).
+    """
     result = DownloadResult(scene_name=scene_name)
     scene_root = output_dir / scene_name
 
-    download_tasks: list[tuple[str, str, Path]] = []
+    # (label, s3_uri, local_path, image_dict)
+    download_tasks: list[tuple[str, str, Path, dict]] = []
 
-    for t in targets:
-        band = t["band"]
-        res = t.get("resolution", 0)
+    for t in images:
+        band = t["band_name"]
+        res = t.get("resolution_m", 0)
         label = f"{band}@{res}m" if res else band
-        rel_path = t["rel_path"]
-        expected = t.get("expected_size", 0)
+        rel_path = t["img_path_in_safedir"]
+        expected = t.get("s3_expected_size", 0)
+        cached_actual = t.get("local_actual_size")
         local_path = scene_root / rel_path
 
-        # check existing file with size verification
+        # if cache has local_actual_size that matches s3_expected_size, skip download
+        if expected and cached_actual is not None and cached_actual == expected:
+            result.skipped.append(label)
+            continue
+
+        # otherwise, if the file exists...
         if local_path.exists():
             local_size = local_path.stat().st_size
+
+            # if stat-ed file size matches s3_expected_size...
             if expected and local_size == expected:
+                # if the cached local_actual_size isn't populated or is stale, update it
+                if cached_actual != local_size:
+                    result.updated_images.append({**t, "local_actual_size": local_size})
                 result.skipped.append(label)
                 continue
+
+            # if stat-ed file size doesn't match s3_expected_size, warn & re-download
+            if expected and local_size != expected:
+                logger.warning(
+                    f"  SIZE MISMATCH {scene_name} / {label}: "
+                    f"local={local_size} expected={expected} -- re-downloading"
+                )
+                # fall through to the download path below
+            # if S3 doesn't have an expected size, just trust what we have
             elif not expected and local_size > 0:
+                if cached_actual != local_size:
+                    result.updated_images.append({**t, "local_actual_size": local_size})
                 result.skipped.append(label)
                 continue
-            # else: incomplete, re-download
 
+        # build the s3_uri and add to download tasks
         s3_uri = f"s3://eodata{s3_path}/{rel_path}"
-        download_tasks.append((label, s3_uri, local_path))
+        download_tasks.append((label, s3_uri, local_path, t))
 
+    # if there's nothing to download, we're done
     if not download_tasks:
         logger.info(
-            f"All targets for {scene_name} already exist and are valid, skipping."
+            f"All images for {scene_name} already exist and are valid, skipping."
         )
         return result
 
-    def _dload(task: tuple[str, str, Path]) -> tuple[str, bool]:
-        label, uri, local = task
+    # otherwise, download in parallel
+    def _dload(
+        task: tuple[str, str, Path, dict],
+    ) -> tuple[str, bool, Path, dict]:
+        label, uri, local, image = task
         logger.debug(f"  DWNLD {scene_name} / {label} starting...")
         ok = download_s3_file(uri, local, logger=logger, config_file=config_file)
-        return label, ok
+        return label, ok, local, image
 
     with ThreadPoolExecutor(max_workers=parallel_bands) as pool:
         futures = {pool.submit(_dload, t): t for t in download_tasks}
         for future in as_completed(futures):
-            label, ok = future.result()
+            label, ok, local_path, image = future.result()
             if ok:
                 result.succeeded.append(label)
+                # measure local_actual_size from the freshly written file so it gets
+                # persisted to the cache
+                try:
+                    actual = local_path.stat().st_size
+                except OSError as e:
+                    logger.warning(f"  could not stat {local_path} after download: {e}")
+                    actual = None
+                result.updated_images.append({**image, "local_actual_size": actual})
                 logger.debug(f"  DWNLDED {scene_name} / {label}")
             else:
                 result.failed.append(label)
@@ -669,35 +815,6 @@ def _download_scene_from_targets(
 # --------------------------------------------------------------------------------------
 
 
-def _band_from_filename(filename: str, mission: str) -> str:
-    """Extract band name from a JP2/TIFF filename."""
-    # L2A: T33TUM_20240615T100559_B02_20m.jp2 -> B02
-    # L1C: T33TUM_20240615T100559_B02.jp2 -> B02
-    parts = filename.replace(".jp2", "").replace(".tiff", "").split("_")
-    for p in reversed(parts):
-        if p in S2_BAND_RESOLUTIONS or p in {"VV", "VH", "HH", "HV"}:
-            return p
-        # catch "B02" in "B02_20m" style
-        if (
-            p.startswith("B")
-            or p == "SCL"
-            or p == "TCI"
-            or p == "AOT"
-            or p == "WVP"
-            or p == "B8A"
-        ):
-            return p
-    return parts[-1]
-
-
-def _res_from_filename(filename: str) -> int:
-    """Extract resolution from a JP2 filename, or 0 if not present."""
-    import re
-
-    m = re.search(r"_(\d+)m\.jp2$", filename)
-    return int(m.group(1)) if m else 0
-
-
 def resolve_and_download(
     scenes_cache: Path,
     mission: str,
@@ -707,14 +824,15 @@ def resolve_and_download(
     config_file: str = ".s5cfg",
     parallel_scenes: int = 2,
     parallel_bands: int = 2,
-    logger: logging.Logger = None,
+    logger: Optional[logging.Logger] = None,
 ) -> list[DownloadResult]:
     """
     Resolve + download pipeline.
 
     For each scene:
-      1. If already in targets cache, skip resolve, just download
-      2. Otherwise: resolve via targeted S3 ls, download, append to cache
+      1. If already in images cache, skip band resolve, just verify/download
+         (trusting local_actual_size when it matches s3_expected_size).
+      2. Otherwise: resolve band via targeted S3 ls, download, & append to cache.
 
     Parameters
     ----------
@@ -743,7 +861,10 @@ def resolve_and_download(
         List of DownloadResult, one per scene.
     """
 
-    # load scenes
+    # set up logger if none
+    logger = logger or logging.getLogger(__name__)
+
+    # load scenes found for this query
     scenes = pd.read_parquet(scenes_cache)
     required_cols = {"Name", "S3Path"}
     if not required_cols.issubset(scenes.columns):
@@ -753,27 +874,30 @@ def resolve_and_download(
         )
     logger.info(f"Loaded {len(scenes)} scenes from {scenes_cache}")
 
-    # targets cache lives alongside scenes.parquet
-    targets_file = Path(scenes_cache).parent.parent / "downloaded_targets.parquet"
-    logger.info(f"Looking for targets cache at: {targets_file}")  # ← add this
-    if targets_file.exists():
-        cached_targets = pd.read_parquet(targets_file)
+    # load images (results of all queries so far)
+    images_file = Path(scenes_cache).parent.parent / "all_downloaded_images.parquet"
+    logger.info(f"Looking for images cache at: {images_file}")
+    if images_file.exists():
+        cached_images = pd.read_parquet(images_file)
+        # ensure local_actual_size column exists for back-compat with older caches
+        if "local_actual_size" not in cached_images.columns:
+            cached_images["local_actual_size"] = None
         cached_keys = set(
             zip(
-                cached_targets["Name"],
-                cached_targets["band"],
-                cached_targets["resolution"],
+                cached_images["safedir"],
+                cached_images["band_name"],
+                cached_images["resolution_m"],
             )
         )
-        cached_scene_names = set(cached_targets["Name"].unique())
+        cached_scene_names = set(cached_images["safedir"].unique())
         logger.info(
-            f"Found {len(cached_scene_names)} scenes ({len(cached_targets)} rows) in {targets_file}"
+            f"Found {len(cached_scene_names)} scenes ({len(cached_images)} rows) in {images_file}"
         )
         logger.info(f"First 3 cached scenes: {list(cached_scene_names)[:3]}")
         logger.info(f"First 3 query scenes: {scenes['Name'].head(3).tolist()}")
     else:
-        logger.info(f"No target cache at {targets_file}")  # ← add this
-        cached_targets = pd.DataFrame()
+        logger.info(f"No images cache at {images_file}")
+        cached_images = pd.DataFrame()
         cached_keys = set()
         cached_scene_names = set()
 
@@ -785,13 +909,15 @@ def resolve_and_download(
 
     # split scenes; a scene is only "fully cached" if ALL requested bands are cached
     def _scene_fully_cached(name: str) -> bool:
+        """Check if all requested bands for this scene are in the cached keys."""
         if name not in cached_scene_names:
             return False
-        for rb in (
+        bands_to_check = (
             resolved_bands
-            if mission.upper() == "S2"
-            else [type("", (), {"band": b, "resolution": 0})() for b in bands]
-        ):
+            if mission.upper() == "S2" and resolved_bands is not None
+            else [ResolvedBand(band=b, resolution=0) for b in bands]
+        )
+        for rb in bands_to_check:
             if (name, rb.band, rb.resolution) not in cached_keys:
                 return False
         return True
@@ -806,83 +932,92 @@ def resolve_and_download(
     )
 
     all_results: list[DownloadResult] = []
-    new_target_rows: list[dict] = []
+    # rows to append/overwrite in the images cache on next flush
+    pending_image_rows: list[dict] = []
     lock = threading.Lock()
     cancel = threading.Event()
     s3_paths = dict(zip(scenes["Name"], scenes["S3Path"]))
 
+    def _flush_images(force: bool = False) -> None:
+        """Merge pending rows into the on-disk images cache."""
+        with lock:
+            if not pending_image_rows:
+                return
+            if not force and len(pending_image_rows) < 1000:
+                return
+            rows_to_write = list(pending_image_rows)
+            pending_image_rows.clear()
+
+        existing = (
+            pd.read_parquet(images_file) if images_file.exists() else pd.DataFrame()
+        )
+        if not existing.empty and "local_actual_size" not in existing.columns:
+            existing["local_actual_size"] = None
+        combined = _merge_image_rows(existing, rows_to_write)
+        write_protected_parquet(combined, images_file)
+        logger.info(f"Flushed {len(rows_to_write)} image row(s) to cache")
+
     # Uncached scenes: resolve + download ----------------------------------------------
     def _resolve_and_dl(row: pd.Series) -> DownloadResult:
+
+        # if fatal error, skip all this and return empty result
         if cancel.is_set():
             return DownloadResult(scene_name=row["Name"])
+
         name = row["Name"]
         raw_s3_path = row["S3Path"]
         s3_path = raw_s3_path.removeprefix("/eodata")
-        scene_root = output_dir / name
 
-        # quick local check before hitting S3
-        if scene_root.exists():
-            existing_jp2 = list(scene_root.rglob("*.jp2"))
-            expected_bands = resolved_bands if mission.upper() == "S2" else bands
-            if len(existing_jp2) >= len(expected_bands):
-                # build targets from local files so the cache gets populated
-                local_targets = []
-                for f in existing_jp2:
-                    rel = str(f.relative_to(scene_root))
-                    local_targets.append(
-                        {
-                            "Name": name,
-                            "S3Path": s3_path,
-                            "band": _band_from_filename(f.name, mission),
-                            "resolution": _res_from_filename(f.name),
-                            "rel_path": rel,
-                            "expected_size": f.stat().st_size,
-                        }
-                    )
-                with lock:
-                    new_target_rows.extend(local_targets)
-                return DownloadResult(
-                    scene_name=name,
-                    skipped=[f.name for f in existing_jp2],
-                )
-
+        # always resolve via S3 so s3_expected_size is authoritative. If the
+        # files already exist locally, the download step will stat them and,
+        # on a size match, skip + record local_actual_size into the cache
         if mission.upper() == "S2":
-            targets = _find_s2_scene_targets(
+            if resolved_bands is None:
+                logger.error(f"resolved_bands is None for S2 scene: {name}")
+                return DownloadResult(scene_name=name)
+            images = _find_s2_scene_images(
                 name, raw_s3_path, resolved_bands, config_file, logger=logger
             )
             logger.info(
-                f"Scene {name}: resolved targets: "
-                f"{', '.join(f'{t["band"]}@{t["resolution"]}m' for t in targets)}"
+                f"Scene {name}: resolved images: "
+                f"{', '.join(f'{t["band_name"]}@{t["resolution_m"]}m' for t in images)}"
             )
         elif mission.upper() == "S1":
-            targets = _find_s1_scene_targets(
+            images = _find_s1_scene_images(
                 name, raw_s3_path, bands, config_file, logger=logger
             )
             logger.info(
-                f"Scene {name}: resolved targets: "
-                f"{', '.join(f'{t["band"]}' for t in targets)}"
+                f"Scene {name}: resolved images: "
+                f"{', '.join(f'{t["band_name"]}' for t in images)}"
             )
         else:
             logger.error(f"Unsupported mission: {mission}")
             return DownloadResult(scene_name=name)
 
-        if not targets:
-            logger.error(f"No targets found for scene: {name}")
+        if not images:
+            logger.error(f"No images found for scene: {name}")
             return DownloadResult(scene_name=name)
 
+        # seed the cache with the resolved rows (local_actual_size still None). The
+        # download step will produce updated rows with local_actual_size populated,
+        # which will overwrite these seeds via the merge-by-key logic
         with lock:
-            new_target_rows.extend(targets)
+            pending_image_rows.extend(images)
 
-        logger.info(f"Scene {name}: downloading {len(targets)} target(s)")
-        return _download_scene_from_targets(
+        logger.info(f"Scene {name}: downloading {len(images)} image(s)")
+        result = _download_scene_from_images(
             scene_name=name,
             s3_path=s3_path,
-            targets=targets,
+            images=images,
             output_dir=output_dir,
             config_file=config_file,
             parallel_bands=parallel_bands,
             logger=logger,
         )
+        if result.updated_images:
+            with lock:
+                pending_image_rows.extend(result.updated_images)
+        return result
 
     if not uncached_df.empty:
         uncached_rows = [row for _, row in uncached_df.iterrows()]
@@ -896,7 +1031,7 @@ def resolve_and_download(
             TimeRemainingColumn(),
         ) as progress:
             task_id = progress.add_task(
-                "Resolving + downloading", total=len(uncached_rows)
+                "Resolving & downloading new scenes", total=len(uncached_rows)
             )
 
             with ThreadPoolExecutor(max_workers=parallel_scenes) as pool:
@@ -918,67 +1053,47 @@ def resolve_and_download(
                     except Exception as exc:
                         logger.error(f"Scene {name} failed: {exc}")
                         all_results.append(
-                            DownloadResult(scene_name=name, failed=["SCENE_ERROR"])
+                            DownloadResult(scene_name=str(name), failed=["SCENE_ERROR"])
                         )
 
-                    # these run per-future, inside the loop
-                    with lock:
-                        if len(new_target_rows) >= 1000:
-                            new_df = pd.DataFrame(new_target_rows)
-                            if targets_file.exists():
-                                existing = pd.read_parquet(targets_file)
-                                combined = pd.concat(
-                                    [existing, new_df], ignore_index=True
-                                )
-                            else:
-                                combined = new_df
-                            write_protected_parquet(combined, targets_file)
-                            new_target_rows.clear()
-                            logger.info(f"Flushed {len(new_df)} targets to cache")
-
+                    _flush_images(force=False)
                     progress.advance(task_id)
 
                 if fatal_error:
                     raise fatal_error
 
-    # final flush for any remaining targets that didn't hit the 1000 threshold
-    with lock:
-        if new_target_rows:
-            new_df = pd.DataFrame(new_target_rows)
-            if targets_file.exists():
-                existing = pd.read_parquet(targets_file)
-                combined = pd.concat([existing, new_df], ignore_index=True)
-            else:
-                combined = new_df
-            write_protected_parquet(combined, targets_file)
-            logger.info(f"Flushed final {len(new_df)} targets to cache")
-            new_target_rows.clear()
+    # final flush for any remaining images from the uncached pass
+    _flush_images(force=True)
 
-    # Cached scenes: download only -----------------------------------------------------
-    if not cached_targets.empty and not cached_df.empty:
+    # Cached scenes: verify + download only --------------------------------------------
+    if not cached_images.empty and not cached_df.empty:
         cached_names = set(cached_df["Name"])
         grouped = [
             (name, group.to_dict("records"))
-            for name, group in cached_targets.groupby("Name")
+            for name, group in cached_images.groupby("safedir")
             if name in cached_names
         ]
 
         if grouped:
 
-            def _dl_cached(name_targets: tuple[str, list[dict]]) -> DownloadResult:
+            def _dl_cached(name_images: tuple[str, list[dict]]) -> DownloadResult:
                 if cancel.is_set():
-                    return DownloadResult(scene_name=name_targets[0])
-                name, targets = name_targets
+                    return DownloadResult(scene_name=name_images[0])
+                name, images = name_images
                 s3_path = s3_paths.get(name, "").removeprefix("/eodata")
-                return _download_scene_from_targets(
+                result = _download_scene_from_images(
                     scene_name=name,
                     s3_path=s3_path,
-                    targets=targets,
+                    images=images,
                     output_dir=output_dir,
                     config_file=config_file,
                     parallel_bands=parallel_bands,
                     logger=logger,
                 )
+                if result.updated_images:
+                    with lock:
+                        pending_image_rows.extend(result.updated_images)
+                return result
 
             with Progress(
                 SpinnerColumn(),
@@ -989,11 +1104,14 @@ def resolve_and_download(
                 TimeRemainingColumn(),
             ) as progress:
                 task_id = progress.add_task(
-                    "Downloading cached scenes", total=len(grouped)
+                    "Verifying previously resolved scenes", total=len(grouped)
                 )
 
                 with ThreadPoolExecutor(max_workers=parallel_scenes) as pool:
-                    futures = {pool.submit(_dl_cached, ng): ng[0] for ng in grouped}
+                    futures = {
+                        pool.submit(_dl_cached, (str(ng[0]), ng[1])): str(ng[0])
+                        for ng in grouped
+                    }
                     fatal_error = None
                     for future in as_completed(futures):
                         name = futures[future]
@@ -1009,12 +1127,18 @@ def resolve_and_download(
                         except Exception as exc:
                             logger.error(f"Scene {name} failed: {exc}")
                             all_results.append(
-                                DownloadResult(scene_name=name, failed=["SCENE_ERROR"])
+                                DownloadResult(
+                                    scene_name=str(name), failed=["SCENE_ERROR"]
+                                )
                             )
+                        _flush_images(force=False)
                         progress.advance(task_id)
 
                     if fatal_error:
                         raise fatal_error
+
+            # flush any remaining updates from the cached-scenes pass
+            _flush_images(force=True)
 
     # Summary --------------------------------------------------------------------------
     total_ok = sum(len(r.succeeded) for r in all_results)

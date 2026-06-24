@@ -15,7 +15,7 @@ sentinel-py csv2geojson \
   --lat latitude \
   --output /mnt/poseidon/remotesensing/6ru/sentinel-py/data/aois/pavc_lt25gps_mostrecent_outlier-removed.geojson \
 
-sentinel-py query \
+sentinel-py cdse query \
   --aoi $AOI \
   --cache-dir /mnt/poseidon/remotesensing/6ru/sentinel-py/examples/cache \
   --crs EPSG:4326 \
@@ -24,10 +24,9 @@ sentinel-py query \
   --eperiod 08-31 \
   --collection SENTINEL-2 \
   --product S2MSI2A \
-  --ops-mode INS-NOBS \
   --log $LOGPATH/s2_pavc_query
 
-sentinel-py download \
+sentinel-py cdse download \
   --mission S2 \
   --bands "B02 B03 B04 B05 B06 B07 B08 B8A B11 B12 SCL" \
   --outdir /mnt/poseidon/remotesensing/6ru/sentinel-py/data/s2/raw \

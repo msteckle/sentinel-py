@@ -418,9 +418,9 @@ def overlay_latlon_grid(
         {
             "row": j,
             "col": i,
-            "minx": x,
-            "miny": y,
-            "geometry": box(x, y, x + dx, y + dy),
+            "minx": float(x),
+            "miny": float(y),
+            "geometry": box(float(x), float(y), float(x + dx), float(y + dy)),
         }
         for (j, y), (i, x) in itertools.product(enumerate(ys), enumerate(xs))
     ]

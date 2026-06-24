@@ -1,6 +1,7 @@
 import datetime as dt
 import logging
 from pathlib import Path
+from typing import Optional
 
 from rich.logging import RichHandler
 
@@ -9,7 +10,7 @@ DEFAULT_LOG_DIR = Path.home() / ".sentinel-py" / "logs"
 
 def get_logger(
     name: str = __name__,
-    logpath: Path = None,
+    logpath: Optional[Path] = None,
     verbose: bool = False,
 ) -> logging.Logger:
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")

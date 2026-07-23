@@ -532,8 +532,12 @@ def _find_s2_scene_images(
         try:
             output = run_s5cmd_with_config(cmd, config_file=config_file)
         except FileNotFoundError as e:
+            if not Path(config_file).is_file():
+                raise RuntimeError(
+                    f"s5cmd configuration file not found: {config_file}"
+                ) from e
             raise RuntimeError(
-                f"s5cmd not found: ensure s5cmd is installed and in PATH: {e}"
+                "s5cmd executable not found: ensure s5cmd is installed and in PATH"
             ) from e
         except Exception:
             logger.warning(
@@ -589,8 +593,12 @@ def _find_s1_scene_images(
         try:
             output = run_s5cmd_with_config(cmd, config_file=config_file)
         except FileNotFoundError as e:
+            if not Path(config_file).is_file():
+                raise RuntimeError(
+                    f"s5cmd configuration file not found: {config_file}"
+                ) from e
             raise RuntimeError(
-                f"s5cmd not found: ensure s5cmd is installed and in PATH: {e}"
+                "s5cmd executable not found: ensure s5cmd is installed and in PATH"
             ) from e
         except Exception:
             logger.warning(

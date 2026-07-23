@@ -1,11 +1,67 @@
+import configparser
 from pathlib import Path
 from typing import Annotated, Optional
 
 import typer
 
+from sentinel_py.cache import DEFAULT_CDSE_CACHE_DIR
 from sentinel_py.log import DEFAULT_LOG_DIR, get_logger
 
 app = typer.Typer()
+
+CDSE_S3_CREDENTIALS_URL = (
+    "https://eodata-s3keysmanager.dataspace.copernicus.eu/panel/s3-credentials"
+)
+S5_CONFIG_EXAMPLE = """[default]
+aws_access_key_id = <YOUR_CDSE_S3_ACCESS_KEY>
+aws_secret_access_key = <YOUR_CDSE_S3_SECRET_KEY>
+aws_region = default
+host_base = eodata.dataspace.copernicus.eu
+use_https = true"""
+REQUIRED_S5_CONFIG_KEYS = (
+    "aws_access_key_id",
+    "aws_secret_access_key",
+    "host_base",
+)
+
+
+def _s5_config_error(config: Path, reason: str) -> typer.BadParameter:
+    return typer.BadParameter(
+        f"Invalid CDSE S3 configuration: {reason}\n\n"
+        "CDSE catalogue login credentials are not S3 credentials. Generate an "
+        f"S3 access key and secret key at:\n{CDSE_S3_CREDENTIALS_URL}\n\n"
+        f"Then create {config} with this shape:\n\n"
+        f"{S5_CONFIG_EXAMPLE}\n\n"
+        f"Protect the file with:\nchmod 600 {config}\n\n"
+        "Do not commit this file or share its contents."
+    )
+
+
+def _validate_s5_config(config: Path) -> None:
+    """Validate the s5cmd configuration before starting download workers."""
+    if not config.is_file():
+        raise _s5_config_error(config, f"file {config} was not found.")
+
+    parser = configparser.ConfigParser()
+    try:
+        with config.open() as config_stream:
+            parser.read_file(config_stream)
+    except (OSError, configparser.Error) as error:
+        raise _s5_config_error(config, f"could not read {config}: {error}") from error
+
+    if "default" not in parser:
+        raise _s5_config_error(config, "missing the [default] section.")
+
+    missing = [
+        key
+        for key in REQUIRED_S5_CONFIG_KEYS
+        if not parser["default"].get(key, "").strip()
+    ]
+    if missing:
+        raise _s5_config_error(
+            config,
+            "missing or empty required setting(s): " + ", ".join(missing) + ".",
+        )
 
 
 @app.command(
@@ -37,19 +93,22 @@ def download(
     config: Annotated[
         Path,
         typer.Option(
-            help=("Path to .s5cfg file with AWS credentials for S3 download access.")
+            help=(
+                "Path to an INI file containing CDSE S3 credentials. If the file is "
+                "missing or malformed, setup instructions are displayed."
+            )
         ),
     ],
     cache_dir: Annotated[
         Path,
         typer.Option(
             help=(
-                "Directory for caching target file information. Must exist and be "
-                "writable."
+                "Query and image cache root. Defaults to the hidden .cdse-cache "
+                "directory in the current working directory."
             ),
             file_okay=False,
         ),
-    ],
+    ] = DEFAULT_CDSE_CACHE_DIR,
     query: Annotated[
         Optional[Path],
         typer.Option(
@@ -81,6 +140,8 @@ def download(
         find_latest_scenes_cache,
         resolve_and_download,
     )
+
+    _validate_s5_config(config)
 
     # set up logging
     logger = get_logger(name="download_logger", logpath=log, verbose=verbose)

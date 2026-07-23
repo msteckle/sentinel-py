@@ -1,14 +1,12 @@
 import calendar
-import hashlib
-import json
 import logging
-import stat
+import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 import pandas as pd
 import phidown.search as _phidown_search
@@ -22,6 +20,16 @@ from rich.progress import (
     TextColumn,
     TimeElapsedColumn,
     TimeRemainingColumn,
+)
+
+from sentinel_py.cache import (
+    cache_directory,
+    deterministic_cache_key,
+    find_latest_cache_file,
+    mark_cache_used,
+    merge_state_rows,
+    write_json_atomic,
+    write_parquet_atomic,
 )
 
 # fix some phidown limitations
@@ -131,7 +139,7 @@ def query_cache_key(
         "ops_mode": ops_mode,
         "platform_serial_id": platform_serial_id,
     }
-    return hashlib.md5(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    return deterministic_cache_key(payload)
 
 
 def query_cache_dir(cache_root: Path, cache_key: str) -> Path:
@@ -139,9 +147,7 @@ def query_cache_dir(cache_root: Path, cache_key: str) -> Path:
     Get or create the cache directory for a query given a parent directory and cache
     key.
     """
-    d = cache_root / cache_key
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return cache_directory(cache_root, cache_key)
 
 
 def save_query_as_json(query_dir: Path, **kwargs) -> None:
@@ -150,46 +156,24 @@ def save_query_as_json(query_dir: Path, **kwargs) -> None:
     """
     info = {k: str(v) if isinstance(v, (Path, date)) else v for k, v in kwargs.items()}
     info["created"] = datetime.now().isoformat()
-    (query_dir / "query_info.json").write_text(
-        json.dumps(info, indent=2, default=str) + "\n"
-    )
+    write_json_atomic(query_dir / "query_info.json", info)
 
 
 def find_latest_scenes_cache(cache_root: Path) -> Optional[Path]:
     """
-    Find the most recently modified scenes.parquet across all query cache directories.
+    Find the most recently used scenes.parquet across all query cache directories.
     """
-    candidates = sorted(
-        cache_root.glob("*/scenes.parquet"),
-        key=lambda p: p.stat().st_mtime,
-    )
-    return candidates[-1] if candidates else None
+    return find_latest_cache_file(cache_root, "scenes.parquet")
 
 
 def write_protected_parquet(df: pd.DataFrame, path: Path) -> None:
     """Write a parquet file and set it as read-only to prevent accidental deletion."""
-    # temporarily make writable if it already exists as read-only
-    if path.exists():
-        path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
-    df.to_parquet(path)
-    path.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+    write_parquet_atomic(df, path, index=True, read_only=True)
 
 
 def _merge_image_rows(existing: pd.DataFrame, new_rows: list[dict]) -> pd.DataFrame:
     """Merge new/updated image row to the downloaded images cache."""
-    if not new_rows:
-        return existing
-    new_df = pd.DataFrame(new_rows)
-    if existing.empty:
-        return new_df
-    # align columns so concat + drop_duplicates behaves predictably
-    all_cols = list(dict.fromkeys([*existing.columns, *new_df.columns]))
-    existing = existing.reindex(columns=all_cols)
-    new_df = new_df.reindex(columns=all_cols)
-    combined = pd.concat([existing, new_df], ignore_index=True)
-    # keep="last" so new rows win over existing ones for the same key
-    combined = combined.drop_duplicates(subset=IMAGE_KEY_COLS, keep="last")
-    return combined.reset_index(drop=True)
+    return merge_state_rows(existing, new_rows, key_columns=IMAGE_KEY_COLS)
 
 
 ########################################################################################
@@ -275,6 +259,7 @@ def query_cdse(
     # if cached products exist, don't bother querying
     if scenes_cache.exists():
         logger.info(f"Loading cached products from {scenes_cache}")
+        mark_cache_used(scenes_cache)
         return pd.read_parquet(scenes_cache)
 
     # otherwise, proceed with querying
@@ -737,12 +722,9 @@ def _download_scene_from_images(
         cached_actual = t.get("local_actual_size")
         local_path = scene_root / rel_path
 
-        # if cache has local_actual_size that matches s3_expected_size, skip download
-        if expected and cached_actual is not None and cached_actual == expected:
-            result.skipped.append(label)
-            continue
-
-        # otherwise, if the file exists...
+        # The cache records what was observed after an earlier download, but it is not
+        # proof that the file still exists. Always check the current filesystem so a
+        # deleted scene or band is restored on the next run.
         if local_path.exists():
             local_size = local_path.stat().st_size
 
@@ -830,8 +812,8 @@ def resolve_and_download(
     Resolve + download pipeline.
 
     For each scene:
-      1. If already in images cache, skip band resolve, just verify/download
-         (trusting local_actual_size when it matches s3_expected_size).
+      1. If already in images cache, skip band resolve, then verify each local file
+         exists and matches s3_expected_size before skipping its download.
       2. Otherwise: resolve band via targeted S3 ls, download, & append to cache.
 
     Parameters
@@ -1102,9 +1084,12 @@ def resolve_and_download(
                 MofNCompleteColumn(),
                 TimeElapsedColumn(),
                 TimeRemainingColumn(),
+                TextColumn("[cyan]{task.fields[repair_status]}"),
             ) as progress:
                 task_id = progress.add_task(
-                    "Verifying previously resolved scenes", total=len(grouped)
+                    "Checking cached scenes & restoring files",
+                    total=len(grouped),
+                    repair_status="checking local files...",
                 )
 
                 with ThreadPoolExecutor(max_workers=parallel_scenes) as pool:

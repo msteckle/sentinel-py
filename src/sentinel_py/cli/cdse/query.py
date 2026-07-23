@@ -4,6 +4,7 @@ from typing import Annotated, Optional
 
 import typer
 
+from sentinel_py.cache import DEFAULT_CDSE_CACHE_DIR
 from sentinel_py.enums import (
     CDSECollections,
     CDSEOrbitDirs,
@@ -33,13 +34,6 @@ def query(
             dir_okay=False,
         ),
     ],
-    cache_dir: Annotated[
-        Path,
-        typer.Option(
-            help=("Directory for caching query results. Must exist and be writable. "),
-            file_okay=False,
-        ),
-    ],
     crs: Annotated[
         str,
         typer.Option(help="CRS of the input aoi file."),
@@ -47,20 +41,30 @@ def query(
     years: Annotated[
         str, typer.Option(help="Space- or comma-separated list of years.")
     ],
+    cache_dir: Annotated[
+        Path,
+        typer.Option(
+            help=(
+                "Query cache root. Defaults to the hidden .cdse-cache directory in "
+                "the current working directory."
+            ),
+            file_okay=False,
+        ),
+    ] = DEFAULT_CDSE_CACHE_DIR,
     speriod: Annotated[
         dt.datetime,
         typer.Option(
             help="Start month and day of seasonal query window.",
             formats=["%m-%d", "%m/%d", "%m %d", "%b-%d", "%b %d", "%B-%d", "%B %d"],
         ),
-    ] = dt.datetime.strptime("01-01", "%m-%d"),
+    ] = dt.datetime(2000, 1, 1),
     eperiod: Annotated[
         dt.datetime,
         typer.Option(
             help="End month and day of seasonal query window.",
             formats=["%m-%d", "%m/%d", "%m %d", "%b-%d", "%b %d", "%B-%d", "%B %d"],
         ),
-    ] = dt.datetime.strptime("12-31", "%m-%d"),
+    ] = dt.datetime(2000, 12, 31),
     collection: Annotated[
         CDSECollections, typer.Option(help="Filter by CDSE Collection.")
     ] = CDSECollections.sentinel2,

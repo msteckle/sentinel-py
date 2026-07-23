@@ -686,6 +686,129 @@ class DownloadResult:
         return len(self.failed) == 0
 
 
+@dataclass(frozen=True)
+class StorageProjection:
+    """Current projected storage for the uncached scenes in a download."""
+
+    resolved_scenes: int
+    total_scenes: int
+    projected_footprint: int
+    projected_additional: int
+
+
+@dataclass
+class StorageEstimator:
+    """Thread-safe running storage estimate based on resolved scene sizes."""
+
+    total_scenes: int
+    resolved_scenes: int = 0
+    resolved_footprint: int = 0
+    resolved_additional: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def add_scene(self, footprint: int, additional: int) -> StorageProjection:
+        with self._lock:
+            self.resolved_scenes += 1
+            self.resolved_footprint += footprint
+            self.resolved_additional += additional
+            return self._projection_unlocked()
+
+    def projection(self) -> Optional[StorageProjection]:
+        with self._lock:
+            if self.resolved_scenes == 0:
+                return None
+            return self._projection_unlocked()
+
+    def _projection_unlocked(self) -> StorageProjection:
+        remaining = max(0, self.total_scenes - self.resolved_scenes)
+        average_footprint = self.resolved_footprint / self.resolved_scenes
+        average_additional = self.resolved_additional / self.resolved_scenes
+        return StorageProjection(
+            resolved_scenes=self.resolved_scenes,
+            total_scenes=self.total_scenes,
+            projected_footprint=round(
+                self.resolved_footprint + average_footprint * remaining
+            ),
+            projected_additional=round(
+                self.resolved_additional + average_additional * remaining
+            ),
+        )
+
+
+def _format_bytes(size: int) -> str:
+    """Format a byte count using compact IEC units."""
+    value = float(max(0, size))
+    units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} PiB"
+
+
+def _free_disk_bytes(path: Path) -> Optional[int]:
+    """Return free bytes for path, falling back to its nearest existing parent."""
+    target = path
+    while not target.exists() and target != target.parent:
+        target = target.parent
+    try:
+        return shutil.disk_usage(target).free
+    except OSError:
+        return None
+
+
+def _scene_storage_bytes(
+    scene_name: str,
+    images: list[dict],
+    output_dir: Path,
+) -> tuple[int, int]:
+    """Return final footprint and conservative additional bytes for one scene."""
+    footprint = 0
+    additional = 0
+    scene_root = output_dir / scene_name
+
+    for image in images:
+        expected = int(image.get("s3_expected_size") or 0)
+        if expected <= 0:
+            continue
+        footprint += expected
+
+        local_path = scene_root / image["img_path_in_safedir"]
+        try:
+            if local_path.is_file() and local_path.stat().st_size == expected:
+                continue
+        except OSError:
+            pass
+
+        # Count the full object for missing or invalid files. This is conservative
+        # when an invalid local file can be overwritten in place.
+        additional += expected
+
+    return footprint, additional
+
+
+def _storage_progress_text(
+    projection: StorageProjection,
+    free_bytes: Optional[int],
+) -> str:
+    """Build the compact storage estimate shown alongside download progress."""
+    sample_target = min(10, projection.total_scenes)
+    qualifier = (
+        f"early sample {projection.resolved_scenes}/{sample_target}"
+        if projection.resolved_scenes < sample_target
+        else "estimate"
+    )
+    text = (
+        f"{qualifier}: dataset ~{_format_bytes(projection.projected_footprint)} total, "
+        f"~{_format_bytes(projection.projected_additional)} additional"
+    )
+    if free_bytes is not None:
+        text += f"; {_format_bytes(free_bytes)} free at start"
+        if projection.projected_additional > free_bytes:
+            text = "⚠ " + text
+    return text
+
+
 def _download_scene_from_images(
     scene_name: str,
     s3_path: str,
@@ -694,15 +817,15 @@ def _download_scene_from_images(
     config_file: str,
     parallel_bands: int,
     logger: logging.Logger,
+    on_download_plan: Optional[Callable[[int], None]] = None,
+    on_download_result: Optional[Callable[[bool], None]] = None,
 ) -> DownloadResult:
     """
     Download pre-resolved images for a single scene, preserving SAFE structure.
 
-    For each image we compare s3_expected_size (from S3) against local_actual_size (on
-    disk). Rules:
+    For each image we compare s3_expected_size (from S3) against the current file on
+    disk. Rules:
 
-      * Cache already knows local_actual_size == s3_expected_size; trust it, skip
-        without stat-ing the file.
       * File on disk and its size matches s3_expected_size; skip. If the cache's
         local_actual_size is missing or stale, emit an updated row so it gets
         persisted.
@@ -769,6 +892,14 @@ def _download_scene_from_images(
         )
         return result
 
+    labels = [task[0] for task in download_tasks]
+    logger.info(
+        f"Scene {scene_name}: found {len(download_tasks)} missing or invalid "
+        f"image(s); downloading: {', '.join(labels)}"
+    )
+    if on_download_plan is not None:
+        on_download_plan(len(download_tasks))
+
     # otherwise, download in parallel
     def _dload(
         task: tuple[str, str, Path, dict],
@@ -796,6 +927,8 @@ def _download_scene_from_images(
             else:
                 result.failed.append(label)
                 logger.debug(f"  ERRED {scene_name} / {label}")
+            if on_download_result is not None:
+                on_download_result(ok)
 
     return result
 
@@ -925,8 +1058,11 @@ def resolve_and_download(
     # rows to append/overwrite in the images cache on next flush
     pending_image_rows: list[dict] = []
     lock = threading.Lock()
+    storage_display_lock = threading.Lock()
     cancel = threading.Event()
     s3_paths = dict(zip(scenes["Name"], scenes["S3Path"]))
+    storage_estimator = StorageEstimator(total_scenes=len(uncached_df))
+    initial_free_bytes = _free_disk_bytes(output_dir)
 
     def _flush_images(force: bool = False) -> None:
         """Merge pending rows into the on-disk images cache."""
@@ -984,6 +1120,20 @@ def resolve_and_download(
             logger.error(f"Unsupported mission: {mission}")
             return DownloadResult(scene_name=name)
 
+        footprint, additional = _scene_storage_bytes(name, images, output_dir)
+        storage_estimator.add_scene(footprint, additional)
+        # Keep concurrent workers from replacing a newer estimate with an older one.
+        with storage_display_lock:
+            projection = storage_estimator.projection()
+            if projection is not None:
+                progress.update(
+                    task_id,
+                    storage=_storage_progress_text(
+                        projection,
+                        initial_free_bytes,
+                    ),
+                )
+
         if not images:
             logger.error(f"No images found for scene: {name}")
             return DownloadResult(scene_name=name)
@@ -1019,9 +1169,12 @@ def resolve_and_download(
             MofNCompleteColumn(),
             TimeElapsedColumn(),
             TimeRemainingColumn(),
+            TextColumn("[cyan]{task.fields[storage]}"),
         ) as progress:
             task_id = progress.add_task(
-                "Resolving & downloading new scenes", total=len(uncached_rows)
+                "Resolving & downloading new scenes",
+                total=len(uncached_rows),
+                storage="estimating storage...",
             )
 
             with ThreadPoolExecutor(max_workers=parallel_scenes) as pool:
@@ -1055,6 +1208,23 @@ def resolve_and_download(
     # final flush for any remaining images from the uncached pass
     _flush_images(force=True)
 
+    new_scene_storage = storage_estimator.projection()
+    if new_scene_storage is not None:
+        storage_message = (
+            "New-scene storage estimate: "
+            f"dataset ~{_format_bytes(new_scene_storage.projected_footprint)} total; "
+            f"~{_format_bytes(new_scene_storage.projected_additional)} additional "
+            f"disk space (based on {new_scene_storage.resolved_scenes}/"
+            f"{new_scene_storage.total_scenes} resolved scenes)"
+        )
+        if initial_free_bytes is not None:
+            storage_message += (
+                f"; {_format_bytes(initial_free_bytes)} free at start"
+            )
+            if new_scene_storage.projected_additional > initial_free_bytes:
+                storage_message += " — estimated requirement exceeds available space"
+        logger.info(storage_message)
+
     # Cached scenes: verify + download only --------------------------------------------
     if not cached_images.empty and not cached_df.empty:
         cached_names = set(cached_df["Name"])
@@ -1065,6 +1235,27 @@ def resolve_and_download(
         ]
 
         if grouped:
+            repair_counts = {"found": 0, "restored": 0, "failed": 0}
+            repair_progress_lock = threading.Lock()
+
+            def _repair_status() -> str:
+                if repair_counts["found"] == 0:
+                    return "checking local files..."
+                return (
+                    f"missing/invalid {repair_counts['found']} · "
+                    f"restored {repair_counts['restored']} · "
+                    f"failed {repair_counts['failed']}"
+                )
+
+            def _record_download_plan(count: int) -> None:
+                with repair_progress_lock:
+                    repair_counts["found"] += count
+                    progress.update(task_id, repair_status=_repair_status())
+
+            def _record_download_result(ok: bool) -> None:
+                with repair_progress_lock:
+                    repair_counts["restored" if ok else "failed"] += 1
+                    progress.update(task_id, repair_status=_repair_status())
 
             def _dl_cached(name_images: tuple[str, list[dict]]) -> DownloadResult:
                 if cancel.is_set():
@@ -1079,6 +1270,8 @@ def resolve_and_download(
                     config_file=config_file,
                     parallel_bands=parallel_bands,
                     logger=logger,
+                    on_download_plan=_record_download_plan,
+                    on_download_result=_record_download_result,
                 )
                 if result.updated_images:
                     with lock:

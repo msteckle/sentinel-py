@@ -68,3 +68,34 @@ def test_validate_s5_config_accepts_required_shape(tmp_path: Path):
     )
 
     _validate_s5_config(config)
+
+
+def test_cdse_download_rejects_non_sentinel2_mission(tmp_path: Path):
+    config = tmp_path / ".s5cfg"
+    config.write_text(
+        "[default]\n"
+        "aws_access_key_id = test-access-key\n"
+        "aws_secret_access_key = test-secret-key\n"
+        "host_base = eodata.dataspace.copernicus.eu\n"
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "cdse",
+            "download",
+            "--mission",
+            "S1",
+            "--bands",
+            "VV",
+            "--outdir",
+            str(tmp_path),
+            "--res",
+            "10",
+            "--config",
+            str(config),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "currently supports only Sentinel-2" in result.stderr

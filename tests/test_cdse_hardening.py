@@ -92,6 +92,51 @@ def test_successful_empty_query_is_cached(tmp_path: Path, monkeypatch):
     assert pd.read_parquet(cache_path).columns.tolist() == cdse.SCENE_CACHE_COLUMNS
 
 
+def test_s2_standard_metadata_filters_are_sent_as_odata_attributes(
+    tmp_path: Path,
+    monkeypatch,
+):
+    aoi = tmp_path / "aoi.geojson"
+    _write_aoi(aoi)
+    calls = []
+
+    class CapturingSearcher:
+        def query_by_filter(self, **kwargs):
+            calls.append(kwargs)
+
+        def execute_query(self):
+            return pd.DataFrame()
+
+    monkeypatch.setattr(cdse, "CopernicusDataSearcher", CapturingSearcher)
+
+    cdse.query_cdse(
+        collection="SENTINEL-2",
+        product="S2MSI2A",
+        years=[2024],
+        speriod=date(2000, 6, 1),
+        eperiod=date(2000, 6, 30),
+        aoi=aoi,
+        crs="EPSG:4326",
+        cache_dir=tmp_path / "cache",
+        attrs={"tileId": "06WVT"},
+        rel_orbit_num=12,
+        ops_mode="INS-NOBS",
+        platform_serial_id="C",
+        count=True,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["attributes"] == {
+        "tileId": "06WVT",
+        "relativeOrbitNumber": 12,
+        "operationalMode": "INS-NOBS",
+        "platformSerialIdentifier": "C",
+    }
+    assert calls[0]["relative_orbit_number"] is None
+    assert calls[0]["operational_mode"] is None
+    assert calls[0]["platform_serial_identifier"] is None
+
+
 def test_failed_query_batch_is_not_cached_as_complete(tmp_path: Path, monkeypatch):
     aoi = tmp_path / "aoi.geojson"
     cache_dir = tmp_path / "cache"
@@ -132,24 +177,15 @@ def test_s2_discovery_lists_each_resolution_once_and_includes_metadata(monkeypat
         if "R20m/*.jp2" in command:
             return "\n".join(
                 [
-                    "2024/01/01 00:00:00 4 "
-                    "L2A_G1/IMG_DATA/R20m/G1_B04_20m.jp2",
-                    "2024/01/01 00:00:00 5 "
-                    "L2A_G1/IMG_DATA/R20m/G1_B05_20m.jp2",
-                    "2024/01/01 00:00:00 6 "
-                    "L2A_G2/IMG_DATA/R20m/G2_B04_20m.jp2",
+                    "2024/01/01 00:00:00 4 L2A_G1/IMG_DATA/R20m/G1_B04_20m.jp2",
+                    "2024/01/01 00:00:00 5 L2A_G1/IMG_DATA/R20m/G1_B05_20m.jp2",
+                    "2024/01/01 00:00:00 6 L2A_G2/IMG_DATA/R20m/G2_B04_20m.jp2",
                 ]
             )
         if "MTD_MSIL2A.xml" in command:
-            return (
-                "2024/01/01 00:00:00 7 "
-                f"s3://eodata{scene_path}/MTD_MSIL2A.xml"
-            )
+            return f"2024/01/01 00:00:00 7 s3://eodata{scene_path}/MTD_MSIL2A.xml"
         if "MTD_TL.xml" in command:
-            return (
-                "2024/01/01 00:00:00 8 "
-                "L2A_G1/MTD_TL.xml"
-            )
+            return "2024/01/01 00:00:00 8 L2A_G1/MTD_TL.xml"
         return ""
 
     monkeypatch.setattr(cdse, "run_s5cmd_with_config", fake_s5cmd)
@@ -174,13 +210,9 @@ def test_s2_discovery_lists_each_resolution_once_and_includes_metadata(monkeypat
         "MTD_MSIL2A",
         "MTD_TL",
     }
-    assert all(
-        not asset["img_path_in_safedir"].startswith("s3://") for asset in assets
-    )
+    assert all(not asset["img_path_in_safedir"].startswith("s3://") for asset in assets)
     assert {
-        asset["img_path_in_safedir"]
-        for asset in assets
-        if asset["band_name"] == "B04"
+        asset["img_path_in_safedir"] for asset in assets if asset["band_name"] == "B04"
     } == {
         "GRANULE/L2A_G1/IMG_DATA/R20m/G1_B04_20m.jp2",
         "GRANULE/L2A_G2/IMG_DATA/R20m/G2_B04_20m.jp2",
@@ -242,7 +274,10 @@ def test_interrupted_s5cmd_is_not_retried(tmp_path: Path, monkeypatch):
     assert not destination.with_name(".asset.jp2.part").exists()
 
 
-def test_download_state_is_scoped_to_output_directory(tmp_path: Path, monkeypatch):
+def test_download_state_is_scoped_to_output_directory(
+    tmp_path: Path, monkeypatch, capsys
+):
+    monkeypatch.setenv("COLUMNS", "200")
     cache_root = tmp_path / "cache"
     query_dir = cache_root / "query"
     query_dir.mkdir(parents=True)
@@ -315,6 +350,8 @@ def test_download_state_is_scoped_to_output_directory(tmp_path: Path, monkeypatc
     state = pd.read_parquet(state_file)
     assert len(state) == 3
     assert set(state["download_status"]) == {"complete"}
+    progress_output = capsys.readouterr().out
+    assert "downloaded 3 · skipped 0 · failed 0 · cache updated 3" in progress_output
 
 
 def test_download_cli_exits_nonzero_for_required_asset_failure(
@@ -324,7 +361,12 @@ def test_download_cli_exits_nonzero_for_required_asset_failure(
     config = tmp_path / ".s5cfg"
     query = tmp_path / "scenes.parquet"
     _write_s5_config(config)
-    query.write_bytes(b"unused")
+    pd.DataFrame(
+        {
+            "Name": ["S2A_TEST.SAFE"],
+            "S3Path": ["/eodata/test"],
+        }
+    ).to_parquet(query, index=False)
 
     monkeypatch.setattr(
         cdse,

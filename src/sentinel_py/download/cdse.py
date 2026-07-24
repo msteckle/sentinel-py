@@ -1,7 +1,10 @@
 import calendar
 import logging
+import os
+import re
 import shutil
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -35,6 +38,11 @@ from sentinel_py.cache import (
 # fix some phidown limitations
 _phidown_search.REQUEST_TIMEOUT_SECONDS = 120
 
+########################################################################################
+# Constants
+########################################################################################
+
+# Available S2 bands and their known resolutions (m)
 S2_BAND_RESOLUTIONS: dict[str, list[int]] = {
     "B01": [60],
     "B02": [10, 20, 60],
@@ -54,14 +62,22 @@ S2_BAND_RESOLUTIONS: dict[str, list[int]] = {
     "WVP": [10, 20, 60],
 }
 
-# Canonical ordering finest -> coarsest
+# Ordering for when a band isn't available at the requested res
 RESOLUTIONS = [10, 20, 60]
-
-# Bands that allow coarser fallback (SCL is the main one)
+# SCL is the only band for which a coarser fallback is acceptable
 COARSER_FALLBACK_BANDS = {"SCL"}
 
-# Columns used as the unique key for an image row in all_downloaded_images.parquet
-IMAGE_KEY_COLS = ["safedir", "band_name", "resolution_m"]
+# Columns used to uniquely identify an image in the downloaded images cache
+IMAGE_KEY_COLS = ["safedir", "img_path_in_safedir"]
+SCENE_CACHE_COLUMNS = [
+    "Id",
+    "Name",
+    "S3Path",
+    "ContentDate",
+    "GeoFootprint",
+    "query_id",
+]
+S2_METADATA_ASSETS = {"MTD_MSIL2A", "MTD_MSIL1C", "MTD_TL"}
 
 ########################################################################################
 # Variable helpers
@@ -70,14 +86,15 @@ IMAGE_KEY_COLS = ["safedir", "band_name", "resolution_m"]
 
 def _fix_date(year: int, month: int, day: int, logger: logging.Logger) -> date:
     """
-    Build datetime from year, month, day, and adjust if the day is invalid for the month
+    Users might provide an invalid date (e.g. Feb 30 or Feb 29 on a non-leap year). So,
+    build datetime from year, month, day, and adjust if the day is invalid for the month
     (e.g. Feb 30 -> Feb 28 or 29) and year (e.g. Feb 29 on non-leap year -> Feb 28).
     """
 
-    # try to build YYYY-MM-DD date
+    # Try to build YYYY-MM-DD date
     try:
         return date(year, month, day)
-    # if date invalid, adjust day down to last valid day of month and log a warning
+    # If date invalid, adjust day down to last valid day of month and log a warning
     except ValueError as e:
         logger.warning(
             f"Invalid date {year}-{month:02d}-{day:02d}: {e}. "
@@ -98,14 +115,12 @@ Sentinel-py caches:
     that the user specified (AOI, date windows, collection/product, etc); this way, if
     you want to re-run a query with the same parameters, you get the cached results 
     immediately without hitting the CDSE API again.
-- Download results
-    - The downloaded images (jp2 files) for all queries are cached into a single parquet
-    file with information about the .SAFE directory name, full S3 path, relative S3 
-    path, band, resolution, expected size (from S3), and actual size (from disk after 
-    download). This allows the download step to verify if the expected images already 
-    exist on disk and are valid (actual size matches expected), and if so, skip the 
-    download while still recording the actual size (if it doesn't already exist) in the 
-    cache for future runs.
+- Remote asset discovery
+    - Resolved S3 objects are shared across queries in all_downloaded_images.parquet.
+- Local download state
+    - Each output root records verified local files in
+      <output>/.sentinel-py/cdse_downloads.parquet. Filesystem checks remain
+      authoritative so deleted or truncated assets are restored.
 """
 
 
@@ -121,6 +136,16 @@ def query_cache_key(
     rel_orbit_num: int | None = None,
     ops_mode: str | None = None,
     platform_serial_id: str | None = None,
+    attrs: Dict[str, str | int | float] | None = None,
+    burst_mode: bool = False,
+    abs_burst_id: int | None = None,
+    parent_product_name: str | None = None,
+    parent_product_type: str | None = None,
+    parent_product_id: str | None = None,
+    datatake_id: int | None = None,
+    pol_channels: str | None = None,
+    top: int = 1000,
+    count: bool = False,
 ) -> str:
     """
     Generate a hash key from query parameters. This hash key will be used as the name of
@@ -138,6 +163,16 @@ def query_cache_key(
         "rel_orbit_num": rel_orbit_num,
         "ops_mode": ops_mode,
         "platform_serial_id": platform_serial_id,
+        "attrs": attrs,
+        "burst_mode": burst_mode,
+        "abs_burst_id": abs_burst_id,
+        "parent_product_name": parent_product_name,
+        "parent_product_type": parent_product_type,
+        "parent_product_id": parent_product_id,
+        "datatake_id": datatake_id,
+        "pol_channels": pol_channels,
+        "top": top,
+        "count": count,
     }
     return deterministic_cache_key(payload)
 
@@ -224,13 +259,13 @@ def query_cdse(
     # Clean up and validate parameters, and prepare query windows
     # ----------------------------------------------------------------------------------
 
-    # define logger if none provided
+    # Define logger if none provided
     logger = logger or logging.getLogger(__name__)
 
-    # ensure AOI is geometry object
+    # Ensure AOI is geometry object
     aoi_geom = aoi_as_geom(aoi, crs)
 
-    # validate and build date windows for each year, adjusting invalid dates as needed
+    # Validate and build date windows for each year, adjusting invalid dates as needed
     years = list(years)
     if not years:
         raise ValueError("Years must contain at least one year")
@@ -249,21 +284,43 @@ def query_cdse(
         for s, e in date_windows
     ]
 
-    # generate scene cache key based on the query parameters
+    # Generate scene cache key based on the query parameters
     cache_key = query_cache_key(
-        aoi_geom.union_all().wkt, collection, product, iso_windows
+        aoi_geom.union_all().wkt,
+        collection,
+        product,
+        iso_windows,
+        orbit=orbit,
+        cloud_thresh=cloud_thresh,
+        burst_id=burst_id,
+        swath_id=swath_id,
+        rel_orbit_num=rel_orbit_num,
+        ops_mode=ops_mode,
+        platform_serial_id=platform_serial_id,
+        attrs=attrs,
+        burst_mode=burst_mode,
+        abs_burst_id=abs_burst_id,
+        parent_product_name=parent_product_name,
+        parent_product_type=parent_product_type,
+        parent_product_id=parent_product_id,
+        datatake_id=datatake_id,
+        pol_channels=pol_channels,
+        top=top,
+        count=count,
     )
     query_dir = query_cache_dir(cache_dir, cache_key)
     scenes_cache = query_dir / "scenes.parquet"
 
-    # if cached products exist, don't bother querying
+    # If cached products exist, don't bother querying
     if scenes_cache.exists():
         logger.info(f"Loading cached products from {scenes_cache}")
         mark_cache_used(scenes_cache)
-        return pd.read_parquet(scenes_cache)
+        cached = pd.read_parquet(scenes_cache)
+        cached.attrs["cache_path"] = str(scenes_cache)
+        return cached
 
-    # otherwise, proceed with querying
-    # if AOI is too large/complex, the CDSE API may reject it. To mitigate this, we
+    # Otherwise, proceed with querying
+    # If AOI is too large/complex, the CDSE API may reject it. To mitigate this, we
     # split the AOI into batches of geometries and query each batch separately,
     # then combine the results.
     aoi_batches = batch_geometries(aoi_geom)
@@ -272,40 +329,58 @@ def query_cdse(
     def _run_query(
         start_iso: str, end_iso: str, batch_idx: int, batch_geom
     ) -> pd.DataFrame:
-        searcher = CopernicusDataSearcher()
-        searcher.query_by_filter(
-            collection_name=collection,
-            product_type=product,
-            orbit_direction=orbit,
-            cloud_cover_threshold=cloud_thresh,
-            attributes=attrs,
-            aoi_wkt=batch_geom.wkt,
-            start_date=start_iso,
-            end_date=end_iso,
-            burst_mode=burst_mode,
-            burst_id=burst_id,
-            absolute_burst_id=abs_burst_id,
-            swath_identifier=swath_id,
-            parent_product_name=parent_product_name,
-            parent_product_type=parent_product_type,
-            parent_product_id=parent_product_id,
-            datatake_id=datatake_id,
-            relative_orbit_number=rel_orbit_num,
-            operational_mode=ops_mode,
-            polarisation_channels=pol_channels,
-            platform_serial_identifier=platform_serial_id,
-            top=top,
-            count=count,
-        )
-        df = searcher.execute_query()
-        num_rows = len(df) if df is not None else 0
-        logger.info(
-            f"Window {start_iso} -> {end_iso}, batch {batch_idx + 1}/"
-            f"{len(aoi_batches)}: {num_rows} scene(s)"
-        )
-        return df if df is not None else pd.DataFrame()
+        # Run a query with max 3 retries
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            try:
+                searcher = CopernicusDataSearcher()
+                searcher.query_by_filter(
+                    collection_name=collection,
+                    product_type=product,
+                    orbit_direction=orbit,
+                    cloud_cover_threshold=cloud_thresh,
+                    attributes=attrs,
+                    aoi_wkt=batch_geom.wkt,
+                    start_date=start_iso,
+                    end_date=end_iso,
+                    burst_mode=burst_mode,
+                    burst_id=burst_id,
+                    absolute_burst_id=abs_burst_id,
+                    swath_identifier=swath_id,
+                    parent_product_name=parent_product_name,
+                    parent_product_type=parent_product_type,
+                    parent_product_id=parent_product_id,
+                    datatake_id=datatake_id,
+                    relative_orbit_number=rel_orbit_num,
+                    operational_mode=ops_mode,
+                    polarisation_channels=pol_channels,
+                    platform_serial_identifier=platform_serial_id,
+                    top=top,
+                    count=count,
+                )
+                df = searcher.execute_query()
+                num_rows = len(df) if df is not None else 0
+                logger.info(
+                    f"Window {start_iso} -> {end_iso}, batch {batch_idx + 1}/"
+                    f"{len(aoi_batches)}: {num_rows} scene(s)"
+                )
+                return df if df is not None else pd.DataFrame()
+            # If the query fails, retry with exponential backoff
+            except Exception:
+                if attempt == attempts:
+                    raise
+                delay = 2 ** (attempt - 1)
+                logger.warning(
+                    f"Query attempt {attempt}/{attempts} failed for window "
+                    f"{start_iso} -> {end_iso}, batch {batch_idx + 1}; "
+                    f"retrying in {delay}s",
+                    exc_info=True,
+                )
+                time.sleep(delay)
+        # If we reach here, all attempts failed
+        raise AssertionError("unreachable")
 
-    # build all (window × batch) tasks
+    # Build all (window × batch) tasks
     tasks = [
         (start_iso, end_iso, i, batch_geom)
         for start_iso, end_iso in iso_windows
@@ -313,9 +388,10 @@ def query_cdse(
     ]
 
     all_rows: list[pd.DataFrame] = []
+    failed_tasks: list[tuple[str, str, int, Exception]] = []
     max_workers = min(len(tasks), 8)
 
-    # run queries in parallel with a progress bar, and collect results
+    # Run queries in parallel with a progress bar, and collect results
     with Progress(
         SpinnerColumn(),
         TextColumn("[bold blue]{task.description}"),
@@ -334,28 +410,41 @@ def query_cdse(
                         all_rows.append(df)
                 except Exception as e:
                     task = futures[future]
+                    failed_tasks.append((task[0], task[1], task[2], e))
                     logger.error(
                         f"Query failed for window {task[0]} -> {task[1]}, "
                         f"batch {task[2] + 1}: {e}"
                     )
                 progress.advance(task_id)
 
-    # if no scenes found across all windows and batches, return empty scenes dataframe
-    if not all_rows:
-        logger.warning("No scenes found for given AOI and date windows.")
-        return pd.DataFrame()
+    # If any tasks failed, raise an error with details of the first 5 failures
+    if failed_tasks:
+        details = "; ".join(
+            f"{start} -> {end}, batch {batch_idx + 1}: {error}"
+            for start, end, batch_idx, error in failed_tasks[:5]
+        )
+        raise RuntimeError(
+            f"CDSE query incomplete: {len(failed_tasks)} of {len(tasks)} "
+            f"window/AOI batch task(s) failed after retries. {details}"
+        )
 
-    # otherwise, combine results, drop duplicates, and cache to scenes.parquet
-    scenes = pd.concat(all_rows, ignore_index=True).drop_duplicates(subset="Id")
-    scenes = scenes[["Id", "Name", "S3Path", "ContentDate", "GeoFootprint"]]
+    # If we have results, merge them into a single DataFrame and cache it
+    if all_rows:
+        scenes = pd.concat(all_rows, ignore_index=True).drop_duplicates(subset="Id")
+        scenes = scenes[["Id", "Name", "S3Path", "ContentDate", "GeoFootprint"]]
+        scenes["query_id"] = cache_key
+    # Otherwise, log a warning and create an empty DataFrame with the expected columns
+    else:
+        logger.warning("No scenes found for given AOI and date windows.")
+        scenes = pd.DataFrame(columns=SCENE_CACHE_COLUMNS)
     logger.info(
         f"Found {len(scenes)} unique scenes across {len(iso_windows)} "
         f"window(s) and {len(aoi_batches)} batch(es)"
     )
 
-    # save scenes.parquet and query_info.json within query-specific cache directory
+    # Save scenes.parquet and query_info.json within query-specific cache directory
     try:
-        scenes.to_parquet(scenes_cache)
+        write_parquet_atomic(scenes, scenes_cache, index=False)
         save_query_as_json(
             query_dir,
             collection=collection,
@@ -365,12 +454,25 @@ def query_cdse(
             aoi=str(aoi),
             cloud_cover=cloud_thresh,
             orbit=orbit,
+            attributes=attrs,
+            burst_mode=burst_mode,
+            burst_id=burst_id,
+            absolute_burst_id=abs_burst_id,
+            swath_id=swath_id,
+            relative_orbit_number=rel_orbit_num,
+            operational_mode=ops_mode,
+            polarisation_channels=pol_channels,
+            platform_serial_identifier=platform_serial_id,
+            top=top,
+            count=count,
+            query_id=cache_key,
             num_scenes=len(scenes),
         )
         logger.info(f"Cached scenes to {scenes_cache}")
     except Exception as e:
-        logger.error(f"Failed to cache scenes to {scenes_cache}: {e}")
+        raise RuntimeError(f"Failed to cache scenes to {scenes_cache}: {e}") from e
 
+    scenes.attrs["cache_path"] = str(scenes_cache)
     return scenes
 
 
@@ -501,6 +603,48 @@ def _parse_s5cmd_ls_line(line: str) -> Optional[tuple[int, str]]:
     return None
 
 
+def _asset_path_relative_to_scene(listed_path: str, scene_s3_path: str) -> str:
+    """Normalize an s5cmd listing path to a path relative to its SAFE product."""
+    normalized_scene = scene_s3_path.removeprefix("/eodata").rstrip("/")
+    prefixes = (
+        f"s3://eodata{normalized_scene}/",
+        f"eodata{normalized_scene}/",
+        f"{normalized_scene.lstrip('/')}/",
+    )
+    for prefix in prefixes:
+        if listed_path.startswith(prefix):
+            return listed_path[len(prefix) :]
+
+    for marker in ("GRANULE/", "DATASTRIP/", "AUX_DATA/", "HTML/"):
+        marker_idx = listed_path.find(marker)
+        if marker_idx >= 0:
+            return listed_path[marker_idx:]
+
+    return Path(listed_path).name
+
+
+def _list_scene_assets(
+    pattern: str,
+    scene_s3_path: str,
+    config_file: str,
+) -> list[tuple[int, str]]:
+    """List matching S3 objects once and normalize their paths."""
+    output = run_s5cmd_with_config(
+        f'ls "{pattern}"',
+        config_file=config_file,
+    )
+    # Assets are items of (size, path relative to SAFE product) for each listed S3 obj
+    assets: list[tuple[int, str]] = []
+    for line in output.strip().splitlines():
+        # Parse the s5cmd `ls` output line to extract size and path
+        parsed = _parse_s5cmd_ls_line(line)
+        if parsed is None:
+            continue
+        size, listed_path = parsed
+        assets.append((size, _asset_path_relative_to_scene(listed_path, scene_s3_path)))
+    return assets
+
+
 def _find_s2_scene_images(
     scene_name: str,
     s3_path: str,
@@ -512,66 +656,131 @@ def _find_s2_scene_images(
     Find S2 images in a scene (.SAFE directory) by querying S3 directly given resolved
     bands.
     """
-    s3_path = s3_path.removeprefix("/eodata")
+    # Normalize the S3 path to remove the "/eodata" prefix and any trailing slashes
+    s3_path = s3_path.removeprefix("/eodata").rstrip("/")
     is_l1c = "MSIL1C" in scene_name.upper()
-    images = []
+    images: list[dict] = []
+    requested = {(rb.band, 0 if is_l1c else rb.resolution) for rb in resolved}
+    found: set[tuple[str, int]] = set()
 
-    # loop through each resolved band
-    for rb in resolved:
-        # get the S3 pattern to query based on whether it's L1C or L2A
+    # Helper function to append an asset to the images list
+    def _append_asset(
+        expected_size: int,
+        rel_path: str,
+        *,
+        band_name: str,
+        resolution_m: int,
+        asset_type: str,
+    ) -> None:
+        images.append(
+            {
+                "safedir": scene_name,
+                "s3_path": s3_path,
+                "band_name": band_name,
+                "resolution_m": resolution_m,
+                "img_path_in_safedir": rel_path,
+                "s3_expected_size": expected_size,
+                "local_actual_size": None,
+                "asset_type": asset_type,
+            }
+        )
+
+    try:
+        # Determine the S3 patterns to list based on whether the scene is L1C
         if is_l1c:
-            pattern = f"s3://eodata{s3_path}/GRANULE/*/IMG_DATA/*_{rb.band}.jp2"
+            patterns = [
+                f"s3://eodata{s3_path}/GRANULE/*/IMG_DATA/*.jp2",
+            ]
+        # Or if it's L2A, we need to list for each resolution
         else:
-            pattern = (
-                f"s3://eodata{s3_path}/GRANULE/*/IMG_DATA/"
-                f"R{rb.resolution}m/*_{rb.band}_{rb.resolution}m.jp2"
-            )
+            patterns = [
+                f"s3://eodata{s3_path}/GRANULE/*/IMG_DATA/R{resolution}m/*.jp2"
+                for resolution in sorted({rb.resolution for rb in resolved})
+            ]
 
-        # find images for a scene and band by querying S3 directly using `s5cmd ls`
-        cmd = f'ls "{pattern}"'
-        try:
-            output = run_s5cmd_with_config(cmd, config_file=config_file)
-        except FileNotFoundError as e:
-            if not Path(config_file).is_file():
-                raise RuntimeError(
-                    f"s5cmd configuration file not found: {config_file}"
-                ) from e
-            raise RuntimeError(
-                "s5cmd executable not found: ensure s5cmd is installed and in PATH"
-            ) from e
-        except Exception:
-            logger.warning(
-                f"  ERR {rb.band}@{rb.resolution}m: not found in {scene_name}",
-                exc_info=True,
-            )
-            continue
-
-        # parse the results of `s5cmd ls` and append information about the images
-        found = False
-        for line in output.strip().splitlines():
-            parsed = _parse_s5cmd_ls_line(line)
-            if parsed:
-                expected_size, rel_path = parsed
-                if not rel_path.startswith("GRANULE/"):
-                    rel_path = f"GRANULE/{rel_path}"
-                images.append(
-                    {
-                        "safedir": scene_name,
-                        "s3_path": s3_path,
-                        "band_name": rb.band,
-                        "resolution_m": rb.resolution if not is_l1c else 0,
-                        "img_path_in_safedir": rel_path,
-                        "s3_expected_size": expected_size,
-                        "local_actual_size": None,
-                    }
+        # List assets for each pattern
+        for pattern in patterns:
+            try:
+                listed_assets = _list_scene_assets(pattern, s3_path, config_file)
+            except FileNotFoundError:
+                raise
+            except Exception:
+                logger.warning(
+                    f"  ERR listing imagery with {pattern} for {scene_name}",
+                    exc_info=True,
                 )
-                found = True
-                break
+                continue
 
-        # if no images found for this band, log a warning
-        # (sometimes what CDSE says is available doesn't actually exist in S3)
-        if not found:
-            logger.warning(f"  ERR {rb.band}: not found in {scene_name}")
+            # Match listed assets to requested bands and resolutions
+            for expected_size, rel_path in listed_assets:
+                filename = Path(rel_path).name.upper()
+                if is_l1c:
+                    match = re.search(
+                        r"_(B(?:0[1-9]|1[0-2]|8A)|SCL|TCI|AOT|WVP)\.JP2$",
+                        filename,
+                    )
+                    key = (match.group(1), 0) if match else None
+                else:
+                    match = re.search(
+                        r"_(B(?:0[1-9]|1[0-2]|8A)|SCL|TCI|AOT|WVP)_"
+                        r"(10|20|60)M\.JP2$",
+                        filename,
+                    )
+                    key = (match.group(1), int(match.group(2))) if match else None
+                # Only append assets that match the requested bands and resolutions
+                if key is None or key not in requested:
+                    continue
+                _append_asset(
+                    expected_size,
+                    rel_path,
+                    band_name=key[0],
+                    resolution_m=key[1],
+                    asset_type="image",
+                )
+                found.add(key)
+
+        # Now handle metadata assets (MTD_MSIL1C or MTD_MSIL2A, and MTD_TL)
+        metadata_patterns = [
+            (
+                "MTD_MSIL1C" if is_l1c else "MTD_MSIL2A",
+                f"s3://eodata{s3_path}/"
+                f"{'MTD_MSIL1C.xml' if is_l1c else 'MTD_MSIL2A.xml'}",
+            ),
+            ("MTD_TL", f"s3://eodata{s3_path}/GRANULE/*/MTD_TL.xml"),
+        ]
+        for metadata_name, pattern in metadata_patterns:
+            # List metadata assets and append them to the images list
+            try:
+                metadata_assets = _list_scene_assets(pattern, s3_path, config_file)
+            except FileNotFoundError:
+                raise
+            except Exception:
+                logger.warning(
+                    f"  ERR {metadata_name}: not found in {scene_name}",
+                    exc_info=True,
+                )
+                continue
+            for expected_size, rel_path in metadata_assets:
+                _append_asset(
+                    expected_size,
+                    rel_path,
+                    band_name=metadata_name,
+                    resolution_m=0,
+                    asset_type="metadata",
+                )
+    except FileNotFoundError as e:
+        if not Path(config_file).is_file():
+            raise RuntimeError(
+                f"s5cmd configuration file not found: {config_file}"
+            ) from e
+        raise RuntimeError(
+            "s5cmd executable not found: ensure s5cmd is installed and in PATH"
+        ) from e
+
+    # Log warnings for any requested bands/resolutions that were not found in the scene
+    for band_name, resolution in sorted(requested - found):
+        label = band_name if is_l1c else f"{band_name}@{resolution}m"
+        logger.warning(f"  ERR {label}: not found in {scene_name}")
 
     return images
 
@@ -645,17 +854,49 @@ def download_s3_file(
     logger: logging.Logger,
     config_file: str = ".s5cfg",
     endpoint_url: str = "https://eodata.dataspace.copernicus.eu",
+    expected_size: int | None = None,
+    attempts: int = 3,
 ) -> bool:
-    """Download a single file from S3."""
+    """Download one object to a temporary sibling, verify it, and atomically publish."""
     local_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = local_path.with_name(f".{local_path.name}.part")
 
-    cmd = f'cp "{s3_uri}" "{local_path}"'
-    try:
-        run_s5cmd_with_config(cmd, config_file=config_file, endpoint_url=endpoint_url)
-        return True
-    except Exception as e:
-        logger.error(f"Download failed: {s3_uri} -> {local_path}: {e}")
-        return False
+    # Try downloading the file with retries and exponential backoff
+    for attempt in range(1, attempts + 1):
+        temporary.unlink(missing_ok=True)
+        cmd = f'cp "{s3_uri}" "{temporary}"'
+        try:
+            run_s5cmd_with_config(
+                cmd,
+                config_file=config_file,
+                endpoint_url=endpoint_url,
+            )
+            actual_size = temporary.stat().st_size
+            if expected_size and actual_size != expected_size:
+                raise RuntimeError(
+                    f"downloaded size {actual_size} does not match expected "
+                    f"size {expected_size}"
+                )
+            if actual_size <= 0:
+                raise RuntimeError("downloaded file is empty")
+            os.replace(temporary, local_path)
+            return True
+        # If the download fails, clean up and retry with exponential backoff
+        except Exception as e:
+            temporary.unlink(missing_ok=True)
+            if attempt == attempts:
+                logger.error(
+                    f"Download failed after {attempts} attempt(s): "
+                    f"{s3_uri} -> {local_path}: {e}"
+                )
+                return False
+            delay = 2 ** (attempt - 1)
+            logger.warning(
+                f"Download attempt {attempt}/{attempts} failed: {s3_uri} -> "
+                f"{local_path}: {e}; retrying in {delay}s"
+            )
+            time.sleep(delay)
+    return False
 
 
 # --------------------------------------------------------------------------------------
@@ -850,7 +1091,6 @@ def _download_scene_from_images(
         label = f"{band}@{res}m" if res else band
         rel_path = t["img_path_in_safedir"]
         expected = t.get("s3_expected_size", 0)
-        cached_actual = t.get("local_actual_size")
         local_path = scene_root / rel_path
 
         # The cache records what was observed after an earlier download, but it is not
@@ -859,33 +1099,45 @@ def _download_scene_from_images(
         if local_path.exists():
             local_size = local_path.stat().st_size
 
-            # if stat-ed file size matches s3_expected_size...
+            # If stat-ed file size matches s3_expected_size...
             if expected and local_size == expected:
-                # if the cached local_actual_size isn't populated or is stale, update it
-                if cached_actual != local_size:
-                    result.updated_images.append({**t, "local_actual_size": local_size})
+                # If the cached local_actual_size isn't populated or is stale, update it
+                result.updated_images.append(
+                    {
+                        **t,
+                        "local_actual_size": local_size,
+                        "local_path": str(local_path),
+                        "download_status": "complete",
+                    }
+                )
                 result.skipped.append(label)
                 continue
 
-            # if stat-ed file size doesn't match s3_expected_size, warn & re-download
+            # If stat-ed file size doesn't match s3_expected_size, warn & re-download
             if expected and local_size != expected:
                 logger.warning(
                     f"  SIZE MISMATCH {scene_name} / {label}: "
                     f"local={local_size} expected={expected} -- re-downloading"
                 )
-                # fall through to the download path below
-            # if S3 doesn't have an expected size, just trust what we have
+                # Fall through to the download path below
+            # If S3 doesn't have an expected size, just trust what we have
             elif not expected and local_size > 0:
-                if cached_actual != local_size:
-                    result.updated_images.append({**t, "local_actual_size": local_size})
+                result.updated_images.append(
+                    {
+                        **t,
+                        "local_actual_size": local_size,
+                        "local_path": str(local_path),
+                        "download_status": "complete",
+                    }
+                )
                 result.skipped.append(label)
                 continue
 
-        # build the s3_uri and add to download tasks
+        # Build the s3_uri and add to download tasks
         s3_uri = f"s3://eodata{s3_path}/{rel_path}"
         download_tasks.append((label, s3_uri, local_path, t))
 
-    # if there's nothing to download, we're done
+    # If there's nothing to download, we're done
     if not download_tasks:
         logger.info(
             f"All images for {scene_name} already exist and are valid, skipping."
@@ -900,29 +1152,45 @@ def _download_scene_from_images(
     if on_download_plan is not None:
         on_download_plan(len(download_tasks))
 
-    # otherwise, download in parallel
+    # Otherwise, download in parallel
     def _dload(
         task: tuple[str, str, Path, dict],
     ) -> tuple[str, bool, Path, dict]:
         label, uri, local, image = task
         logger.debug(f"  DWNLD {scene_name} / {label} starting...")
-        ok = download_s3_file(uri, local, logger=logger, config_file=config_file)
+        ok = download_s3_file(
+            uri,
+            local,
+            logger=logger,
+            config_file=config_file,
+            expected_size=int(image.get("s3_expected_size") or 0) or None,
+        )
         return label, ok, local, image
 
+    # Download each image in parallel, and update the result with successes/failures
     with ThreadPoolExecutor(max_workers=parallel_bands) as pool:
         futures = {pool.submit(_dload, t): t for t in download_tasks}
         for future in as_completed(futures):
             label, ok, local_path, image = future.result()
             if ok:
                 result.succeeded.append(label)
-                # measure local_actual_size from the freshly written file so it gets
+                # Measure local_actual_size from the freshly written file so it gets
                 # persisted to the cache
                 try:
                     actual = local_path.stat().st_size
+                # If the file was deleted between download and stat, log a warning
                 except OSError as e:
                     logger.warning(f"  could not stat {local_path} after download: {e}")
                     actual = None
-                result.updated_images.append({**image, "local_actual_size": actual})
+                # Update the image row with relavent info for the cache
+                result.updated_images.append(
+                    {
+                        **image,
+                        "local_actual_size": actual,
+                        "local_path": str(local_path),
+                        "download_status": "complete",
+                    }
+                )
                 logger.debug(f"  DWNLDED {scene_name} / {label}")
             else:
                 result.failed.append(label)
@@ -997,8 +1265,10 @@ def resolve_and_download(
         )
     logger.info(f"Loaded {len(scenes)} scenes from {scenes_cache}")
 
-    # load images (results of all queries so far)
+    # The cache-root catalog records remote assets resolved from S3. Download state is
+    # scoped to output_dir so two storage roots cannot accidentally share local state.
     images_file = Path(scenes_cache).parent.parent / "all_downloaded_images.parquet"
+    downloads_file = output_dir / ".sentinel-py" / "cdse_downloads.parquet"
     logger.info(f"Looking for images cache at: {images_file}")
     if images_file.exists():
         cached_images = pd.read_parquet(images_file)
@@ -1024,6 +1294,10 @@ def resolve_and_download(
         cached_keys = set()
         cached_scene_names = set()
 
+    local_downloads = (
+        pd.read_parquet(downloads_file) if downloads_file.exists() else pd.DataFrame()
+    )
+
     # resolve bands once (logs fallbacks once) — must be before _scene_fully_cached
     if mission.upper() == "S2":
         resolved_bands = _resolve_s2_bands(bands, resolution, logger)
@@ -1032,7 +1306,7 @@ def resolve_and_download(
 
     # split scenes; a scene is only "fully cached" if ALL requested bands are cached
     def _scene_fully_cached(name: str) -> bool:
-        """Check if all requested bands for this scene are in the cached keys."""
+        """Check if all requested assets have already been resolved from S3."""
         if name not in cached_scene_names:
             return False
         bands_to_check = (
@@ -1042,6 +1316,20 @@ def resolve_and_download(
         )
         for rb in bands_to_check:
             if (name, rb.band, rb.resolution) not in cached_keys:
+                return False
+        # Require metadata assets for S2 scenes, otherwise the scene is not fully cached
+        if mission.upper() == "S2":
+            metadata_name = "MTD_MSIL1C" if "MSIL1C" in name.upper() else "MTD_MSIL2A"
+            scene_asset_names = set(
+                cached_images.loc[
+                    cached_images["safedir"] == name,
+                    "band_name",
+                ].astype(str)
+            )
+            if (
+                metadata_name not in scene_asset_names
+                or "MTD_TL" not in scene_asset_names
+            ):
                 return False
         return True
 
@@ -1065,7 +1353,8 @@ def resolve_and_download(
     initial_free_bytes = _free_disk_bytes(output_dir)
 
     def _flush_images(force: bool = False) -> None:
-        """Merge pending rows into the on-disk images cache."""
+        """Flush remote asset discovery and output-scoped local download state."""
+        # Flush pending image rows to the images cache
         with lock:
             if not pending_image_rows:
                 return
@@ -1074,19 +1363,41 @@ def resolve_and_download(
             rows_to_write = list(pending_image_rows)
             pending_image_rows.clear()
 
+        # Read existing image rows from the cache
         existing = (
             pd.read_parquet(images_file) if images_file.exists() else pd.DataFrame()
         )
+        # Ensure the local_actual_size column exists for back-compat with older caches
         if not existing.empty and "local_actual_size" not in existing.columns:
             existing["local_actual_size"] = None
+        # Merge the new rows with the existing cache, overwriting by key
         combined = _merge_image_rows(existing, rows_to_write)
         write_protected_parquet(combined, images_file)
-        logger.info(f"Flushed {len(rows_to_write)} image row(s) to cache")
+        completed_rows = [
+            row for row in rows_to_write if row.get("download_status") == "complete"
+        ]
+        # Flush completed rows to the local downloads cache
+        if completed_rows:
+            existing_local = (
+                pd.read_parquet(downloads_file)
+                if downloads_file.exists()
+                else local_downloads
+            )
+            combined_local = merge_state_rows(
+                existing_local,
+                completed_rows,
+                key_columns=IMAGE_KEY_COLS,
+            )
+            write_parquet_atomic(combined_local, downloads_file, index=False)
+        logger.info(
+            f"Flushed {len(rows_to_write)} remote asset row(s) and "
+            f"{len(completed_rows)} local download row(s)"
+        )
 
     # Uncached scenes: resolve + download ----------------------------------------------
     def _resolve_and_dl(row: pd.Series) -> DownloadResult:
 
-        # if fatal error, skip all this and return empty result
+        # If fatal error, skip all this and return empty result
         if cancel.is_set():
             return DownloadResult(scene_name=row["Name"])
 
@@ -1094,9 +1405,9 @@ def resolve_and_download(
         raw_s3_path = row["S3Path"]
         s3_path = raw_s3_path.removeprefix("/eodata")
 
-        # always resolve via S3 so s3_expected_size is authoritative. If the
-        # files already exist locally, the download step will stat them and,
-        # on a size match, skip + record local_actual_size into the cache
+        # Always resolve via S3 so s3_expected_size is authoritative. If the files
+        # already exist locally, the download step will stat them and, on a size match,
+        # skip + record local_actual_size into the cache
         if mission.upper() == "S2":
             if resolved_bands is None:
                 logger.error(f"resolved_bands is None for S2 scene: {name}")
@@ -1134,11 +1445,34 @@ def resolve_and_download(
                     ),
                 )
 
+        # If no images were found, log an error and return a failed result
         if not images:
             logger.error(f"No images found for scene: {name}")
-            return DownloadResult(scene_name=name)
+            return DownloadResult(scene_name=name, failed=["NO_ASSETS_FOUND"])
 
-        # seed the cache with the resolved rows (local_actual_size still None). The
+        # Determine which expected images are missing
+        expected_keys = (
+            {(rb.band, rb.resolution) for rb in resolved_bands}
+            if mission.upper() == "S2" and resolved_bands is not None
+            else {(band.upper(), 0) for band in bands}
+        )
+        found_keys = {
+            (str(image["band_name"]), int(image.get("resolution_m") or 0))
+            for image in images
+        }
+        missing_labels = [
+            f"{band}@{resolution}m" if resolution else band
+            for band, resolution in sorted(expected_keys - found_keys)
+        ]
+        # For S2, also check for required metadata assets
+        if mission.upper() == "S2":
+            metadata_name = "MTD_MSIL1C" if "MSIL1C" in name.upper() else "MTD_MSIL2A"
+            if not any(image["band_name"] == metadata_name for image in images):
+                missing_labels.append(metadata_name)
+            if not any(image["band_name"] == "MTD_TL" for image in images):
+                missing_labels.append("MTD_TL")
+
+        # Seed the cache with the resolved rows (local_actual_size still None). The
         # download step will produce updated rows with local_actual_size populated,
         # which will overwrite these seeds via the merge-by-key logic
         with lock:
@@ -1157,8 +1491,10 @@ def resolve_and_download(
         if result.updated_images:
             with lock:
                 pending_image_rows.extend(result.updated_images)
+        result.failed.extend(f"MISSING:{label}" for label in missing_labels)
         return result
 
+    # Process uncached rows
     if not uncached_df.empty:
         uncached_rows = [row for _, row in uncached_df.iterrows()]
 
@@ -1218,9 +1554,7 @@ def resolve_and_download(
             f"{new_scene_storage.total_scenes} resolved scenes)"
         )
         if initial_free_bytes is not None:
-            storage_message += (
-                f"; {_format_bytes(initial_free_bytes)} free at start"
-            )
+            storage_message += f"; {_format_bytes(initial_free_bytes)} free at start"
             if new_scene_storage.projected_additional > initial_free_bytes:
                 storage_message += " — estimated requirement exceeds available space"
         logger.info(storage_message)
@@ -1228,9 +1562,26 @@ def resolve_and_download(
     # Cached scenes: verify + download only --------------------------------------------
     if not cached_images.empty and not cached_df.empty:
         cached_names = set(cached_df["Name"])
+        if mission.upper() == "S2" and resolved_bands is not None:
+            requested_keys = {(rb.band, rb.resolution) for rb in resolved_bands}
+            cached_assets_for_request = cached_images[
+                cached_images.apply(
+                    lambda row: (
+                        (str(row["band_name"]), int(row.get("resolution_m") or 0))
+                        in requested_keys
+                        or str(row["band_name"]) in S2_METADATA_ASSETS
+                    ),
+                    axis=1,
+                )
+            ]
+        else:
+            requested_names = {band.upper() for band in bands}
+            cached_assets_for_request = cached_images[
+                cached_images["band_name"].astype(str).str.upper().isin(requested_names)
+            ]
         grouped = [
             (name, group.to_dict("records"))
-            for name, group in cached_images.groupby("safedir")
+            for name, group in cached_assets_for_request.groupby("safedir")
             if name in cached_names
         ]
 

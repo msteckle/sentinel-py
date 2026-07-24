@@ -5,9 +5,11 @@ build/
 dist/
 wheels/
 *.egg-info
+*.DS_Store
 
 # Virtual environments
 .venv
+uv.lock
 
 # Data files
 data/s1
@@ -17,4 +19,5 @@ data/tests
 data/aois
 
 # Cache
-examples/cache
+*.asf-cache
+*.cdse-cache

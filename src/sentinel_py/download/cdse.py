@@ -2,8 +2,8 @@ import calendar
 import logging
 import os
 import re
-import signal
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -112,14 +112,14 @@ def _fix_date(year: int, month: int, day: int, logger: logging.Logger) -> date:
 
 """
 Sentinel-py (cdse) has 3 levels of caching to avoid redundant queries and downloads:
-1. Query results (the .SAFE scenes found for a particular CDSE query)
+1. Query results [.cdse-cache/<query_hash>/scenes.parquet]
     - Each unique query gets its own cache directory named by a hash of the parameters
     that the user specified (AOI, date windows, collection/product, etc); this way, if
     you want to re-run a query with the same parameters, you get the cached results 
-    immediately without hitting the CDSE API again.
-2. Remote asset discovery
-    - Resolved S3 objects are shared across queries in all_downloaded_images.parquet.
-3. Local download state
+    immediately without hitting the CDSE API again
+2. Remote asset discovery [.cdse-cache/all_downloaded_images.parquet]
+    - Resolved S3 objects are shared across queries
+3. Local download state [<data_dir>/.sentinel-py/cdse_downloads.parquet]
     - Each output root records verified local files in
       <output>/.sentinel-py/cdse_downloads.parquet. Filesystem checks remain
       authoritative so deleted or truncated assets are restored.
@@ -331,6 +331,15 @@ def query_cdse(
     def _run_query(
         start_iso: str, end_iso: str, batch_idx: int, batch_geom
     ) -> pd.DataFrame:
+        query_attributes = dict(attrs or {})
+        if not burst_mode:
+            if rel_orbit_num is not None:
+                query_attributes["relativeOrbitNumber"] = rel_orbit_num
+            if ops_mode is not None:
+                query_attributes["operationalMode"] = ops_mode
+            if platform_serial_id is not None:
+                query_attributes["platformSerialIdentifier"] = platform_serial_id
+
         # Run a query with max 3 retries
         attempts = 3
         for attempt in range(1, attempts + 1):
@@ -341,7 +350,7 @@ def query_cdse(
                     product_type=product,
                     orbit_direction=orbit,
                     cloud_cover_threshold=cloud_thresh,
-                    attributes=attrs,
+                    attributes=query_attributes or None,
                     aoi_wkt=batch_geom.wkt,
                     start_date=start_iso,
                     end_date=end_iso,
@@ -353,10 +362,12 @@ def query_cdse(
                     parent_product_type=parent_product_type,
                     parent_product_id=parent_product_id,
                     datatake_id=datatake_id,
-                    relative_orbit_number=rel_orbit_num,
-                    operational_mode=ops_mode,
+                    relative_orbit_number=rel_orbit_num if burst_mode else None,
+                    operational_mode=ops_mode if burst_mode else None,
                     polarisation_channels=pol_channels,
-                    platform_serial_identifier=platform_serial_id,
+                    platform_serial_identifier=(
+                        platform_serial_id if burst_mode else None
+                    ),
                     top=top,
                     count=count,
                 )
@@ -625,9 +636,8 @@ def _asset_path_relative_to_scene(listed_path: str, scene_s3_path: str) -> str:
     # CDSE's s5cmd endpoint omits the leading "GRANULE/" from wildcard listing
     # results, returning paths such as:
     # L2A_T06WVB_A048017_20240831T221528/IMG_DATA/R20m/...jp2
-    if (
-        listed_path.startswith(("L1C_", "L2A_"))
-        and ("/IMG_DATA/" in listed_path or listed_path.endswith("/MTD_TL.xml"))
+    if listed_path.startswith(("L1C_", "L2A_")) and (
+        "/IMG_DATA/" in listed_path or listed_path.endswith("/MTD_TL.xml")
     ):
         return f"GRANULE/{listed_path}"
 
@@ -1359,14 +1369,33 @@ def resolve_and_download(
     )
 
     all_results: list[DownloadResult] = []
+    progress_counts = {
+        "downloaded": 0,
+        "skipped": 0,
+        "failed": 0,
+        "cache_updated": 0,
+    }
     # rows to append/overwrite in the images cache on next flush
     pending_image_rows: list[dict] = []
     lock = threading.Lock()
-    storage_display_lock = threading.Lock()
     cancel = threading.Event()
     s3_paths = dict(zip(scenes["Name"], scenes["S3Path"]))
     storage_estimator = StorageEstimator(total_scenes=len(uncached_df))
     initial_free_bytes = _free_disk_bytes(output_dir)
+
+    def _progress_status() -> str:
+        return (
+            f"downloaded {progress_counts['downloaded']} · "
+            f"skipped {progress_counts['skipped']} · "
+            f"failed {progress_counts['failed']} · "
+            f"cache updated {progress_counts['cache_updated']}"
+        )
+
+    def _record_progress_result(result: DownloadResult) -> None:
+        progress_counts["downloaded"] += len(result.succeeded)
+        progress_counts["skipped"] += len(result.skipped)
+        progress_counts["failed"] += len(result.failed)
+        progress_counts["cache_updated"] += len(result.updated_images)
 
     def _flush_images(force: bool = False) -> None:
         """Flush remote asset discovery and output-scoped local download state."""
@@ -1449,17 +1478,6 @@ def resolve_and_download(
 
         footprint, additional = _scene_storage_bytes(name, images, output_dir)
         storage_estimator.add_scene(footprint, additional)
-        # Keep concurrent workers from replacing a newer estimate with an older one.
-        with storage_display_lock:
-            projection = storage_estimator.projection()
-            if projection is not None:
-                progress.update(
-                    task_id,
-                    storage=_storage_progress_text(
-                        projection,
-                        initial_free_bytes,
-                    ),
-                )
 
         # If no images were found, log an error and return a failed result
         if not images:
@@ -1521,12 +1539,12 @@ def resolve_and_download(
             MofNCompleteColumn(),
             TimeElapsedColumn(),
             TimeRemainingColumn(),
-            TextColumn("[cyan]{task.fields[storage]}"),
+            TextColumn("[cyan]{task.fields[status]}"),
         ) as progress:
             task_id = progress.add_task(
                 "Resolving & downloading new scenes",
                 total=len(uncached_rows),
-                storage="estimating storage...",
+                status=_progress_status(),
             )
 
             with ThreadPoolExecutor(max_workers=parallel_scenes) as pool:
@@ -1538,7 +1556,6 @@ def resolve_and_download(
                     name = futures[future]
                     try:
                         result = future.result()
-                        all_results.append(result)
                     except RuntimeError as exc:
                         cancel.set()
                         fatal_error = exc
@@ -1547,12 +1564,18 @@ def resolve_and_download(
                         break
                     except Exception as exc:
                         logger.error(f"Scene {name} failed: {exc}")
-                        all_results.append(
-                            DownloadResult(scene_name=str(name), failed=["SCENE_ERROR"])
+                        result = DownloadResult(
+                            scene_name=str(name), failed=["SCENE_ERROR"]
                         )
 
+                    _record_progress_result(result)
+                    all_results.append(result)
                     _flush_images(force=False)
-                    progress.advance(task_id)
+                    progress.update(
+                        task_id,
+                        advance=1,
+                        status=_progress_status(),
+                    )
 
                 if fatal_error:
                     raise fatal_error
@@ -1602,27 +1625,6 @@ def resolve_and_download(
         ]
 
         if grouped:
-            repair_counts = {"found": 0, "restored": 0, "failed": 0}
-            repair_progress_lock = threading.Lock()
-
-            def _repair_status() -> str:
-                if repair_counts["found"] == 0:
-                    return "checking local files..."
-                return (
-                    f"missing/invalid {repair_counts['found']} · "
-                    f"restored {repair_counts['restored']} · "
-                    f"failed {repair_counts['failed']}"
-                )
-
-            def _record_download_plan(count: int) -> None:
-                with repair_progress_lock:
-                    repair_counts["found"] += count
-                    progress.update(task_id, repair_status=_repair_status())
-
-            def _record_download_result(ok: bool) -> None:
-                with repair_progress_lock:
-                    repair_counts["restored" if ok else "failed"] += 1
-                    progress.update(task_id, repair_status=_repair_status())
 
             def _dl_cached(name_images: tuple[str, list[dict]]) -> DownloadResult:
                 if cancel.is_set():
@@ -1637,8 +1639,6 @@ def resolve_and_download(
                     config_file=config_file,
                     parallel_bands=parallel_bands,
                     logger=logger,
-                    on_download_plan=_record_download_plan,
-                    on_download_result=_record_download_result,
                 )
                 if result.updated_images:
                     with lock:
@@ -1652,12 +1652,12 @@ def resolve_and_download(
                 MofNCompleteColumn(),
                 TimeElapsedColumn(),
                 TimeRemainingColumn(),
-                TextColumn("[cyan]{task.fields[repair_status]}"),
+                TextColumn("[cyan]{task.fields[status]}"),
             ) as progress:
                 task_id = progress.add_task(
                     "Checking cached scenes & restoring files",
                     total=len(grouped),
-                    repair_status="checking local files...",
+                    status=_progress_status(),
                 )
 
                 with ThreadPoolExecutor(max_workers=parallel_scenes) as pool:
@@ -1670,7 +1670,6 @@ def resolve_and_download(
                         name = futures[future]
                         try:
                             result = future.result()
-                            all_results.append(result)
                         except RuntimeError as exc:
                             cancel.set()
                             fatal_error = exc
@@ -1679,13 +1678,17 @@ def resolve_and_download(
                             break
                         except Exception as exc:
                             logger.error(f"Scene {name} failed: {exc}")
-                            all_results.append(
-                                DownloadResult(
-                                    scene_name=str(name), failed=["SCENE_ERROR"]
-                                )
+                            result = DownloadResult(
+                                scene_name=str(name), failed=["SCENE_ERROR"]
                             )
+                        _record_progress_result(result)
+                        all_results.append(result)
                         _flush_images(force=False)
-                        progress.advance(task_id)
+                        progress.update(
+                            task_id,
+                            advance=1,
+                            status=_progress_status(),
+                        )
 
                     if fatal_error:
                         raise fatal_error

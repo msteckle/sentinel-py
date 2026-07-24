@@ -1,8 +1,11 @@
 import configparser
+import time
+from enum import Enum
 from pathlib import Path
 from typing import Annotated, Optional
 
 import typer
+import pandas as pd
 
 from sentinel_py.cache import DEFAULT_CDSE_CACHE_DIR
 from sentinel_py.log import DEFAULT_LOG_DIR, get_logger
@@ -23,6 +26,36 @@ REQUIRED_S5_CONFIG_KEYS = (
     "aws_secret_access_key",
     "host_base",
 )
+
+
+class CDSES2Bands(str, Enum):
+    """Enum of valid Sentinel-2 bands for CDSE download."""
+
+    B01 = "B01"
+    B02 = "B02"
+    B03 = "B03"
+    B04 = "B04"
+    B05 = "B05"
+    B06 = "B06"
+    B07 = "B07"
+    B08 = "B08"
+    B8A = "B8A"
+    B09 = "B09"
+    B10 = "B10"
+    B11 = "B11"
+    B12 = "B12"
+    SCL = "SCL"
+    TCI = "TCI"
+    AOT = "AOT"
+    WVP = "WVP"
+
+
+class CDSES2Resolutions(int, Enum):
+    """Enum of valid Sentinel-2 resolutions for CDSE download."""
+
+    R10M = 10
+    R20M = 20
+    R60M = 60
 
 
 def _s5_config_error(config: Path, reason: str) -> typer.BadParameter:
@@ -69,25 +102,39 @@ def _validate_s5_config(config: Path) -> None:
 )
 def download(
     mission: Annotated[
-        str, typer.Option(help="Mission name to filter the query cache for download.")
+        str,
+        typer.Option(
+            help="Mission name. Currently only Sentinel-2 (S2) is fully supported and "
+            "tested.",
+            rich_help_panel="Required Arguments",
+        ),
     ],
     bands: Annotated[
-        str, typer.Option(help="Space- or comma-separated list of bands to download.")
+        str,
+        typer.Option(
+            help=(
+                "Space- or comma-separated Sentinel-2 assets: B01-B12, B8A, SCL, "
+                "TCI, AOT, or WVP."
+            ),
+            rich_help_panel="Required Arguments",
+        ),
     ],
     outdir: Annotated[
         Path,
         typer.Option(
             help=("Output directory for downloaded files. Must exist and be writable."),
             file_okay=False,
+            rich_help_panel="Required Arguments",
         ),
     ],
     res: Annotated[
-        int,
+        CDSES2Resolutions,
         typer.Option(
             help=(
                 "Target resolution in meters for the bands to download. Only used "
                 "for Sentinel-2. Options: 10, 20, or 60."
             ),
+            rich_help_panel="Required Arguments",
         ),
     ],
     config: Annotated[
@@ -96,9 +143,35 @@ def download(
             help=(
                 "Path to an INI file containing CDSE S3 credentials. If the file is "
                 "missing or malformed, setup instructions are displayed."
-            )
+            ),
+            rich_help_panel="Required Arguments",
         ),
     ],
+    query: Annotated[
+        Optional[Path],
+        typer.Option(
+            help=("Path to a cache of CDSE query results stored as a parquet."),
+            exists=True,
+            dir_okay=False,
+            rich_help_panel="Optional Download Configurations",
+        ),
+    ] = None,
+    parallel_scenes: Annotated[
+        int,
+        typer.Option(
+            help="Number of scenes to download in parallel.",
+            min=1,
+            rich_help_panel="Optional Download Configurations",
+        ),
+    ] = 2,
+    parallel_bands: Annotated[
+        int,
+        typer.Option(
+            help="Number of bands to download in parallel within each scene.",
+            min=1,
+            rich_help_panel="Optional Download Configurations",
+        ),
+    ] = 4,
     cache_dir: Annotated[
         Path,
         typer.Option(
@@ -107,32 +180,25 @@ def download(
                 "directory in the current working directory."
             ),
             file_okay=False,
+            rich_help_panel="Utils",
         ),
     ] = DEFAULT_CDSE_CACHE_DIR,
-    query: Annotated[
-        Optional[Path],
-        typer.Option(
-            help=("Path to a cache of CDSE query results stored as a parquet.")
-        ),
-    ] = None,
-    parallel_scenes: Annotated[
-        int, typer.Option(help="Number of scenes to download in parallel.")
-    ] = 2,
-    parallel_bands: Annotated[
-        int,
-        typer.Option(help="Number of bands to download in parallel within each scene."),
-    ] = 4,
     log: Annotated[
         Optional[Path],
         typer.Option(
             help=(
                 "Log file path for download execution logs. If omitted, logs are saved "
                 f"to {DEFAULT_LOG_DIR}."
-            )
+            ),
+            rich_help_panel="Utils",
         ),
     ] = None,
     verbose: Annotated[
-        bool, typer.Option(help="Enable verbose logging to the console and log file.")
+        bool,
+        typer.Option(
+            help="Enable verbose logging to the console and log file.",
+            rich_help_panel="Utils",
+        ),
     ] = False,
 ):
 
@@ -142,6 +208,25 @@ def download(
     )
 
     _validate_s5_config(config)
+
+    mission_value = mission.upper()
+    if mission_value != "S2":
+        raise typer.BadParameter(
+            "CDSE download currently supports only Sentinel-2; use --mission S2"
+        )
+    requested_bands = [
+        value.upper() for value in bands.replace(",", " ").split() if value.strip()
+    ]
+    if not requested_bands:
+        raise typer.BadParameter("--bands must contain at least one band")
+    try:
+        band_values = [CDSES2Bands(value).value for value in requested_bands]
+    except ValueError as error:
+        supported = ", ".join(band.value for band in CDSES2Bands)
+        raise typer.BadParameter(
+            f"Unsupported Sentinel-2 band in --bands. Supported values: {supported}"
+        ) from error
+    resolution_value = res.value
 
     # Set up logging
     logger = get_logger(name="download_logger", logpath=log, verbose=verbose)
@@ -154,24 +239,47 @@ def download(
             raise typer.BadParameter(f"No scenes.parquet found in {cache_dir}")
         logger.info(f"Using most recent query cache: {query}")
 
-    if parallel_scenes < 1:
-        raise typer.BadParameter("--parallel-scenes must be at least 1")
-    if parallel_bands < 1:
-        raise typer.BadParameter("--parallel-bands must be at least 1")
-    if mission.upper() == "S2" and res not in {10, 20, 60}:
-        raise typer.BadParameter("--res must be 10, 20, or 60 for Sentinel-2")
+    scenes = pd.read_parquet(query, columns=["Name"])
+    scene_count = len(scenes)
+    requested_images_per_scene = len(set(band_values))
+    image_label = "image" if requested_images_per_scene == 1 else "images"
+    typer.echo(f"Cached query: {query}")
+    typer.echo(
+        f"Found {scene_count} scenes: "
+        f"{requested_images_per_scene} requested {image_label} per scene"
+    )
 
+    started = time.time()
+    started_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started))
     results = resolve_and_download(
         scenes_cache=query,
-        mission=mission,
-        bands=[b.strip() for b in bands.replace(",", " ").split()],
-        resolution=res,
+        mission=mission_value,
+        bands=band_values,
+        resolution=resolution_value,
         output_dir=outdir,
         config_file=str(config),
         parallel_scenes=parallel_scenes,
         parallel_bands=parallel_bands,
         logger=logger,
     )
+    ended = time.time()
+    ended_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ended))
+    elapsed = ended - started
+    downloaded = sum(len(result.succeeded) for result in (results or []))
+    skipped = sum(len(result.skipped) for result in (results or []))
+    failed = sum(len(result.failed) for result in (results or []))
+    status_file = outdir / ".sentinel-py" / "cdse_downloads.parquet"
+
+    typer.echo("Summary:")
+    typer.echo(f"  Download started: {started_text}")
+    typer.echo(f"  Download ended:   {ended_text}")
+    typer.echo(f"  Elapsed time:     {elapsed:.1f} seconds for {scene_count} scenes")
+    typer.echo(
+        f"  Results:          {downloaded} downloaded, {skipped} skipped, "
+        f"{failed} failed"
+    )
+    typer.echo(f"  Download status:  {status_file}")
+
     # Report any failed downloads
     failures = [
         (result.scene_name, failure)

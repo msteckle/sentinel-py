@@ -17,15 +17,54 @@ from sentinel_py.cache import (
     write_json_atomic,
     write_parquet_atomic,
 )
-from sentinel_py.download.asf import get_predominant_flightdir, query_asf
+from sentinel_py.download.asf import (
+    get_predominant_flightdir,
+    query_asf,
+)
+from sentinel_py.log import DEFAULT_LOG_DIR, get_logger
 
 app = typer.Typer()
 
 
 class ASFOrbitDirection(str, Enum):
-    predominant = "predominant"
+    both = "BOTH"
+    predominant = "PREDOMINANT"
     ascending = "ASCENDING"
     descending = "DESCENDING"
+
+
+class ASFProductLevel(str, Enum):
+    grd_hd = "GRD_HD"
+    grd_hs = "GRD_HS"
+    grd_md = "GRD_MD"
+    grd_ms = "GRD_MS"
+    grd_fd = "GRD_FD"
+    slc = "SLC"
+    raw = "RAW"
+    ocn = "OCN"
+
+
+class ASFBeamMode(str, Enum):
+    iw = "IW"
+    ew = "EW"
+    wv = "WV"
+    s1 = "S1"
+    s2 = "S2"
+    s3 = "S3"
+    s4 = "S4"
+    s5 = "S5"
+    s6 = "S6"
+
+
+class ASFPolarization(str, Enum):
+    vv_vh = "VV+VH"
+    hh_hv = "HH+HV"
+    vv = "VV"
+    hh = "HH"
+    dual_vv = "DUAL VV"
+    dual_vh = "DUAL VH"
+    dual_hh = "DUAL HH"
+    dual_hv = "DUAL HV"
 
 
 def _seasonal_date(year: int, period: dt.datetime) -> dt.date:
@@ -42,17 +81,22 @@ def query(
             help="The AOI file used to filter the query (GeoJSON, shapefile, etc.).",
             exists=True,
             dir_okay=False,
+            rich_help_panel="Required Arguments",
         ),
     ],
     years: Annotated[
         str,
-        typer.Option(help="Space- or comma-separated list of years."),
+        typer.Option(
+            help="Space- or comma-separated list of years.",
+            rich_help_panel="Required Arguments",
+        ),
     ],
     speriod: Annotated[
         dt.datetime,
         typer.Option(
             help="Start month and day of seasonal query window.",
             formats=["%m-%d", "%m/%d", "%m %d", "%b-%d", "%b %d", "%B-%d", "%B %d"],
+            rich_help_panel="Optional Query Configurations",
         ),
     ] = dt.datetime(2000, 1, 1),
     eperiod: Annotated[
@@ -60,41 +104,73 @@ def query(
         typer.Option(
             help="End month and day of seasonal query window.",
             formats=["%m-%d", "%m/%d", "%m %d", "%b-%d", "%b %d", "%B-%d", "%B %d"],
+            rich_help_panel="Optional Query Configurations",
         ),
     ] = dt.datetime(2000, 12, 31),
     product_levels: Annotated[
-        str,
+        ASFProductLevel,
         typer.Option(
-            help="Space- or comma-separated ASF product levels, such as SLC or GRD_HD."
+            help=(
+                "Sentinel-1 ASF product level: GRD_HD, GRD_HS, GRD_MD, GRD_MS, "
+                "GRD_FD, SLC, RAW, or OCN. Availability depends on acquisition mode "
+                "and archive history. Source: ASF Search API keyword reference."
+            ),
+            case_sensitive=False,
+            rich_help_panel="Optional Query Configurations",
         ),
-    ] = "GRD_HD GRD_FD GRD_HS GRD_MD GRD_MS",
+    ] = ASFProductLevel.grd_hd,
     beam_mode: Annotated[
-        str,
-        typer.Option(help="ASF beam mode. Sentinel-1 commonly uses IW."),
-    ] = "IW",
+        ASFBeamMode,
+        typer.Option(
+            help=(
+                "Sentinel-1 ASF beam mode: IW (primary land mode), EW "
+                "(extra-wide swath), WV (wave), or S1-S6 (individual Stripmap beams). "
+                "Source: ESA Sentinel-1 Mission."
+            ),
+            case_sensitive=False,
+            rich_help_panel="Optional Query Configurations",
+        ),
+    ] = ASFBeamMode.iw,
     flight_direction: Annotated[
         ASFOrbitDirection,
         typer.Option(
             help=(
-                "Orbit direction. One of predominant, ASCENDING, or DESCENDING. By "
-                "default, query both directions and keep only the direction with the "
-                "most returned products (predominant)."
-            )
+                "Orbit direction. One of: BOTH, PREDOMINANT, ASCENDING, or DESCENDING. "
+                "The default retains both directions."
+            ),
+            case_sensitive=False,
+            rich_help_panel="Optional Query Configurations",
         ),
-    ] = ASFOrbitDirection.predominant,
+    ] = ASFOrbitDirection.both,
     polarization: Annotated[
-        str,
+        ASFPolarization,
         typer.Option(
-            help="Restrict product polarization. Defaults to dual-polarized VV+VH."
+            help=(
+                "Sentinel-1 polarization. VV+VH is commonly used over land, HH+HV is "
+                "commonly used for polar/sea-ice observations. Availability depends on "
+                "the acquisition. Sources: ASF Search API keyword reference and ESA "
+                "Sentinel-1 Mission."
+            ),
+            case_sensitive=False,
+            rich_help_panel="Optional Query Configurations",
         ),
-    ] = "VV+VH",
+    ] = ASFPolarization.vv_vh,
     relative_orbit: Annotated[
         Optional[int],
-        typer.Option(help="Optionally restrict Sentinel-1 relative orbit.", min=1),
+        typer.Option(
+            help="Optionally restrict Sentinel-1 relative orbit.",
+            min=1,
+            max=175,
+            rich_help_panel="Optional Query Configurations",
+        ),
     ] = None,
     max_results: Annotated[
         Optional[int],
-        typer.Option(help="Optional maximum result count per yearly window.", min=1),
+        typer.Option(
+            help="Optionally set maximum result count per yearly window.",
+            min=1,
+            rich_help_panel="Optional Query Configurations",
+        ),
     ] = None,
     cache_dir: Annotated[
         Path,
@@ -104,13 +180,36 @@ def query(
                 "the current working directory."
             ),
             file_okay=False,
+            rich_help_panel="Utils",
         ),
     ] = DEFAULT_ASF_CACHE_DIR,
     crs: Annotated[
         str,
-        typer.Option(help="CRS to assume when the input AOI has no CRS metadata."),
+        typer.Option(
+            help="CRS to assume when the input AOI has no CRS metadata.",
+            rich_help_panel="Utils",
+        ),
     ] = "EPSG:4326",
+    log: Annotated[
+        Optional[Path],
+        typer.Option(
+            help=(
+                "Log file path for query execution logs. If omitted, logs are saved to "
+                f"{DEFAULT_LOG_DIR}."
+            ),
+            rich_help_panel="Utils",
+        ),
+    ] = None,
+    verbose: Annotated[
+        bool,
+        typer.Option(
+            help="Enable verbose logging to the console and log file.",
+            rich_help_panel="Utils",
+        ),
+    ] = False,
 ):
+    logger = get_logger(name="asf_query_logger", logpath=log, verbose=verbose)
+
     # Validate inputs
     try:
         parsed_years = sorted({int(year) for year in years.replace(",", " ").split()})
@@ -140,23 +239,20 @@ def query(
         aoi_gdf = aoi_gdf.set_crs(crs)
     aoi_wkt = aoi_gdf.to_crs("EPSG:4326").geometry.union_all().wkt
 
-    direction_value = (
-        flight_direction.value
-        if isinstance(flight_direction, ASFOrbitDirection)
-        else str(flight_direction)
-    )
+    product_level_value = product_levels.value
+    beam_mode_value = beam_mode.value
+    direction_value = flight_direction.value
+    polarization_value = polarization.value
     query_direction = (
         None
-        if direction_value == ASFOrbitDirection.predominant.value
+        if direction_value
+        in {
+            ASFOrbitDirection.both.value,
+            ASFOrbitDirection.predominant.value,
+        }
         else direction_value
     )
-    levels = [
-        level.upper()
-        for level in product_levels.replace(",", " ").split()
-        if level.strip()
-    ]
-    if not levels:
-        raise typer.BadParameter("--product-levels must contain at least one value")
+    levels = [product_level_value]
 
     # Build query payload and cache directory
     query_payload = {
@@ -167,10 +263,10 @@ def query(
         "speriod": f"{speriod.month:02d}-{speriod.day:02d}",
         "eperiod": f"{eperiod.month:02d}-{eperiod.day:02d}",
         "windows": query_windows,
-        "product_levels": sorted(set(levels)),
-        "beam_mode": beam_mode.upper(),
+        "product_levels": levels,
+        "beam_mode": beam_mode_value,
         "flight_direction": direction_value,
-        "polarization": polarization,
+        "polarization": polarization_value,
         "relative_orbit": relative_orbit,
         "max_results": max_results,
     }
@@ -182,6 +278,14 @@ def query(
     query_info_path = query_dir / "query_info.json"
     direction_counts: dict[str, int] = {}
     selected_direction: str | None = None
+    possibly_truncated_windows: list[dict[str, object]] = []
+    logger.info(
+        "ASF query configured: aoi=%s years=%s windows=%s cache=%s",
+        aoi,
+        parsed_years,
+        query_windows,
+        cached_manifest,
+    )
 
     # Load cached manifest if it exists
     if cached_manifest.exists():
@@ -194,6 +298,8 @@ def query(
                 for direction, count in info.get("direction_counts", {}).items()
             }
             selected_direction = info.get("selected_direction")
+            possibly_truncated_windows = info.get("possibly_truncated_windows", [])
+        logger.info("Loaded cached ASF query from %s", cached_manifest)
         typer.echo(f"Loaded cached ASF query: {cached_manifest}")
     # Otherwise, run the query and cache the results
     else:
@@ -204,16 +310,32 @@ def query(
                     date_start=start_date,
                     date_end=end_date,
                     product_levels=levels,
-                    beam_mode=beam_mode,
+                    beam_mode=beam_mode_value,
                     flight_direction=query_direction,
-                    polarization=polarization,
+                    polarization=polarization_value,
                     relative_orbit=relative_orbit,
                     max_results=max_results,
+                    logger=logger,
                 )
                 for start_date, end_date in query_windows
             ]
         except ValueError as error:
+            logger.error("Invalid ASF query: %s", error)
             raise typer.BadParameter(str(error)) from error
+
+        if max_results is not None:
+            possibly_truncated_windows = [
+                {
+                    "start": start_date,
+                    "end": end_date,
+                    "returned": len(yearly_manifest),
+                    "max_results": max_results,
+                }
+                for (start_date, end_date), yearly_manifest in zip(
+                    query_windows, yearly_manifests
+                )
+                if len(yearly_manifest) >= max_results
+            ]
 
         manifest = pd.concat(yearly_manifests, ignore_index=True)
         if not manifest.empty:
@@ -255,8 +377,10 @@ def query(
                 "num_products": len(manifest),
                 "direction_counts": direction_counts,
                 "selected_direction": selected_direction,
+                "possibly_truncated_windows": possibly_truncated_windows,
             },
         )
+        logger.info("Cached %d ASF products to %s", len(manifest), cached_manifest)
         typer.echo(f"Cached ASF query: {cached_manifest}")
 
     # Report flight direction counts if applicable
@@ -267,5 +391,22 @@ def query(
         )
         typer.echo(f"Flight direction counts: {counts}; selected {selected_direction}.")
 
+    if possibly_truncated_windows:
+        windows = ", ".join(
+            f"{window['start']} to {window['end']}"
+            for window in possibly_truncated_windows
+        )
+        logger.warning(
+            "ASF returned the --max-results limit for %s; the cached manifest may be "
+            "truncated.",
+            windows,
+        )
+        typer.echo(
+            "WARNING: ASF returned the --max-results limit for "
+            f"{windows}; the cached manifest may be truncated.",
+            err=True,
+        )
+
     # Report results
+    logger.info("ASF query complete: %d unique products", len(manifest))
     typer.echo(f"Found {len(manifest)} unique ASF product(s).")

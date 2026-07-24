@@ -97,7 +97,6 @@ class S2Products(str, Enum):
 
     msi1c = "S2MSI1C"
     msi2a = "S2MSI2A"
-    msi2b = "S2MSI2B"
 
 
 class S2SerialIds(str, Enum):
@@ -105,6 +104,7 @@ class S2SerialIds(str, Enum):
 
     sentinel2a = "A"
     sentinel2b = "B"
+    sentinel2c = "C"
 
 
 class S2SensorModes(str, Enum):

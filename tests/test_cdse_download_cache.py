@@ -21,6 +21,7 @@ def test_cached_size_does_not_hide_deleted_local_file(
         *,
         logger,
         config_file: str,
+        expected_size: int | None,
     ) -> bool:
         downloaded.append((uri, local_path))
         local_path.parent.mkdir(parents=True, exist_ok=True)

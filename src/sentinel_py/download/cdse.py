@@ -109,15 +109,15 @@ def _fix_date(year: int, month: int, day: int, logger: logging.Logger) -> date:
 ########################################################################################
 
 """
-Sentinel-py caches:
-- Query results (the .SAFE scenes found for a particular CDSE query)
+Sentinel-py (cdse) has 3 levels of caching to avoid redundant queries and downloads:
+1. Query results (the .SAFE scenes found for a particular CDSE query)
     - Each unique query gets its own cache directory named by a hash of the parameters
     that the user specified (AOI, date windows, collection/product, etc); this way, if
     you want to re-run a query with the same parameters, you get the cached results 
     immediately without hitting the CDSE API again.
-- Remote asset discovery
+2. Remote asset discovery
     - Resolved S3 objects are shared across queries in all_downloaded_images.parquet.
-- Local download state
+3. Local download state
     - Each output root records verified local files in
       <output>/.sentinel-py/cdse_downloads.parquet. Filesystem checks remain
       authoritative so deleted or truncated assets are restored.

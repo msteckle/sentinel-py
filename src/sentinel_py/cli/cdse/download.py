@@ -65,7 +65,7 @@ def _validate_s5_config(config: Path) -> None:
 
 
 @app.command(
-    help=("Download from S3 given a cache of CDSE query results. Not implemented yet."),
+    help="Download selected assets from S3 using a cached CDSE query manifest.",
 )
 def download(
     mission: Annotated[
@@ -143,17 +143,25 @@ def download(
 
     _validate_s5_config(config)
 
-    # set up logging
+    # Set up logging
     logger = get_logger(name="download_logger", logpath=log, verbose=verbose)
 
-    # load most recent query cache if not provided
+    # Validate inputs
     if query is None:
+        # If no query cache is provided, find the latest query cache in the cache_dir
         query = find_latest_scenes_cache(Path(cache_dir))
         if not query:
             raise typer.BadParameter(f"No scenes.parquet found in {cache_dir}")
         logger.info(f"Using most recent query cache: {query}")
 
-    resolve_and_download(
+    if parallel_scenes < 1:
+        raise typer.BadParameter("--parallel-scenes must be at least 1")
+    if parallel_bands < 1:
+        raise typer.BadParameter("--parallel-bands must be at least 1")
+    if mission.upper() == "S2" and res not in {10, 20, 60}:
+        raise typer.BadParameter("--res must be 10, 20, or 60 for Sentinel-2")
+
+    results = resolve_and_download(
         scenes_cache=query,
         mission=mission,
         bands=[b.strip() for b in bands.replace(",", " ").split()],
@@ -164,3 +172,15 @@ def download(
         parallel_bands=parallel_bands,
         logger=logger,
     )
+    # Report any failed downloads
+    failures = [
+        (result.scene_name, failure)
+        for result in (results or [])
+        for failure in result.failed
+    ]
+    if failures:
+        typer.echo(
+            f"Download completed with {len(failures)} failed required asset(s).",
+            err=True,
+        )
+        raise typer.Exit(code=1)

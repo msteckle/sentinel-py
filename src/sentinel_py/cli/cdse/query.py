@@ -142,21 +142,21 @@ def query(
 
     from sentinel_py.download.cdse import query_cdse
 
-    # set up logging
+    # Set up logging
     logger = get_logger(name="download_logger", logpath=log, verbose=verbose)
 
-    # parse years
+    # Parse years
     try:
         parsed_years = [int(y) for y in years.replace(",", " ").split()]
     except ValueError as e:
         raise typer.BadParameter(f"Could not parse years: {e}")
 
-    # parse query single item args
+    # Parse query single item args
     collection = collection.value if hasattr(collection, "value") else collection  # type: ignore
     orbit = orbit.value if hasattr(orbit, "value") else orbit  # type: ignore
     swath_id = swath_id.value if hasattr(swath_id, "value") else swath_id  # type: ignore
 
-    # parse query args that depend on collection choice
+    # Parse query args that depend on collection choice
     valid_product = (
         validate_product(CDSECollections(collection), product)
         if product is not None
@@ -173,8 +173,8 @@ def query(
         else None
     )
 
-    # query
-    query_cdse(
+    # Query
+    scenes = query_cdse(
         collection=collection,
         product=valid_product,
         years=parsed_years,
@@ -195,3 +195,9 @@ def query(
         count=count,
         logger=logger,
     )
+    # Report query results
+    if scenes is not None:
+        cache_path = scenes.attrs.get("cache_path")
+        if cache_path:
+            typer.echo(f"Cached query manifest: {cache_path}")
+        typer.echo(f"Found {len(scenes)} unique scene(s).")

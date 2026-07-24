@@ -2,7 +2,9 @@ import calendar
 import logging
 import os
 import re
+import signal
 import shutil
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -620,6 +622,15 @@ def _asset_path_relative_to_scene(listed_path: str, scene_s3_path: str) -> str:
         if marker_idx >= 0:
             return listed_path[marker_idx:]
 
+    # CDSE's s5cmd endpoint omits the leading "GRANULE/" from wildcard listing
+    # results, returning paths such as:
+    # L2A_T06WVB_A048017_20240831T221528/IMG_DATA/R20m/...jp2
+    if (
+        listed_path.startswith(("L1C_", "L2A_"))
+        and ("/IMG_DATA/" in listed_path or listed_path.endswith("/MTD_TL.xml"))
+    ):
+        return f"GRANULE/{listed_path}"
+
     return Path(listed_path).name
 
 
@@ -884,6 +895,11 @@ def download_s3_file(
         # If the download fails, clean up and retry with exponential backoff
         except Exception as e:
             temporary.unlink(missing_ok=True)
+            if isinstance(e, subprocess.CalledProcessError) and e.returncode in {
+                -signal.SIGINT,
+                -signal.SIGTERM,
+            }:
+                raise KeyboardInterrupt from e
             if attempt == attempts:
                 logger.error(
                     f"Download failed after {attempts} attempt(s): "

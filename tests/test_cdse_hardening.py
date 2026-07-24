@@ -1,5 +1,7 @@
 import logging
+import signal
 import shlex
+import subprocess
 from datetime import date
 from pathlib import Path
 
@@ -131,14 +133,11 @@ def test_s2_discovery_lists_each_resolution_once_and_includes_metadata(monkeypat
             return "\n".join(
                 [
                     "2024/01/01 00:00:00 4 "
-                    f"s3://eodata{scene_path}/GRANULE/G1/IMG_DATA/R20m/"
-                    "G1_B04_20m.jp2",
+                    "L2A_G1/IMG_DATA/R20m/G1_B04_20m.jp2",
                     "2024/01/01 00:00:00 5 "
-                    f"s3://eodata{scene_path}/GRANULE/G1/IMG_DATA/R20m/"
-                    "G1_B05_20m.jp2",
+                    "L2A_G1/IMG_DATA/R20m/G1_B05_20m.jp2",
                     "2024/01/01 00:00:00 6 "
-                    f"s3://eodata{scene_path}/GRANULE/G2/IMG_DATA/R20m/"
-                    "G2_B04_20m.jp2",
+                    "L2A_G2/IMG_DATA/R20m/G2_B04_20m.jp2",
                 ]
             )
         if "MTD_MSIL2A.xml" in command:
@@ -149,7 +148,7 @@ def test_s2_discovery_lists_each_resolution_once_and_includes_metadata(monkeypat
         if "MTD_TL.xml" in command:
             return (
                 "2024/01/01 00:00:00 8 "
-                f"s3://eodata{scene_path}/GRANULE/G1/MTD_TL.xml"
+                "L2A_G1/MTD_TL.xml"
             )
         return ""
 
@@ -178,6 +177,14 @@ def test_s2_discovery_lists_each_resolution_once_and_includes_metadata(monkeypat
     assert all(
         not asset["img_path_in_safedir"].startswith("s3://") for asset in assets
     )
+    assert {
+        asset["img_path_in_safedir"]
+        for asset in assets
+        if asset["band_name"] == "B04"
+    } == {
+        "GRANULE/L2A_G1/IMG_DATA/R20m/G1_B04_20m.jp2",
+        "GRANULE/L2A_G2/IMG_DATA/R20m/G2_B04_20m.jp2",
+    }
 
 
 def test_download_is_atomic_and_retries_size_mismatch(tmp_path: Path, monkeypatch):
@@ -204,6 +211,34 @@ def test_download_is_atomic_and_retries_size_mismatch(tmp_path: Path, monkeypatc
     assert ok
     assert len(attempts) == 2
     assert destination.read_bytes() == b"good"
+    assert not destination.with_name(".asset.jp2.part").exists()
+
+
+def test_interrupted_s5cmd_is_not_retried(tmp_path: Path, monkeypatch):
+    destination = tmp_path / "asset.jp2"
+    destination.write_bytes(b"existing")
+    calls = 0
+
+    def interrupted_s5cmd(command: str, **kwargs):
+        nonlocal calls
+        calls += 1
+        temporary = Path(shlex.split(command)[-1])
+        temporary.write_bytes(b"partial")
+        raise subprocess.CalledProcessError(-signal.SIGINT, ["s5cmd"])
+
+    monkeypatch.setattr(cdse, "run_s5cmd_with_config", interrupted_s5cmd)
+
+    with pytest.raises(KeyboardInterrupt):
+        cdse.download_s3_file(
+            "s3://eodata/example.jp2",
+            destination,
+            logger=logging.getLogger("test_interrupted_download"),
+            expected_size=20,
+            attempts=3,
+        )
+
+    assert calls == 1
+    assert destination.read_bytes() == b"existing"
     assert not destination.with_name(".asset.jp2.part").exists()
 
 

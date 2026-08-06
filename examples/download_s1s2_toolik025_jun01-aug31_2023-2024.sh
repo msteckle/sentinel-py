@@ -9,8 +9,8 @@ OUTPATH="../data"
 
 # Set up user/password for CDSE
 # Note: you need to have an account with CDSE to download data
-export CDSE_USERNAME="morganrsteckler@gmail.com"
-export CDSE_PASSWORD_FILE="$HOME/.cdse/cdse_pw"  # ensure chmod 600 on this file or it won't read
+# export CDSE_USERNAME="<email>"
+# export CDSE_PASSWORD_FILE="$HOME/.cdse/cdse_pw"  # ensure chmod 600 on this file or it won't read
 
 # Query/Download all Sentinel-2 summer scenes for 2023–2024
 sentinel-py cdse query \

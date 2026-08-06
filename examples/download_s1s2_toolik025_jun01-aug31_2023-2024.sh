@@ -7,8 +7,12 @@ LOGPATH="../data/logs/download"
 LOGFILENAME=$(basename "$0")
 OUTPATH="../data"
 
+################################
+# S2
+################################
+
 # Set up user/password for CDSE
-# Note: you need to have an account with CDSE to download data
+# Note: you need to have an account with CDSE to download S2 data
 # export CDSE_USERNAME="<email>"
 # export CDSE_PASSWORD_FILE="$HOME/.cdse/cdse_pw"  # ensure chmod 600 on this file or it won't read
 
@@ -30,6 +34,22 @@ sentinel-py cdse download \
   --config $HOME/.s5cfg \
   --log $LOGPATH/${LOGFILENAME}
 
+################################
+# S1
+################################
+
+# Set up user/password for ASF
+# Note: you need to have an account with earthdata to download. You can do:
+
+# cat > "$HOME/.earthdata.netrc" <<'EOF'
+# machine urs.earthdata.nasa.gov
+#     login YOUR_EARTHDATA_USERNAME
+#     password YOUR_EARTHDATA_PASSWORD
+# EOF
+# chmod 600 "$HOME/.earthdata.netrc"
+
+# And then set the --config flag to point to your .netrc file
+
 # Query/Download all Sentinel-1 summer scenes for 2023–2024
 sentinel-py asf query \
   --aoi $AOI \
@@ -39,6 +59,6 @@ sentinel-py asf query \
 
 sentinel-py asf download \
   --outdir $OUTPATH/s1/raw \
-  --config $HOME/.netrc \
+  --config $HOME/.earthdata.netrc \
   --processes 8 \
   

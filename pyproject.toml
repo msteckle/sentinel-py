@@ -10,7 +10,6 @@ requires-python = ">=3.13"
 dependencies = [
     "asf-search>=12.0.7",
     "folium>=0.20.0",
-    "gdal==3.4.3",
     "geopandas>=1.1.1",
     "lxml>=6.0.2",
     "matplotlib>=3.10.8",
@@ -23,6 +22,11 @@ dependencies = [
     "s5cmd>=0.3.3",
     "shapely>=2.1.2",
     "typer>=0.20.0",
+]
+
+[project.optional-dependencies]
+processing = [
+    "gdal>=3.11.5",
 ]
 
 [project.scripts]

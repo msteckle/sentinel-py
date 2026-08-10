@@ -546,12 +546,12 @@ def create_masked_vrt(
     """
     Create a VRT that masks `band_path` using the SCL layer.
 
-    Because GDAL is version 3.4.3:
-    - Warp SCL to the band grid first:
+    The implementation:
+    - Warps SCL to the band grid first:
         * 10/20m band: nearest resampling of SCL classes
         * 60m band: build binary 20m mask, then warp with max
-    - Build a 2-band VRT stack (band + aligned mask/SCL)
-    - Convert band 1 to derived and run scl_mask(band, scl_or_binarymask)
+    - Builds a 2-band VRT stack (band + aligned mask/SCL)
+    - Converts band 1 to derived and runs scl_mask(band, scl_or_binarymask)
     """
     band_path = Path(band_path)
     scl_jp2_path = Path(scl_jp2_path)

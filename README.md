@@ -1,26 +1,83 @@
 ### Requirements
-- Python 3.7+
-- [SNAP 9.0+](https://step.esa.int/main/download/snap-download/previous-versions/)
-- [GDAL 3.4.3](https://gdal.org/en/stable/download_past.html)
-- [uv 0.7.6+](https://docs.astral.sh/uv/getting-started/installation/#pypi)
+
+- Python 3.13+
+- [uv 0.11.7+](https://docs.astral.sh/uv/getting-started/installation/)
+
+Querying and downloading data do not require the Python GDAL bindings or SNAP.
+Sentinel-2 raster processing requires GDAL 3.11.5 or newer; install it with the
+optional `processing` dependency described below. The Python bindings must be built
+against the same version of the native GDAL library available in the environment.
 
 ### Installation
+
 1. Clone the repository:
+
 ```bash
 git clone https://github.com/msteckle/sentinel-py.git
 cd sentinel-py
 ```
 
-2. Install the required Python packages with uv:
+2. Create the environment for querying and downloading:
+
 ```bash
-uv pip install -e .
+uv sync --no-dev
 ```
 
-3. Set up the SNAP environment:
+Run commands through uv, or activate the environment first:
+
 ```bash
-export SNAP_HOME=/path/to/snap/bin
-export PYTHONPATH=$SNAP_HOME/snap-python:$PYTHONPATH
+uv run sentinel-py --help
+# or
+source .venv/bin/activate
+sentinel-py --help
 ```
+
+To include the optional Sentinel-2 raster-processing dependencies:
+
+```bash
+uv sync --no-dev --extra processing
+```
+
+GDAL's Python package compiles against a native GDAL installation. If this command
+cannot find `gdal-config`, or reports a version mismatch, install/load a native GDAL
+3.11.5+ build first and ensure its `gdal-config` is on `PATH`. This does not affect
+the default query/download installation.
+
+### NERSC (Perlmutter)
+
+For query and download work on Perlmutter, no GDAL module or GDAL Python binding is
+needed. After cloning the repository and installing
+[uv](https://docs.astral.sh/uv/getting-started/installation/) in your user account:
+
+```bash
+cd ~/morgandir/sentinel-py
+uv sync --no-dev
+uv run sentinel-py --help
+```
+
+The first command creates `.venv` and installs only the base query/download
+dependencies. Do not pass `--extra processing` unless the job will run the
+GDAL-based Sentinel-2 processing commands.
+
+Large downloads should go to Perlmutter scratch rather than your home directory.
+For example:
+
+```bash
+mkdir -p "$SCRATCH/sentinel-py/data/s1/raw"
+
+uv run sentinel-py asf download \
+  --outdir "$SCRATCH/sentinel-py/data/s1/raw" \
+  --config "$HOME/.earthdata.netrc" \
+  --query .asf-cache/QUERY_KEY/manifest.parquet
+```
+
+Scratch is intended for temporary, high-performance storage and is not backed up;
+move results that must be retained to an appropriate persistent NERSC filesystem.
+For shared installations, NERSC recommends a versioned prefix under
+`/global/common/software/<project>/`, which is mounted read-only on compute nodes;
+keep writable caches and downloaded data outside that installation directory. See
+the [NERSC software installation guide](https://docs.nersc.gov/development/installing-sharing-software/)
+and [Perlmutter scratch documentation](https://docs.nersc.gov/filesystems/perlmutter-scratch/).
 
 ### Downloading S2
 To download Sentinel-2 data, you will need to have an account on the [Copernicus Open Access Hub](https://scihub.copernicus.eu/dhus/#/home) and obtain your credentials. Once you have your credentials, you can use the CLI to download data. We recommend exporting your credentials as environment variables for convenience:

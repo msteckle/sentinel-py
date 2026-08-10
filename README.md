@@ -50,7 +50,7 @@ needed. After cloning the repository and installing
 [uv](https://docs.astral.sh/uv/getting-started/installation/) in your user account:
 
 ```bash
-cd ~/morgandir/sentinel-py
+cd sentinel-py
 uv sync --no-dev
 uv run sentinel-py --help
 ```

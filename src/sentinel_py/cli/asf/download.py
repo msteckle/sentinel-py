@@ -5,10 +5,16 @@ import pandas as pd
 import typer
 
 from sentinel_py.cache import DEFAULT_ASF_CACHE_DIR, find_latest_cache_file
+from sentinel_py.cli.download_preflight import (
+    confirm_download,
+    echo_storage_summary,
+)
 from sentinel_py.download.asf import (
+    _product_filename,
     download_asf,
     earthdata_netrc_credentials,
 )
+from sentinel_py.download.preflight import DownloadStorageSummary
 from sentinel_py.log import DEFAULT_LOG_DIR, get_logger
 
 app = typer.Typer()
@@ -31,6 +37,45 @@ def _earthdata_config_error(config: Path) -> typer.BadParameter:
 def _validate_earthdata_config(config: Path) -> None:
     if earthdata_netrc_credentials(config) is None:
         raise _earthdata_config_error(config)
+
+
+def _storage_summary(products: pd.DataFrame, outdir: Path) -> DownloadStorageSummary:
+    """Calculate known final and additional bytes for an ASF manifest."""
+    known_total = 0
+    known_additional = 0
+    unknown = 0
+
+    for product in products.to_dict("records"):
+        expected = product.get("expected_size")
+        if expected is None or pd.isna(expected):
+            size_mb = product.get("sizeMB")
+            expected = (
+                round(float(size_mb) * 1024 * 1024)
+                if size_mb is not None and not pd.isna(size_mb)
+                else None
+            )
+        expected = int(expected) if expected is not None else None
+        if expected is None or expected <= 0:
+            unknown += 1
+            continue
+
+        known_total += expected
+        local_path = outdir / _product_filename(product)
+        try:
+            already_complete = (
+                local_path.is_file() and local_path.stat().st_size == expected
+            )
+        except OSError:
+            already_complete = False
+        if not already_complete:
+            known_additional += expected
+
+    return DownloadStorageSummary(
+        asset_count=len(products),
+        known_total_bytes=known_total,
+        known_additional_bytes=known_additional,
+        unknown_size_assets=unknown,
+    )
 
 
 @app.command(help="Download products from an explicit or cached ASF query manifest.")
@@ -79,6 +124,15 @@ def download(
             rich_help_panel="Optional Download Configurations",
         ),
     ] = 3,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            "-y",
+            help="Skip the interactive download confirmation.",
+            rich_help_panel="Optional Download Configurations",
+        ),
+    ] = False,
     cache_dir: Annotated[
         Path,
         typer.Option(
@@ -139,10 +193,23 @@ def download(
         typer.echo("Found 0 scenes: 0 ZIP files")
         raise typer.Exit()
 
-    # Create output directory and download products
-    outdir.mkdir(parents=True, exist_ok=True)
     zip_label = "ZIP file" if len(products) == 1 else "ZIP files"
     typer.echo(f"Found {len(products)} scenes: {len(products)} {zip_label}")
+    storage = _storage_summary(products, outdir)
+    echo_storage_summary(storage)
+    logger.info(
+        "ASF download preflight: manifest=%s assets=%d known_total_bytes=%d "
+        "known_additional_bytes=%d unknown_size_assets=%d",
+        manifest,
+        storage.asset_count,
+        storage.known_total_bytes,
+        storage.known_additional_bytes,
+        storage.unknown_size_assets,
+    )
+    confirm_download(assume_yes=yes)
+
+    # Create output directory and download products
+    outdir.mkdir(parents=True, exist_ok=True)
     logger.info(
         "Downloading %d unique ASF products to %s with %d processes and %d retries",
         len(products),

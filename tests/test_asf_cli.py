@@ -678,6 +678,7 @@ def test_asf_download_cli_reads_cached_query_and_config(tmp_path: Path, monkeypa
             "2",
             "--retries",
             "5",
+            "--yes",
             "--log",
             str(tmp_path / "asf-download"),
             "--verbose",
@@ -748,6 +749,7 @@ def test_asf_download_cli_uses_latest_cached_query(tmp_path: Path, monkeypatch):
             str(tmp_path / "downloads"),
             "--config",
             str(config),
+            "--yes",
         ],
     )
 
@@ -796,6 +798,7 @@ def test_asf_download_cli_uses_explicit_query_manifest(
             str(explicit),
             "--config",
             str(config),
+            "--yes",
         ],
     )
 
@@ -835,11 +838,64 @@ def test_asf_download_cli_exits_nonzero_when_a_product_fails(
             str(manifest),
             "--config",
             str(config),
+            "--yes",
         ],
     )
 
     assert result.exit_code == 1
     assert "1 failed ASF product" in result.stderr
+
+
+def test_asf_download_cli_reports_storage_and_can_cancel(tmp_path: Path, monkeypatch):
+    manifest = tmp_path / "manifest.parquet"
+    pd.DataFrame(
+        {
+            "url": [
+                "https://example.test/already.zip",
+                "https://example.test/missing.zip",
+            ],
+            "expected_size": [100, 200],
+        }
+    ).to_parquet(manifest, index=False)
+    config = tmp_path / "earthdata.netrc"
+    _write_earthdata_config(config)
+    outdir = tmp_path / "downloads"
+    outdir.mkdir()
+    (outdir / "already.zip").write_bytes(b"x" * 100)
+
+    called = False
+
+    def fake_download_asf(**kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(
+        "sentinel_py.cli.asf.download.download_asf",
+        fake_download_asf,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "asf",
+            "download",
+            "--outdir",
+            str(outdir),
+            "--query",
+            str(manifest),
+            "--config",
+            str(config),
+        ],
+        input="n\n",
+    )
+
+    assert result.exit_code == 0, result.stderr
+    assert not called
+    assert f"Cached query: {manifest}" in result.stdout
+    assert "Known dataset size: 300 B" in result.stdout
+    assert "Known additional storage needed: 200 B" in result.stdout
+    assert "Continue with download? [y/N]: n" in result.stdout
+    assert "Download cancelled." in result.stdout
 
 
 def test_asf_download_cli_explains_invalid_config(tmp_path: Path):

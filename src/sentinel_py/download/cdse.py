@@ -36,6 +36,7 @@ from sentinel_py.cache import (
     write_json_atomic,
     write_parquet_atomic,
 )
+from sentinel_py.download.preflight import DownloadStorageSummary
 
 # fix some phidown limitations
 _phidown_search.REQUEST_TIMEOUT_SECONDS = 120
@@ -1230,6 +1231,206 @@ def _download_scene_from_images(
 # --------------------------------------------------------------------------------------
 # Download multiple scenes given cached query results
 # --------------------------------------------------------------------------------------
+
+
+def prepare_cdse_download(
+    scenes_cache: Path,
+    mission: str,
+    bands: list[str],
+    resolution: int,
+    output_dir: Path,
+    config_file: str = ".s5cfg",
+    parallel_scenes: int = 2,
+    logger: Optional[logging.Logger] = None,
+) -> DownloadStorageSummary:
+    """Build a metadata-only download plan and calculate its storage requirements.
+
+    The CDSE query manifest identifies scenes, but it does not contain the sizes of
+    the individual bands and metadata files selected by the download command. This
+    preflight therefore reuses previously resolved asset metadata when possible and
+    lists only missing assets in CDSE S3. It caches those listings, compares their
+    expected sizes with files already present in ``output_dir``, and returns the
+    resulting storage summary. It does not download image or metadata content.
+    """
+    logger = logger or logging.getLogger(__name__)
+
+    # 1. Load the query manifest and fail early if it cannot identify a scene and its
+    #    corresponding CDSE S3 product directory.
+    scenes = pd.read_parquet(scenes_cache)
+    required_cols = {"Name", "S3Path"}
+    if not required_cols.issubset(scenes.columns):
+        raise ValueError(
+            "Scenes parquet missing required columns: "
+            f"{required_cols - set(scenes.columns)}"
+        )
+
+    # 2. Load the shared remote-asset cache. Unlike the output-scoped download state,
+    #    this cache records which S3 objects belong to each scene and their sizes, so
+    #    it can be reused by different queries and output directories.
+    images_file = Path(scenes_cache).parent.parent / "all_downloaded_images.parquet"
+    cached_images = (
+        pd.read_parquet(images_file) if images_file.exists() else pd.DataFrame()
+    )
+    if not cached_images.empty and "local_actual_size" not in cached_images.columns:
+        cached_images["local_actual_size"] = None
+
+    # 3. Convert the requested Sentinel-2 bands to resolutions that actually exist in
+    #    CDSE. For example, a requested resolution may need the repository's documented
+    #    fallback resolution. The S1 branch remains available to the lower-level API.
+    if mission.upper() == "S2":
+        resolved_bands = _resolve_s2_bands(bands, resolution, logger)
+    else:
+        resolved_bands = None
+
+    def _selected_cached_assets(scene_name: str) -> list[dict] | None:
+        """Return a complete cached asset selection, or None if S3 must be listed."""
+        if cached_images.empty or "safedir" not in cached_images.columns:
+            return None
+        scene_assets = cached_images[cached_images["safedir"] == scene_name]
+        if scene_assets.empty:
+            return None
+
+        if mission.upper() == "S2" and resolved_bands is not None:
+            is_l1c = "MSIL1C" in scene_name.upper()
+            requested_keys = {
+                (band.band, 0 if is_l1c else band.resolution) for band in resolved_bands
+            }
+            metadata_names = {
+                "MTD_MSIL1C" if is_l1c else "MTD_MSIL2A",
+                "MTD_TL",
+            }
+
+            # A cached scene is usable only if it contains every requested
+            # band/resolution pair and both required SAFE metadata files.
+            available_keys = set(
+                zip(
+                    scene_assets["band_name"].astype(str),
+                    scene_assets["resolution_m"].fillna(0).astype(int),
+                )
+            )
+            available_names = set(scene_assets["band_name"].astype(str))
+            if not requested_keys.issubset(
+                available_keys
+            ) or not metadata_names.issubset(available_names):
+                return None
+
+            # Ignore other bands that may have been resolved by an earlier command;
+            # only the assets belonging to this request contribute to its size.
+            selected = scene_assets[
+                scene_assets.apply(
+                    lambda row: (
+                        (str(row["band_name"]), int(row.get("resolution_m") or 0))
+                        in requested_keys
+                        or str(row["band_name"]) in metadata_names
+                    ),
+                    axis=1,
+                )
+            ]
+        else:
+            # Sentinel-1 assets have no band-resolution pairing or SAFE metadata
+            # requirement, so names alone determine whether the cache is complete.
+            requested_names = {band.upper() for band in bands}
+            available_names = set(scene_assets["band_name"].astype(str).str.upper())
+            if not requested_names.issubset(available_names):
+                return None
+            selected = scene_assets[
+                scene_assets["band_name"].astype(str).str.upper().isin(requested_names)
+            ]
+        return selected.to_dict("records")
+
+    # 4. Partition the manifest into scenes whose requested assets are fully described
+    #    by the cache and scenes that still require metadata-only S3 listings.
+    selected_by_scene: dict[str, list[dict]] = {}
+    rows_to_resolve: list[pd.Series] = []
+    for _, row in scenes.iterrows():
+        scene_name = str(row["Name"])
+        selected = _selected_cached_assets(scene_name)
+        if selected is None:
+            rows_to_resolve.append(row)
+        else:
+            selected_by_scene[scene_name] = selected
+
+    def _resolve(row: pd.Series) -> tuple[str, list[dict]]:
+        """List one scene's requested S3 objects without downloading their content."""
+        scene_name = str(row["Name"])
+        s3_path = str(row["S3Path"])
+        if mission.upper() == "S2":
+            if resolved_bands is None:
+                raise ValueError("Resolved Sentinel-2 bands are unavailable")
+            images = _find_s2_scene_images(
+                scene_name,
+                s3_path,
+                resolved_bands,
+                config_file,
+                logger=logger,
+            )
+        elif mission.upper() == "S1":
+            images = _find_s1_scene_images(
+                scene_name,
+                s3_path,
+                bands,
+                config_file,
+                logger=logger,
+            )
+        else:
+            raise ValueError(f"Unsupported mission: {mission}")
+        return scene_name, images
+
+    # 5. Resolve uncached scenes concurrently. The returned rows contain S3 paths and
+    #    reported sizes only; the actual file-transfer functions are not called here.
+    newly_resolved: list[dict] = []
+    if rows_to_resolve:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+        ) as progress:
+            task_id = progress.add_task(
+                "Resolving assets for storage estimate",
+                total=len(rows_to_resolve),
+            )
+            with ThreadPoolExecutor(max_workers=parallel_scenes) as pool:
+                futures = [pool.submit(_resolve, row) for row in rows_to_resolve]
+                for future in as_completed(futures):
+                    scene_name, images = future.result()
+                    selected_by_scene[scene_name] = images
+                    newly_resolved.extend(images)
+                    progress.update(task_id, advance=1)
+
+    # 6. Persist newly discovered remote metadata. A cancelled download can therefore
+    #    reuse this preflight work the next time it is invoked.
+    if newly_resolved:
+        combined = _merge_image_rows(cached_images, newly_resolved)
+        write_protected_parquet(combined, images_file)
+        logger.info(
+            "Cached %d resolved CDSE asset row(s) in %s",
+            len(newly_resolved),
+            images_file,
+        )
+
+    # 7. Sum the final dataset footprint and the additional bytes currently needed.
+    #    _scene_storage_bytes stats local files, so correctly sized existing assets do
+    #    not count toward additional storage. Unknown S3 sizes are reported separately.
+    known_total = 0
+    known_additional = 0
+    unknown = 0
+    asset_count = 0
+    for scene_name in scenes["Name"].astype(str):
+        images = selected_by_scene.get(scene_name, [])
+        asset_count += len(images)
+        footprint, additional = _scene_storage_bytes(scene_name, images, output_dir)
+        known_total += footprint
+        known_additional += additional
+        unknown += sum(int(image.get("s3_expected_size") or 0) <= 0 for image in images)
+
+    return DownloadStorageSummary(
+        asset_count=asset_count,
+        known_total_bytes=known_total,
+        known_additional_bytes=known_additional,
+        unknown_size_assets=unknown,
+    )
 
 
 def resolve_and_download(

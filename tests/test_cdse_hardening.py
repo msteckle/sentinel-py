@@ -378,6 +378,11 @@ def test_download_cli_exits_nonzero_for_required_asset_failure(
             )
         ],
     )
+    monkeypatch.setattr(
+        cdse,
+        "prepare_cdse_download",
+        lambda **kwargs: cdse.DownloadStorageSummary(3, 300, 300),
+    )
 
     result = runner.invoke(
         app,
@@ -396,6 +401,7 @@ def test_download_cli_exits_nonzero_for_required_asset_failure(
             str(config),
             "--query",
             str(query),
+            "--yes",
         ],
     )
 

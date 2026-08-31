@@ -194,6 +194,19 @@ sentinel-py asf download \
   --retries 3
 ```
 
+Before transferring files, both ASF and CDSE download commands print the selected
+manifest, resolved asset count, known final dataset size, known additional storage
+needed after accounting for valid local files, and the number of assets with unknown
+sizes. They then use a standard `Continue with download? [y/N]` confirmation. CDSE
+resolves and caches the requested S3 asset metadata before displaying this summary;
+that preflight does not download image data. Pass `--yes` (or `-y`) only for an
+intentional noninteractive run, such as a batch script:
+
+```bash
+sentinel-py asf download ... --yes
+sentinel-py cdse download ... --yes
+```
+
 The credentials path is required for every ASF download command, matching CDSE's
 required `--config` workflow.
 

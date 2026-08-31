@@ -6,6 +6,7 @@ from typer.testing import CliRunner
 
 from sentinel_py.cache import DEFAULT_CDSE_CACHE_DIR
 from sentinel_py.cli.main import app
+from sentinel_py.download.preflight import DownloadStorageSummary
 from sentinel_py.enums import CDSECollections, validate_product, validate_serial_id
 
 runner = CliRunner()
@@ -216,6 +217,9 @@ def test_cdse_download_discovers_query_in_hidden_default_cache(
     def fake_resolve_and_download(**kwargs):
         calls.update(kwargs)
 
+    def fake_prepare_cdse_download(**kwargs):
+        return DownloadStorageSummary(2, 300, 300)
+
     monkeypatch.setattr(
         "sentinel_py.download.cdse.find_latest_scenes_cache",
         fake_find_latest,
@@ -223,6 +227,10 @@ def test_cdse_download_discovers_query_in_hidden_default_cache(
     monkeypatch.setattr(
         "sentinel_py.download.cdse.resolve_and_download",
         fake_resolve_and_download,
+    )
+    monkeypatch.setattr(
+        "sentinel_py.download.cdse.prepare_cdse_download",
+        fake_prepare_cdse_download,
     )
 
     result = runner.invoke(
@@ -240,6 +248,7 @@ def test_cdse_download_discovers_query_in_hidden_default_cache(
             "20",
             "--config",
             str(config),
+            "--yes",
         ],
     )
 
@@ -278,9 +287,16 @@ def test_cdse_download_parses_supplied_parameters_before_downloading(
         calls.update(kwargs)
         return []
 
+    def fake_prepare_cdse_download(**kwargs):
+        return DownloadStorageSummary(4, 400, 400)
+
     monkeypatch.setattr(
         "sentinel_py.download.cdse.resolve_and_download",
         fake_resolve_and_download,
+    )
+    monkeypatch.setattr(
+        "sentinel_py.download.cdse.prepare_cdse_download",
+        fake_prepare_cdse_download,
     )
 
     result = runner.invoke(
@@ -304,6 +320,7 @@ def test_cdse_download_parses_supplied_parameters_before_downloading(
             "3",
             "--parallel-bands",
             "2",
+            "--yes",
         ],
     )
 

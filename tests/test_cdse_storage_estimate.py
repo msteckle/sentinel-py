@@ -1,10 +1,13 @@
 from pathlib import Path
 
+import pandas as pd
+
 from sentinel_py.download.cdse import (
     StorageEstimator,
     _format_bytes,
     _scene_storage_bytes,
     _storage_progress_text,
+    prepare_cdse_download,
 )
 
 
@@ -73,3 +76,73 @@ def test_storage_display_warns_when_estimate_exceeds_free_space():
 def test_format_bytes_uses_iec_units():
     assert _format_bytes(0) == "0 B"
     assert _format_bytes(1536) == "1.5 KiB"
+
+
+def test_prepare_cdse_download_resolves_sizes_without_downloading(
+    tmp_path: Path,
+    monkeypatch,
+):
+    scenes_cache = tmp_path / "cache" / "query" / "scenes.parquet"
+    scenes_cache.parent.mkdir(parents=True)
+    scene_name = "S2A_TEST_MSIL2A.SAFE"
+    pd.DataFrame({"Name": [scene_name], "S3Path": ["/eodata/test"]}).to_parquet(
+        scenes_cache, index=False
+    )
+    output_dir = tmp_path / "downloads"
+    existing = output_dir / scene_name / "B04.jp2"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"x" * 100)
+
+    def fake_find_images(*args, **kwargs):
+        return [
+            {
+                "safedir": scene_name,
+                "s3_path": "/test",
+                "band_name": "B04",
+                "resolution_m": 20,
+                "img_path_in_safedir": "B04.jp2",
+                "s3_expected_size": 100,
+                "local_actual_size": None,
+                "asset_type": "image",
+            },
+            {
+                "safedir": scene_name,
+                "s3_path": "/test",
+                "band_name": "MTD_MSIL2A",
+                "resolution_m": 0,
+                "img_path_in_safedir": "MTD_MSIL2A.xml",
+                "s3_expected_size": 10,
+                "local_actual_size": None,
+                "asset_type": "metadata",
+            },
+            {
+                "safedir": scene_name,
+                "s3_path": "/test",
+                "band_name": "MTD_TL",
+                "resolution_m": 0,
+                "img_path_in_safedir": "GRANULE/MTD_TL.xml",
+                "s3_expected_size": 5,
+                "local_actual_size": None,
+                "asset_type": "metadata",
+            },
+        ]
+
+    monkeypatch.setattr(
+        "sentinel_py.download.cdse._find_s2_scene_images",
+        fake_find_images,
+    )
+
+    summary = prepare_cdse_download(
+        scenes_cache=scenes_cache,
+        mission="S2",
+        bands=["B04"],
+        resolution=20,
+        output_dir=output_dir,
+        config_file=str(tmp_path / ".s5cfg"),
+    )
+
+    assert summary.asset_count == 3
+    assert summary.known_total_bytes == 115
+    assert summary.known_additional_bytes == 15
+    assert summary.unknown_size_assets == 0
+    assert (tmp_path / "cache" / "all_downloaded_images.parquet").exists()

@@ -4,10 +4,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Annotated, Optional
 
-import typer
 import pandas as pd
+import typer
 
 from sentinel_py.cache import DEFAULT_CDSE_CACHE_DIR
+from sentinel_py.cli.download_preflight import confirm_download, echo_storage_summary
 from sentinel_py.log import DEFAULT_LOG_DIR, get_logger
 
 app = typer.Typer()
@@ -172,6 +173,15 @@ def download(
             rich_help_panel="Optional Download Configurations",
         ),
     ] = 4,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            "-y",
+            help="Skip the interactive download confirmation.",
+            rich_help_panel="Optional Download Configurations",
+        ),
+    ] = False,
     cache_dir: Annotated[
         Path,
         typer.Option(
@@ -204,6 +214,7 @@ def download(
 
     from sentinel_py.download.cdse import (
         find_latest_scenes_cache,
+        prepare_cdse_download,
         resolve_and_download,
     )
 
@@ -238,6 +249,8 @@ def download(
         if not query:
             raise typer.BadParameter(f"No scenes.parquet found in {cache_dir}")
         logger.info(f"Using most recent query cache: {query}")
+    else:
+        logger.info("Using explicit query cache: %s", query)
 
     scenes = pd.read_parquet(query, columns=["Name"])
     scene_count = len(scenes)
@@ -248,6 +261,27 @@ def download(
         f"Found {scene_count} scenes: "
         f"{requested_images_per_scene} requested {image_label} per scene"
     )
+    storage = prepare_cdse_download(
+        scenes_cache=query,
+        mission=mission_value,
+        bands=band_values,
+        resolution=resolution_value,
+        output_dir=outdir,
+        config_file=str(config),
+        parallel_scenes=parallel_scenes,
+        logger=logger,
+    )
+    echo_storage_summary(storage)
+    logger.info(
+        "CDSE download preflight: manifest=%s assets=%d known_total_bytes=%d "
+        "known_additional_bytes=%d unknown_size_assets=%d",
+        query,
+        storage.asset_count,
+        storage.known_total_bytes,
+        storage.known_additional_bytes,
+        storage.unknown_size_assets,
+    )
+    confirm_download(assume_yes=yes)
 
     started = time.time()
     started_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started))

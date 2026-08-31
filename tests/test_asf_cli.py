@@ -104,10 +104,12 @@ def test_query_asf_translates_multipoint_to_cmr_point_or(monkeypatch):
         date_start="2024-01-01",
         date_end="2024-01-02",
         product_levels=["GRD_HD"],
+        season=[1, 2],
     )
 
     assert len(calls) == 1
     assert "intersectsWith" not in calls[0]
+    assert calls[0]["season"] == [1, 2]
     assert calls[0]["cmr_keywords"] == [
         ("point", "-150.0,68.0"),
         ("point", "20.0,-30.0"),
@@ -383,6 +385,7 @@ def test_asf_query_cli_caches_manifest(tmp_path: Path, monkeypatch):
     assert query_args["polarization"] == "VV+VH"
     assert query_args["date_start"] == "2024-06-01"
     assert query_args["date_end"] == "2024-08-31"
+    assert query_args["season"] == [152, 243]
     assert "ASCENDING=2, DESCENDING=1; selected ASCENDING" in result.stdout
     assert "Found 2 unique ASF product" in result.stdout
     assert (tmp_path / ".asf-cache").is_dir()
@@ -512,7 +515,7 @@ def test_asf_query_warns_when_max_results_may_truncate_window(
     assert "cached manifest may be truncated" in cached_result.stderr
 
 
-def test_asf_query_cli_queries_each_year_and_reads_projected_shapefile(
+def test_asf_query_cli_uses_one_seasonal_range_and_reads_projected_shapefile(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -528,12 +531,11 @@ def test_asf_query_cli_queries_each_year_and_reads_projected_shapefile(
 
     def fake_query_asf(**kwargs):
         calls.append(kwargs)
-        year = kwargs["date_start"][:4]
         return pd.DataFrame(
             [
                 {
-                    "granule": f"S1-{year}.zip",
-                    "url": f"https://example.test/S1-{year}.zip",
+                    "granule": "S1-seasonal.zip",
+                    "url": "https://example.test/S1-seasonal.zip",
                     "flightDirection": "ASCENDING",
                 }
             ]
@@ -560,12 +562,12 @@ def test_asf_query_cli_queries_each_year_and_reads_projected_shapefile(
     )
 
     assert result.exit_code == 0, result.stderr
-    assert [(call["date_start"], call["date_end"]) for call in calls] == [
-        ("2023-06-01", "2023-08-31"),
-        ("2024-06-01", "2024-08-31"),
-    ]
+    assert len(calls) == 1
+    assert calls[0]["date_start"] == "2023-06-01"
+    assert calls[0]["date_end"] == "2024-08-31"
+    assert calls[0]["season"] == [152, 243]
     cached_manifest = next(cache_dir.glob("*/manifest.parquet"))
-    assert len(pd.read_parquet(cached_manifest)) == 2
+    assert len(pd.read_parquet(cached_manifest)) == 1
     minx, miny, maxx, maxy = shapely.from_wkt(calls[0]["aoi_wkt"]).bounds
     assert minx == pytest.approx(-150.0)
     assert miny == pytest.approx(68.0)
@@ -614,7 +616,8 @@ def test_asf_query_cli_preserves_multipoint_for_cmr_point_or(
     )
 
     assert result.exit_code == 0, result.stderr
-    assert len(calls) == 2
+    assert len(calls) == 1
+    assert calls[0]["season"] == [1, 365]
     assert all(
         shapely.from_wkt(call["aoi_wkt"]).geom_type == "MultiPoint" for call in calls
     )

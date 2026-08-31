@@ -73,6 +73,13 @@ def _seasonal_date(year: int, period: dt.datetime) -> dt.date:
     return dt.date(year, period.month, day)
 
 
+def _season_day(period: dt.datetime) -> int:
+    """Return ASF's 1-based, non-leap day-of-year for a month/day period."""
+    if (period.month, period.day) == (2, 29):
+        return 60
+    return dt.date(2001, period.month, period.day).timetuple().tm_yday
+
+
 @app.command(help="Query ASF for Sentinel-1 products and cache a download manifest.")
 def query(
     aoi: Annotated[
@@ -167,7 +174,7 @@ def query(
     max_results: Annotated[
         Optional[int],
         typer.Option(
-            help="Optionally set maximum result count per yearly window.",
+            help="Optionally set the maximum result count for the complete query.",
             min=1,
             rich_help_panel="Optional Query Configurations",
         ),
@@ -231,6 +238,8 @@ def query(
         )
         for year in parsed_years
     ]
+    query_range = (query_windows[0][0], query_windows[-1][1])
+    season = [_season_day(speriod), _season_day(eperiod)]
 
     aoi_gdf = gpd.read_file(aoi)
     if aoi_gdf.empty:
@@ -264,6 +273,9 @@ def query(
         "speriod": f"{speriod.month:02d}-{speriod.day:02d}",
         "eperiod": f"{eperiod.month:02d}-{eperiod.day:02d}",
         "windows": query_windows,
+        "query_range": query_range,
+        "season": season,
+        "temporal_query_strategy": "asf_season_v1",
         "product_levels": levels,
         "beam_mode": beam_mode_value,
         "flight_direction": direction_value,
@@ -285,9 +297,11 @@ def query(
     selected_direction: str | None = None
     possibly_truncated_windows: list[dict[str, object]] = []
     logger.info(
-        "ASF query configured: aoi=%s years=%s windows=%s cache=%s",
+        "ASF query configured: aoi=%s years=%s range=%s season=%s windows=%s cache=%s",
         aoi,
         parsed_years,
+        query_range,
+        season,
         query_windows,
         cached_manifest,
     )
@@ -309,40 +323,34 @@ def query(
     # Otherwise, run the query and cache the results
     else:
         try:
-            yearly_manifests = [
-                query_asf(
-                    aoi_wkt=aoi_wkt,
-                    date_start=start_date,
-                    date_end=end_date,
-                    product_levels=levels,
-                    beam_mode=beam_mode_value,
-                    flight_direction=query_direction,
-                    polarization=polarization_value,
-                    relative_orbit=relative_orbit,
-                    max_results=max_results,
-                    logger=logger,
-                )
-                for start_date, end_date in query_windows
-            ]
+            manifest = query_asf(
+                aoi_wkt=aoi_wkt,
+                date_start=query_range[0],
+                date_end=query_range[1],
+                product_levels=levels,
+                season=season,
+                beam_mode=beam_mode_value,
+                flight_direction=query_direction,
+                polarization=polarization_value,
+                relative_orbit=relative_orbit,
+                max_results=max_results,
+                logger=logger,
+            )
         except ValueError as error:
             logger.error("Invalid ASF query: %s", error)
             raise typer.BadParameter(str(error)) from error
 
         if max_results is not None:
-            possibly_truncated_windows = [
-                {
-                    "start": start_date,
-                    "end": end_date,
-                    "returned": len(yearly_manifest),
-                    "max_results": max_results,
-                }
-                for (start_date, end_date), yearly_manifest in zip(
-                    query_windows, yearly_manifests
-                )
-                if len(yearly_manifest) >= max_results
-            ]
+            if len(manifest) >= max_results:
+                possibly_truncated_windows = [
+                    {
+                        "start": query_range[0],
+                        "end": query_range[1],
+                        "returned": len(manifest),
+                        "max_results": max_results,
+                    }
+                ]
 
-        manifest = pd.concat(yearly_manifests, ignore_index=True)
         if not manifest.empty:
             manifest = (
                 manifest.drop_duplicates(subset=["url"])

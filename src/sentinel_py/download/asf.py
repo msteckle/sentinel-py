@@ -160,6 +160,7 @@ def query_asf(
     date_start: str,
     date_end: str,
     product_levels: list[str],
+    season: list[int] | None = None,
     beam_mode: str = "IW",
     flight_direction: str | None = None,
     polarization: str | None = None,
@@ -211,10 +212,11 @@ def query_asf(
 
     normalized_direction = flight_direction.upper() if flight_direction else None
     logger.info(
-        "Querying ASF: start=%s end=%s product_levels=%s beam_mode=%s "
+        "Querying ASF: start=%s end=%s season=%s product_levels=%s beam_mode=%s "
         "flight_direction=%s polarization=%s relative_orbit=%s max_results=%s",
         date_start,
         date_end,
+        season,
         normalized_levels,
         normalized_beam_mode,
         normalized_direction,
@@ -256,6 +258,7 @@ def query_asf(
                 processingLevel=lvls,
                 start=pd.to_datetime(date_start).date(),
                 end=pd.to_datetime(date_end).date(),
+                season=season,
                 beamMode=getattr(asf.BEAMMODE, normalized_beam_mode),
                 flightDirection=normalized_direction,
                 polarization=normalized_polarization,

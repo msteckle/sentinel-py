@@ -15,6 +15,7 @@ import pandas as pd
 import requests
 from asf_search.download import download_url as asf_download_url
 from asf_search.exceptions import ASFAuthenticationError
+from shapely import wkt
 from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
@@ -92,6 +93,11 @@ ASF_DOWNLOAD_STATE_COLUMNS = [
     "error",
 ]
 ASF_FINGERPRINT_VERSION = 1
+# CMR rejects queries with more than 4,100 total conditions, but spatial OR
+# performance degrades well before that limit. A 100-point global query stays
+# comfortably within both the condition limit and the normal request timeout.
+CMR_POINT_BATCH_SIZE = 100
+CMR_POINT_QUERY_WORKERS = 8
 
 
 @dataclass(frozen=True)
@@ -218,28 +224,64 @@ def query_asf(
     )
     logger.debug("ASF query AOI WKT: %s", aoi_wkt)
 
+    spatial_option_batches: list[dict[str, object]]
+    aoi_geometry = wkt.loads(aoi_wkt)
+    if aoi_geometry.geom_type == "MultiPoint":
+        points = list(aoi_geometry.geoms)
+        if not points:
+            raise ValueError("MultiPoint AOI must contain at least one point")
+        # CMR supports repeated point parameters with OR semantics. Using
+        # asf_search's raw CMR keyword escape hatch avoids its intersectsWith
+        # validator, which otherwise convex-hulls disconnected geometries.
+        spatial_option_batches = []
+        for offset in range(0, len(points), CMR_POINT_BATCH_SIZE):
+            point_batch = points[offset : offset + CMR_POINT_BATCH_SIZE]
+            cmr_keywords = [("point", f"{point.x},{point.y}") for point in point_batch]
+            cmr_keywords.append(("options[point][or]", "true"))
+            spatial_option_batches.append({"cmr_keywords": cmr_keywords})
+        logger.info(
+            "Querying ASF MultiPoint AOI as %d OR-ed CMR point filters in %d batch(es)",
+            len(points),
+            len(spatial_option_batches),
+        )
+    else:
+        spatial_option_batches = [{"intersectsWith": aoi_wkt}]
+
     # Search ASF for products matching the criteria using the asf_search library
     try:
-        results = asf.search(
-            platform=asf.PLATFORM.SENTINEL1,
-            processingLevel=lvls,
-            start=pd.to_datetime(date_start).date(),
-            end=pd.to_datetime(date_end).date(),
-            beamMode=getattr(asf.BEAMMODE, normalized_beam_mode),
-            intersectsWith=aoi_wkt,
-            flightDirection=normalized_direction,
-            polarization=normalized_polarization,
-            relativeOrbit=relative_orbit,
-            maxResults=max_results,
-        )
+
+        def _search(spatial_options: dict[str, object]):
+            return asf.search(
+                platform=asf.PLATFORM.SENTINEL1,
+                processingLevel=lvls,
+                start=pd.to_datetime(date_start).date(),
+                end=pd.to_datetime(date_end).date(),
+                beamMode=getattr(asf.BEAMMODE, normalized_beam_mode),
+                flightDirection=normalized_direction,
+                polarization=normalized_polarization,
+                relativeOrbit=relative_orbit,
+                maxResults=max_results,
+                **spatial_options,
+            )
+
+        if len(spatial_option_batches) == 1:
+            result_batches = [_search(spatial_option_batches[0])]
+        else:
+            max_workers = min(CMR_POINT_QUERY_WORKERS, len(spatial_option_batches))
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                result_batches = list(pool.map(_search, spatial_option_batches))
     except Exception:
         logger.exception("ASF query failed for %s to %s", date_start, date_end)
         raise
 
     # Convert the results to a GeoJSON and then to a pandas DataFrame
-    geoj = results.geojson()
     rows = []
-    for feat in geoj["features"]:
+    features = [
+        feature
+        for results in result_batches
+        for feature in results.geojson()["features"]
+    ]
+    for feat in features:
         prop = feat["properties"]
         expected_size = prop.get("bytes")
         expected_size = int(expected_size) if expected_size is not None else None
@@ -269,12 +311,12 @@ def query_asf(
     if df.empty:
         logger.info("ASF query returned 0 products for %s to %s", date_start, date_end)
         return df
-    df = (
-        df.dropna(subset=["url"])
-        .drop_duplicates(subset=["url"])
-        .sort_values("granule")
-        .reset_index(drop=True)
-    )
+    df = df.dropna(subset=["url"]).drop_duplicates(subset=["url"])
+    if max_results is not None and len(df) > max_results:
+        df = df.sort_values(
+            ["stopTime", "granule"], ascending=[False, True], na_position="last"
+        ).head(max_results)
+    df = df.sort_values("granule").reset_index(drop=True)
     logger.info(
         "ASF query returned %d unique products for %s to %s",
         len(df),

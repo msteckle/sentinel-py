@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 from pathlib import Path
 
@@ -87,6 +88,61 @@ def test_query_asf_preserves_exact_size_and_checksum(monkeypatch):
     assert manifest.iloc[0]["expected_size"] == 1048576
     assert manifest.iloc[0]["sizeMB"] == 1.0
     assert manifest.iloc[0]["md5sum"] == "abc123"
+
+
+def test_query_asf_translates_multipoint_to_cmr_point_or(monkeypatch):
+    calls = []
+
+    def fake_search(**kwargs):
+        calls.append(kwargs)
+        return EmptyASFResults()
+
+    monkeypatch.setattr("sentinel_py.download.asf.asf.search", fake_search)
+
+    query_asf(
+        aoi_wkt="MULTIPOINT ((-150 68), (20 -30))",
+        date_start="2024-01-01",
+        date_end="2024-01-02",
+        product_levels=["GRD_HD"],
+    )
+
+    assert len(calls) == 1
+    assert "intersectsWith" not in calls[0]
+    assert calls[0]["cmr_keywords"] == [
+        ("point", "-150.0,68.0"),
+        ("point", "20.0,-30.0"),
+        ("options[point][or]", "true"),
+    ]
+
+
+def test_query_asf_batches_multipoint_for_cmr_condition_limit(monkeypatch):
+    calls = []
+
+    def fake_search(**kwargs):
+        calls.append(kwargs)
+        return EmptyASFResults()
+
+    monkeypatch.setattr("sentinel_py.download.asf.asf.search", fake_search)
+    monkeypatch.setattr("sentinel_py.download.asf.CMR_POINT_BATCH_SIZE", 2)
+
+    query_asf(
+        aoi_wkt="MULTIPOINT ((-150 68), (20 -30), (40 10))",
+        date_start="2024-01-01",
+        date_end="2024-01-02",
+        product_levels=["GRD_HD"],
+    )
+
+    assert len(calls) == 2
+    keyword_batches = [call["cmr_keywords"] for call in calls]
+    assert [
+        ("point", "-150.0,68.0"),
+        ("point", "20.0,-30.0"),
+        ("options[point][or]", "true"),
+    ] in keyword_batches
+    assert [
+        ("point", "40.0,10.0"),
+        ("options[point][or]", "true"),
+    ] in keyword_batches
 
 
 @pytest.mark.parametrize(
@@ -515,6 +571,57 @@ def test_asf_query_cli_queries_each_year_and_reads_projected_shapefile(
     assert miny == pytest.approx(68.0)
     assert maxx == pytest.approx(-149.5)
     assert maxy == pytest.approx(68.5)
+
+
+def test_asf_query_cli_preserves_multipoint_for_cmr_point_or(
+    tmp_path: Path,
+    monkeypatch,
+):
+    aoi = tmp_path / "points.geojson"
+    gpd.GeoDataFrame(
+        geometry=[shapely.MultiPoint([(-150.0, 68.0), (20.0, -30.0)])],
+        crs="EPSG:4326",
+    ).to_file(aoi, driver="GeoJSON")
+    cache_dir = tmp_path / ".asf-cache"
+    calls: list[dict] = []
+
+    def fake_query_asf(**kwargs):
+        calls.append(kwargs)
+        return pd.DataFrame(
+            [
+                {
+                    "granule": "shared.zip",
+                    "url": "https://example.test/shared.zip",
+                    "flightDirection": "ASCENDING",
+                }
+            ]
+        )
+
+    monkeypatch.setattr("sentinel_py.cli.asf.query.query_asf", fake_query_asf)
+
+    result = runner.invoke(
+        app,
+        [
+            "asf",
+            "query",
+            "--aoi",
+            str(aoi),
+            "--years",
+            "2023,2024",
+            "--cache-dir",
+            str(cache_dir),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    assert len(calls) == 2
+    assert all(
+        shapely.from_wkt(call["aoi_wkt"]).geom_type == "MultiPoint" for call in calls
+    )
+    cached_manifest = next(cache_dir.glob("*/manifest.parquet"))
+    assert len(pd.read_parquet(cached_manifest)) == 1
+    query_info = json.loads(next(cache_dir.glob("*/query_info.json")).read_text())
+    assert query_info["spatial_query_strategy"] == "cmr_point_or_v1"
 
 
 def test_asf_download_cli_reads_cached_query_and_config(tmp_path: Path, monkeypatch):

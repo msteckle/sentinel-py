@@ -237,7 +237,8 @@ def query(
         raise typer.BadParameter(f"AOI contains no features: {aoi}")
     if aoi_gdf.crs is None:
         aoi_gdf = aoi_gdf.set_crs(crs)
-    aoi_wkt = aoi_gdf.to_crs("EPSG:4326").geometry.union_all().wkt
+    aoi_geometry = aoi_gdf.to_crs("EPSG:4326").geometry.union_all()
+    aoi_wkt = aoi_geometry.wkt
 
     product_level_value = product_levels.value
     beam_mode_value = beam_mode.value
@@ -270,6 +271,10 @@ def query(
         "relative_orbit": relative_orbit,
         "max_results": max_results,
     }
+    if aoi_geometry.geom_type == "MultiPoint":
+        # Invalidate manifests cached by older versions that queried ASF's convex
+        # hull, as well as the temporary per-point implementation.
+        query_payload["spatial_query_strategy"] = "cmr_point_or_v1"
     query_dir = cache_directory(
         cache_dir,
         deterministic_cache_key(query_payload),

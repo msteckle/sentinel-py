@@ -5,7 +5,9 @@ from typing import Optional
 
 from rich.logging import RichHandler
 
-DEFAULT_LOG_DIR = Path.home() / ".sentinel-py" / "logs"
+from sentinel_py.cache import SENTINEL_PY_HOME
+
+DEFAULT_LOG_DIR = SENTINEL_PY_HOME / "logs"
 
 
 def get_logger(

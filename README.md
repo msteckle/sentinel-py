@@ -68,7 +68,7 @@ mkdir -p "$SCRATCH/sentinel-py/data/s1/raw"
 uv run sentinel-py asf download \
   --outdir "$SCRATCH/sentinel-py/data/s1/raw" \
   --config "$HOME/.earthdata.netrc" \
-  --query .asf-cache/QUERY_KEY/manifest.parquet
+  --query "$HOME/.sentinel-py/cache/asf/QUERY_KEY/manifest.parquet"
 ```
 
 Scratch is intended for temporary, high-performance storage and is not backed up;
@@ -114,10 +114,12 @@ documentation](https://sentiwiki.copernicus.eu/web/s2-products), [ESA Sentinel-2
 mission description](https://sentiwiki.copernicus.eu/web/s2-mission), and [CDSE OData
 documentation](https://documentation.dataspace.copernicus.eu/APIs/OData.html).
 
-CDSE query and image metadata are cached in `.cdse-cache` in the current working
-directory by default. The query and download commands use the same location, so
-`--cache-dir` can normally be omitted from both. Pass it explicitly when you want a
-shared or project-specific cache elsewhere.
+CDSE query manifests, a deduplicated scene catalog, and remote-asset metadata are
+cached in `~/.sentinel-py/cache/cdse` by default. The query and download commands use
+the same location, so `--cache-dir` can normally be omitted from both. Local download
+state remains beside the downloaded data because it describes files at that exact
+storage location. Set `SENTINEL_PY_HOME` to move all default reusable caches and logs,
+or pass `--cache-dir` for a command-specific override.
 
 ### Downloading Sentinel-1 from ASF
 
@@ -165,11 +167,11 @@ that its manifest may be truncated. Rerun with a higher limit or without the opt
 before using that manifest in a complete production workflow.
 
 Identical ASF queries are cached by all spatial, temporal, and product filters. The
-default cache is `.asf-cache` in the current working directory. A cache hit recreates
-the query result without contacting ASF. The download command uses the most recently
-queried cached manifest automatically. For reproducible runs, pass the exact
-`manifest.parquet` using `--query`; use `--cache-dir` on both commands to share a
-different cache location.
+default cache is `~/.sentinel-py/cache/asf`. A cache hit recreates the query result
+without contacting ASF. The download command uses the most recently queried cached
+manifest automatically. For reproducible runs, pass the exact `manifest.parquet`
+using `--query`; use `--cache-dir` on both commands to share a different cache
+location.
 
 ASF downloads require a NASA Earthdata Login account. Create a netrc-format
 credentials file:
@@ -189,7 +191,7 @@ Download every unique URL in the manifest:
 sentinel-py asf download \
   --outdir data/s1/raw \
   --config "$HOME/.earthdata.netrc" \
-  --query .asf-cache/QUERY_KEY/manifest.parquet \
+  --query "$HOME/.sentinel-py/cache/asf/QUERY_KEY/manifest.parquet" \
   --processes 4 \
   --retries 3
 ```

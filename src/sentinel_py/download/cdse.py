@@ -31,7 +31,9 @@ from sentinel_py.cache import (
     cache_directory,
     deterministic_cache_key,
     find_latest_cache_file,
+    legacy_provider_cache_root,
     mark_cache_used,
+    merge_parquet_cache,
     merge_state_rows,
     write_json_atomic,
     write_parquet_atomic,
@@ -81,6 +83,9 @@ SCENE_CACHE_COLUMNS = [
     "query_id",
 ]
 S2_METADATA_ASSETS = {"MTD_MSIL2A", "MTD_MSIL1C", "MTD_TL"}
+CDSE_ASSET_CACHE_NAME = "assets.parquet"
+CDSE_LEGACY_ASSET_CACHE_NAME = "all_downloaded_images.parquet"
+CDSE_SCENE_CATALOG_NAME = "catalog.parquet"
 
 ########################################################################################
 # Variable helpers
@@ -112,15 +117,17 @@ def _fix_date(year: int, month: int, day: int, logger: logging.Logger) -> date:
 ########################################################################################
 
 """
-Sentinel-py (cdse) has 3 levels of caching to avoid redundant queries and downloads:
-1. Query results [.cdse-cache/<query_hash>/scenes.parquet]
+Sentinel-py (cdse) has 4 metadata layers to avoid redundant queries and downloads:
+1. Query results [~/.sentinel-py/cache/cdse/<query_hash>/scenes.parquet]
     - Each unique query gets its own cache directory named by a hash of the parameters
     that the user specified (AOI, date windows, collection/product, etc); this way, if
     you want to re-run a query with the same parameters, you get the cached results 
     immediately without hitting the CDSE API again
-2. Remote asset discovery [.cdse-cache/all_downloaded_images.parquet]
+2. Shared scene catalog [~/.sentinel-py/cache/cdse/catalog.parquet]
+    - Scene footprints and acquisition dates are deduplicated across query manifests
+3. Remote asset discovery [~/.sentinel-py/cache/cdse/assets.parquet]
     - Resolved S3 objects are shared across queries
-3. Local download state [<data_dir>/.sentinel-py/cdse_downloads.parquet]
+4. Local download state [<data_dir>/.sentinel-py/cdse_downloads.parquet]
     - Each output root records verified local files in
       <output>/.sentinel-py/cdse_downloads.parquet. Filesystem checks remain
       authoritative so deleted or truncated assets are restored.
@@ -204,14 +211,59 @@ def find_latest_scenes_cache(cache_root: Path) -> Optional[Path]:
     return find_latest_cache_file(cache_root, "scenes.parquet")
 
 
-def write_protected_parquet(df: pd.DataFrame, path: Path) -> None:
-    """Write a parquet file and set it as read-only to prevent accidental deletion."""
-    write_parquet_atomic(df, path, index=True, read_only=True)
+def cdse_asset_cache_path(cache_root: Path) -> Path:
+    """Return the shared CDSE remote-asset cache path."""
+    return Path(cache_root) / CDSE_ASSET_CACHE_NAME
 
 
-def _merge_image_rows(existing: pd.DataFrame, new_rows: list[dict]) -> pd.DataFrame:
-    """Merge new/updated image row to the downloaded images cache."""
-    return merge_state_rows(existing, new_rows, key_columns=IMAGE_KEY_COLS)
+def cdse_scene_catalog_path(cache_root: Path) -> Path:
+    """Return the deduplicated CDSE scene catalog path."""
+    return Path(cache_root) / CDSE_SCENE_CATALOG_NAME
+
+
+def _read_cdse_asset_cache(cache_root: Path) -> tuple[pd.DataFrame, Path]:
+    """Read the shared asset cache, migrating its legacy filename when needed."""
+    path = cdse_asset_cache_path(cache_root)
+    legacy_path = Path(cache_root) / CDSE_LEGACY_ASSET_CACHE_NAME
+    legacy_root = legacy_provider_cache_root(cache_root)
+    if not legacy_path.is_file() and legacy_root is not None:
+        legacy_path = legacy_root / CDSE_LEGACY_ASSET_CACHE_NAME
+    if path.is_file():
+        return pd.read_parquet(path), path
+    if legacy_path.is_file():
+        cached = pd.read_parquet(legacy_path)
+        migrated = merge_parquet_cache(
+            path,
+            cached,
+            key_columns=IMAGE_KEY_COLS,
+            read_only=True,
+        )
+        return migrated, path
+    return pd.DataFrame(), path
+
+
+def _cdse_cache_root(scenes_cache: Path, cache_dir: Path | None) -> Path:
+    """Resolve the provider cache root for explicit and cached query manifests."""
+    if cache_dir is not None:
+        return Path(cache_dir)
+    return Path(scenes_cache).parent.parent
+
+
+def update_cdse_scene_catalog(
+    cache_root: Path,
+    scenes: pd.DataFrame,
+) -> Path:
+    """Merge query results into the shared spatial and temporal scene catalog."""
+    available_columns = [
+        column for column in SCENE_CACHE_COLUMNS if column in scenes.columns
+    ]
+    catalog_rows = scenes.loc[:, available_columns].copy()
+    key_columns = ["Name"] if "Name" in catalog_rows.columns else ["Id"]
+    if key_columns[0] not in catalog_rows.columns:
+        raise ValueError("CDSE scenes must contain Id or Name to update the catalog")
+    path = cdse_scene_catalog_path(cache_root)
+    merge_parquet_cache(path, catalog_rows, key_columns=key_columns)
+    return path
 
 
 ########################################################################################
@@ -319,6 +371,7 @@ def query_cdse(
         logger.info(f"Loading cached products from {scenes_cache}")
         mark_cache_used(scenes_cache)
         cached = pd.read_parquet(scenes_cache)
+        update_cdse_scene_catalog(cache_dir, cached)
         cached.attrs["cache_path"] = str(scenes_cache)
         return cached
 
@@ -459,12 +512,16 @@ def query_cdse(
     # Save scenes.parquet and query_info.json within query-specific cache directory
     try:
         write_parquet_atomic(scenes, scenes_cache, index=False)
+        catalog_path = update_cdse_scene_catalog(cache_dir, scenes)
         save_query_as_json(
             query_dir,
             collection=collection,
             product=product,
             years=years,
-            period=f"{speriod.month:02d}-{speriod.day:02d} to {eperiod.month:02d}-{eperiod.day:02d}",
+            period=(
+                f"{speriod.month:02d}-{speriod.day:02d} to "
+                f"{eperiod.month:02d}-{eperiod.day:02d}"
+            ),
             aoi=str(aoi),
             cloud_cover=cloud_thresh,
             orbit=orbit,
@@ -483,6 +540,7 @@ def query_cdse(
             num_scenes=len(scenes),
         )
         logger.info(f"Cached scenes to {scenes_cache}")
+        logger.info(f"Updated shared CDSE scene catalog at {catalog_path}")
     except Exception as e:
         raise RuntimeError(f"Failed to cache scenes to {scenes_cache}: {e}") from e
 
@@ -1242,6 +1300,7 @@ def prepare_cdse_download(
     config_file: str = ".s5cfg",
     parallel_scenes: int = 2,
     logger: Optional[logging.Logger] = None,
+    cache_dir: Path | None = None,
 ) -> DownloadStorageSummary:
     """Build a metadata-only download plan and calculate its storage requirements.
 
@@ -1250,7 +1309,9 @@ def prepare_cdse_download(
     preflight therefore reuses previously resolved asset metadata when possible and
     lists only missing assets in CDSE S3. It caches those listings, compares their
     expected sizes with files already present in ``output_dir``, and returns the
-    resulting storage summary. It does not download image or metadata content.
+    resulting storage summary. ``cache_dir`` identifies the shared CDSE cache root;
+    when omitted by lower-level callers, it is inferred from ``scenes_cache``. This
+    function does not download image or metadata content.
     """
     logger = logger or logging.getLogger(__name__)
 
@@ -1267,10 +1328,9 @@ def prepare_cdse_download(
     # 2. Load the shared remote-asset cache. Unlike the output-scoped download state,
     #    this cache records which S3 objects belong to each scene and their sizes, so
     #    it can be reused by different queries and output directories.
-    images_file = Path(scenes_cache).parent.parent / "all_downloaded_images.parquet"
-    cached_images = (
-        pd.read_parquet(images_file) if images_file.exists() else pd.DataFrame()
-    )
+    cache_root = _cdse_cache_root(scenes_cache, cache_dir)
+    update_cdse_scene_catalog(cache_root, scenes)
+    cached_images, images_file = _read_cdse_asset_cache(cache_root)
     if not cached_images.empty and "local_actual_size" not in cached_images.columns:
         cached_images["local_actual_size"] = None
 
@@ -1402,8 +1462,12 @@ def prepare_cdse_download(
     # 6. Persist newly discovered remote metadata. A cancelled download can therefore
     #    reuse this preflight work the next time it is invoked.
     if newly_resolved:
-        combined = _merge_image_rows(cached_images, newly_resolved)
-        write_protected_parquet(combined, images_file)
+        merge_parquet_cache(
+            images_file,
+            pd.DataFrame(newly_resolved),
+            key_columns=IMAGE_KEY_COLS,
+            read_only=True,
+        )
         logger.info(
             "Cached %d resolved CDSE asset row(s) in %s",
             len(newly_resolved),
@@ -1443,6 +1507,7 @@ def resolve_and_download(
     parallel_scenes: int = 2,
     parallel_bands: int = 2,
     logger: Optional[logging.Logger] = None,
+    cache_dir: Path | None = None,
 ) -> list[DownloadResult]:
     """
     Resolve + download pipeline.
@@ -1472,6 +1537,8 @@ def resolve_and_download(
         Concurrent band downloads per scene.
     logger : logging.Logger
         Optional logger instance.
+    cache_dir : Path, optional
+        Shared CDSE cache root. Inferred from ``scenes_cache`` when omitted.
 
     Returns
     -------
@@ -1494,11 +1561,12 @@ def resolve_and_download(
 
     # The cache-root catalog records remote assets resolved from S3. Download state is
     # scoped to output_dir so two storage roots cannot accidentally share local state.
-    images_file = Path(scenes_cache).parent.parent / "all_downloaded_images.parquet"
+    cache_root = _cdse_cache_root(scenes_cache, cache_dir)
+    update_cdse_scene_catalog(cache_root, scenes)
+    cached_images, images_file = _read_cdse_asset_cache(cache_root)
     downloads_file = output_dir / ".sentinel-py" / "cdse_downloads.parquet"
     logger.info(f"Looking for images cache at: {images_file}")
-    if images_file.exists():
-        cached_images = pd.read_parquet(images_file)
+    if not cached_images.empty:
         # ensure local_actual_size column exists for back-compat with older caches
         if "local_actual_size" not in cached_images.columns:
             cached_images["local_actual_size"] = None
@@ -1511,13 +1579,15 @@ def resolve_and_download(
         )
         cached_scene_names = set(cached_images["safedir"].unique())
         logger.info(
-            f"Found {len(cached_scene_names)} scenes ({len(cached_images)} rows) in {images_file}"
+            "Found %d scenes (%d rows) in %s",
+            len(cached_scene_names),
+            len(cached_images),
+            images_file,
         )
         logger.info(f"First 3 cached scenes: {list(cached_scene_names)[:3]}")
         logger.info(f"First 3 query scenes: {scenes['Name'].head(3).tolist()}")
     else:
         logger.info(f"No images cache at {images_file}")
-        cached_images = pd.DataFrame()
         cached_keys = set()
         cached_scene_names = set()
 
@@ -1609,16 +1679,13 @@ def resolve_and_download(
             rows_to_write = list(pending_image_rows)
             pending_image_rows.clear()
 
-        # Read existing image rows from the cache
-        existing = (
-            pd.read_parquet(images_file) if images_file.exists() else pd.DataFrame()
+        # Merge against the latest shared cache while holding its interprocess lock.
+        merge_parquet_cache(
+            images_file,
+            pd.DataFrame(rows_to_write),
+            key_columns=IMAGE_KEY_COLS,
+            read_only=True,
         )
-        # Ensure the local_actual_size column exists for back-compat with older caches
-        if not existing.empty and "local_actual_size" not in existing.columns:
-            existing["local_actual_size"] = None
-        # Merge the new rows with the existing cache, overwriting by key
-        combined = _merge_image_rows(existing, rows_to_write)
-        write_protected_parquet(combined, images_file)
         completed_rows = [
             row for row in rows_to_write if row.get("download_status") == "complete"
         ]

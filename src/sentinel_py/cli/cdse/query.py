@@ -169,7 +169,7 @@ def query(
     cache_dir: Annotated[
         Path,
         typer.Option(
-            help=("Query cache root. Defaults to the current working directory."),
+            help=(f"CDSE query cache root. Defaults to {DEFAULT_CDSE_CACHE_DIR}."),
             file_okay=False,
             rich_help_panel="Utils",
         ),

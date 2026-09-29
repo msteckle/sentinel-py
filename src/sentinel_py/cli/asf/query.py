@@ -182,10 +182,7 @@ def query(
     cache_dir: Annotated[
         Path,
         typer.Option(
-            help=(
-                "Query cache root. Defaults to the hidden .asf-cache directory in "
-                "the current working directory."
-            ),
+            help=(f"ASF query cache root. Defaults to {DEFAULT_ASF_CACHE_DIR}."),
             file_okay=False,
             rich_help_panel="Utils",
         ),

@@ -186,8 +186,8 @@ def download(
         Path,
         typer.Option(
             help=(
-                "Query and image cache root. Defaults to the hidden .cdse-cache "
-                "directory in the current working directory."
+                "CDSE query and remote-asset cache root. Defaults to "
+                f"{DEFAULT_CDSE_CACHE_DIR}."
             ),
             file_okay=False,
             rich_help_panel="Utils",
@@ -270,6 +270,7 @@ def download(
         config_file=str(config),
         parallel_scenes=parallel_scenes,
         logger=logger,
+        cache_dir=cache_dir,
     )
     echo_storage_summary(storage)
     logger.info(
@@ -295,6 +296,7 @@ def download(
         parallel_scenes=parallel_scenes,
         parallel_bands=parallel_bands,
         logger=logger,
+        cache_dir=cache_dir,
     )
     ended = time.time()
     ended_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ended))

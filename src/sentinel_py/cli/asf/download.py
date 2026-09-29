@@ -101,7 +101,7 @@ def download(
     query: Annotated[
         Optional[Path],
         typer.Option(
-            help="Explicit ASF manifest.parquet to download instead of the latest cache.",
+            help="Explicit ASF manifest.parquet instead of the latest cached query.",
             exists=True,
             dir_okay=False,
             rich_help_panel="Optional Download Configurations",
@@ -136,10 +136,7 @@ def download(
     cache_dir: Annotated[
         Path,
         typer.Option(
-            help=(
-                "ASF query cache root. Defaults to the hidden .asf-cache directory "
-                "in the current working directory."
-            ),
+            help=(f"ASF query cache root. Defaults to {DEFAULT_ASF_CACHE_DIR}."),
             file_okay=False,
             rich_help_panel="Utils",
         ),

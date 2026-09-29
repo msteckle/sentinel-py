@@ -26,7 +26,10 @@ dependencies = [
 
 [project.optional-dependencies]
 processing = [
-    "gdal>=3.11.5",
+    "gdal[numpy]==3.13.3",
+]
+hpc = [
+    "mpi4py==4.1.2",
 ]
 
 [project.scripts]

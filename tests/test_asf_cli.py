@@ -370,6 +370,8 @@ def test_asf_query_cli_caches_manifest(tmp_path: Path, monkeypatch):
             "08-31",
             "--flight-direction",
             "predominant",
+            "--cache-dir",
+            str(tmp_path / ".asf-cache"),
         ],
     )
 
@@ -405,6 +407,8 @@ def test_asf_query_cli_caches_manifest(tmp_path: Path, monkeypatch):
             "08-31",
             "--flight-direction",
             "predominant",
+            "--cache-dir",
+            str(tmp_path / ".asf-cache"),
         ],
     )
 
@@ -749,6 +753,8 @@ def test_asf_download_cli_uses_latest_cached_query(tmp_path: Path, monkeypatch):
             str(tmp_path / "downloads"),
             "--config",
             str(config),
+            "--cache-dir",
+            str(cache_dir),
             "--yes",
         ],
     )

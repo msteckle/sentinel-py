@@ -4,12 +4,23 @@ import pandas as pd
 import pytest
 from typer.testing import CliRunner
 
-from sentinel_py.cache import DEFAULT_CDSE_CACHE_DIR
+from sentinel_py.cache import (
+    DEFAULT_ASF_CACHE_DIR,
+    DEFAULT_CACHE_DIR,
+    DEFAULT_CDSE_CACHE_DIR,
+    SENTINEL_PY_HOME,
+)
 from sentinel_py.cli.main import app
 from sentinel_py.download.preflight import DownloadStorageSummary
 from sentinel_py.enums import CDSECollections, validate_product, validate_serial_id
 
 runner = CliRunner()
+
+
+def test_default_provider_caches_share_sentinel_py_home():
+    assert DEFAULT_CACHE_DIR == SENTINEL_PY_HOME / "cache"
+    assert DEFAULT_CDSE_CACHE_DIR == DEFAULT_CACHE_DIR / "cdse"
+    assert DEFAULT_ASF_CACHE_DIR == DEFAULT_CACHE_DIR / "asf"
 
 
 def _write_aoi(path: Path) -> None:

@@ -7,7 +7,9 @@ from sentinel_py.download.cdse import (
     _format_bytes,
     _scene_storage_bytes,
     _storage_progress_text,
+    cdse_scene_catalog_path,
     prepare_cdse_download,
+    update_cdse_scene_catalog,
 )
 
 
@@ -78,6 +80,37 @@ def test_format_bytes_uses_iec_units():
     assert _format_bytes(1536) == "1.5 KiB"
 
 
+def test_cdse_scene_catalog_merges_queries_by_scene_name(tmp_path: Path):
+    first = pd.DataFrame(
+        {
+            "Id": ["one", "two"],
+            "Name": ["S2A_ONE.SAFE", "S2A_TWO.SAFE"],
+            "S3Path": ["/one", "/two"],
+            "ContentDate": ["2024-06-01", "2024-06-02"],
+            "GeoFootprint": ["POLYGON ONE", "POLYGON TWO"],
+            "query_id": ["first", "first"],
+        }
+    )
+    second = pd.DataFrame(
+        {
+            "Id": ["two", "three"],
+            "Name": ["S2A_TWO.SAFE", "S2A_THREE.SAFE"],
+            "S3Path": ["/two", "/three"],
+            "ContentDate": ["2024-06-02", "2024-06-03"],
+            "GeoFootprint": ["POLYGON TWO", "POLYGON THREE"],
+            "query_id": ["second", "second"],
+        }
+    )
+
+    update_cdse_scene_catalog(tmp_path, first)
+    path = update_cdse_scene_catalog(tmp_path, second)
+    catalog = pd.read_parquet(path).sort_values("Id").reset_index(drop=True)
+
+    assert path == cdse_scene_catalog_path(tmp_path)
+    assert catalog["Id"].tolist() == ["one", "three", "two"]
+    assert catalog.loc[catalog["Id"] == "two", "query_id"].item() == "second"
+
+
 def test_prepare_cdse_download_resolves_sizes_without_downloading(
     tmp_path: Path,
     monkeypatch,
@@ -145,4 +178,4 @@ def test_prepare_cdse_download_resolves_sizes_without_downloading(
     assert summary.known_total_bytes == 115
     assert summary.known_additional_bytes == 15
     assert summary.unknown_size_assets == 0
-    assert (tmp_path / "cache" / "all_downloaded_images.parquet").exists()
+    assert (tmp_path / "cache" / "assets.parquet").exists()

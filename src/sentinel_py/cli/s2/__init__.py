@@ -1,7 +1,7 @@
 import typer
 
-from .offset import app as offset_app
+from .preprocess import app as preprocess_app
 
 app = typer.Typer()
 
-app.add_typer(offset_app)
+app.add_typer(preprocess_app)

@@ -1,16 +1,11 @@
-from enum import Enum
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
+from sentinel_py.enums import GridClipOpts
+
 app = typer.Typer()
-
-
-class GridClipOpts(str, Enum):
-    intersect = "intersect"
-    within = "within"
-    all = "all"
 
 
 # sentinel-py bbox2geojson -------------------------------------------------------------

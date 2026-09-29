@@ -18,6 +18,15 @@ class CDSEOrbitDirs(str, Enum):
     descending = "DESCENDING"
 
 
+# Utility CVs --------------------------------------------------------------------------
+class GridClipOpts(str, Enum):
+    """Spatial relationships used to select processing-grid cells."""
+
+    intersect = "intersect"
+    within = "within"
+    all = "all"
+
+
 # Sentinel-1 CVs -----------------------------------------------------------------------
 class S1Products(str, Enum):
     """CDSE Sentinel-1 product types that can be downloaded with this CLI."""
@@ -124,6 +133,7 @@ class S2Res(str, Enum):
 class S2Bands(str, Enum):
     """CDSE Sentinel-2 bands that can be downloaded with this CLI."""
 
+    b01 = "B01"
     b02 = "B02"
     b03 = "B03"
     b04 = "B04"
@@ -152,6 +162,24 @@ class S2Bands(str, Enum):
             cls.b11,
             cls.b12,
         ]
+
+
+# ESA band_id values used by BOA_ADD_OFFSET elements in Level-2A metadata.
+S2_BAND_IDS = {
+    "B01": "0",
+    "B02": "1",
+    "B03": "2",
+    "B04": "3",
+    "B05": "4",
+    "B06": "5",
+    "B07": "6",
+    "B08": "7",
+    "B8A": "8",
+    "B09": "9",
+    "B10": "10",
+    "B11": "11",
+    "B12": "12",
+}
 
 
 # Collection-specific helpers ----------------------------------------------------------

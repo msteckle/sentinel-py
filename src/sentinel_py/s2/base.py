@@ -32,7 +32,7 @@ class S2PreprocessConfig:
 
 @dataclass(frozen=True)
 class S2PreprocessResult:
-    """Result returned by a serial, process-pool, or MPI preprocessing worker."""
+    """Result returned by a preprocessing task worker."""
 
     task_id: str
     product_id: str

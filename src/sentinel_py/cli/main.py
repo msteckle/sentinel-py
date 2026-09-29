@@ -2,7 +2,7 @@ import typer
 
 from .asf import app as asf_app
 from .cdse import app as cdse_app
-from .s2 import app as s2_app
+from .run import run
 from .utils import app as utils_app
 
 app = typer.Typer(
@@ -18,7 +18,10 @@ app.add_typer(
 app.add_typer(
     cdse_app, name="cdse", help="Commands for querying and downloading from CDSE."
 )
-app.add_typer(s2_app, name="s2", help="Sentinel-2 processing and analysis tools.")
+app.command(
+    "run",
+    help="Run a validated processing pipeline from a YAML file.",
+)(run)
 
 
 if __name__ == "__main__":

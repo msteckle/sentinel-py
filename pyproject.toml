@@ -8,15 +8,20 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
+    "affine>=2.4.0",
     "asf-search>=12.0.7",
     "folium>=0.20.0",
     "geopandas>=1.1.1",
     "lxml>=6.0.2",
     "matplotlib>=3.10.8",
+    "numpy>=2.0.0",
     "openeo>=0.49.0",
     "pandas>=2.3.3",
     "phidown>=0.1.25",
     "pyarrow>=23.0.1",
+    "pydantic>=2.12.0",
+    "pyproj>=3.7.0",
+    "pyyaml>=6.0.3",
     "requests>=2.32.5",
     "rich>=14.2.0",
     "s5cmd>=0.3.3",
@@ -26,10 +31,11 @@ dependencies = [
 
 [project.optional-dependencies]
 processing = [
+    "dask[distributed]>=2025.9.0",
     "gdal[numpy]==3.13.3",
 ]
 hpc = [
-    "mpi4py==4.1.2",
+    "dask-jobqueue>=0.9.0",
 ]
 
 [project.scripts]

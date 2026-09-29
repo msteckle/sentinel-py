@@ -117,7 +117,7 @@ def validate_gdal_for_preprocessing() -> str:
     if not hasattr(gdal, "Run"):
         raise RuntimeError(
             "This GDAL build does not provide the unified Python algorithm API. "
-            "GDAL 3.11 or newer is required for 's2 preprocess'."
+            "GDAL 3.11 or newer is required for Sentinel-2 pipeline preprocessing."
         )
     try:
         gdal.Algorithm("raster", "calc")
@@ -131,7 +131,7 @@ def validate_gdal_for_preprocessing() -> str:
     if "muparser" not in supported:
         raise RuntimeError(
             "This GDAL build does not provide the muparser VRT expression dialect. "
-            "Rebuild GDAL with muparser before running 'sentinel-py s2 preprocess'."
+            "Rebuild GDAL with muparser before running 'sentinel-py run'."
         )
     return gdal.VersionInfo("RELEASE_NAME")
 
@@ -471,7 +471,7 @@ def preprocess_s2_granule(
     output_dir: Path,
     cached_row: dict[str, object] | None = None,
 ) -> S2PreprocessResult:
-    """Preprocess one granule in a serial, process-pool, or MPI worker.
+    """Preprocess one granule in an execution-backend worker.
 
     Parameters
     ----------

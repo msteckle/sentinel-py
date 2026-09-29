@@ -14,6 +14,7 @@ AOI="../data/aois/toolik_025_aoi.geojson"
 LOGPATH="../data/logs/download"
 LOGFILENAME=$(basename "$0")
 OUTPATH="../data"
+PIPELINE="$(dirname "$0")/s2_preprocess_pipeline.yaml"
 
 # Re-used params
 RES=20
@@ -48,14 +49,7 @@ sentinel-py cdse download \
   --config $HOME/.s5cfg \
   --log $LOGPATH/${LOGFILENAME}
 
-sentinel-py s2 preprocess \
-  --indir $OUTPATH/s2/raw \
-  --outdir $OUTPATH/s2/preprocessed \
-  --res $RES \
-  --aoi $AOI \
-  --years "$YEARS" \
-  --speriod "$SPERIOD" \
-  --eperiod "$EPERIOD" \
+sentinel-py run "$PIPELINE" \
   --log $LOGPATH/${LOGFILENAME}
 
 ################################

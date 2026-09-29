@@ -1,0 +1,41 @@
+version: 1
+
+execution:
+  # local: process workers on this machine
+  # dask: connect to scheduler_address
+  # slurm: create workers through dask-jobqueue
+  method: local
+  workers: 4
+  threads_per_worker: 1
+
+selection:
+  aoi: ../data/aois/toolik_025_aoi.geojson
+  years: [2023, 2024]
+  speriod: "06-01"
+  eperiod: "08-31"
+
+output_grid:
+  # The current VRT compatibility processor preserves each granule's native UTM CRS.
+  # Canonical-grid processors instead use explicit crs, resolution, extent: aoi,
+  # anchor: [x, y], and chunks: {y: ..., x: ...}.
+  crs: native
+  resolution_m: 20
+
+sources:
+  s2:
+    type: s2.l2a.local
+    data_dir: ../data/s2/raw
+
+nodes:
+  - id: preprocess
+    type: s2.preprocess
+    source: s2
+    bands: [B02, B03, B04, B05, B06, B07, B08, B8A, B11, B12]
+    mask_classes: [0, 1, 3, 8, 9, 10, 11]
+    nodata: 65535
+
+outputs:
+  preprocessed:
+    from: preprocess
+    path: ../data/s2/preprocessed
+    format: vrt

@@ -4,7 +4,7 @@
 - [uv 0.11.7+](https://docs.astral.sh/uv/getting-started/installation/)
 
 Querying and downloading data do not require the Python GDAL bindings or SNAP.
-Sentinel-2 raster processing requires GDAL 3.11.5 or newer; install it with the
+Sentinel-2 raster processing currently uses GDAL 3.13.3; install it with the
 optional `processing` dependency described below. The Python bindings must be built
 against the same version of the native GDAL library available in the environment.
 
@@ -38,9 +38,15 @@ To include the optional Sentinel-2 raster-processing dependencies:
 uv sync --no-dev --extra processing
 ```
 
+For Slurm execution through Dask, install both processing and HPC extras:
+
+```bash
+uv sync --no-dev --extra processing --extra hpc
+```
+
 GDAL's Python package compiles against a native GDAL installation. If this command
-cannot find `gdal-config`, or reports a version mismatch, install/load a native GDAL
-3.11.5+ build first and ensure its `gdal-config` is on `PATH`. This does not affect
+cannot find `gdal-config`, or reports a version mismatch, install/load native GDAL
+3.13.3 first and ensure its `gdal-config` is on `PATH`. This does not affect
 the default query/download installation.
 
 ### NERSC (Perlmutter)
@@ -121,26 +127,56 @@ state remains beside the downloaded data because it describes files at that exac
 storage location. Set `SENTINEL_PY_HOME` to move all default reusable caches and logs,
 or pass `--cache-dir` for a command-specific override.
 
-Preprocess a spatial and seasonal subset of the local Level-2A cache into lazy,
-offset-corrected and SCL-masked VRTs:
+Preprocess a spatial and seasonal subset of the local Level-2A cache by defining a
+strict, versioned pipeline YAML and running it with:
 
 ```bash
-sentinel-py s2 preprocess \
-  --data-cache data/s2/raw \
-  --output-dir data/s2/preprocessed \
-  --aoi data/aois/toolik_025_aoi.geojson \
-  --bands "B02 B03 B04 B08 B11 B12" \
-  --scl-mask-pixels "0 1 3 8 9 10 11" \
-  --res 20 \
-  --years "2023 2024" \
-  --speriod 06-01 \
-  --eperiod 08-31
+sentinel-py run examples/s2_preprocess_pipeline.yaml --validate-only
+sentinel-py run examples/s2_preprocess_pipeline.yaml
 ```
 
+Paths inside the YAML are resolved relative to the YAML file. Nodes form a validated
+directed acyclic graph: each registered processor owns its Pydantic configuration,
+and named `inputs` refer to upstream node IDs. Named outputs use `from` to select the
+node to materialize. The initial `s2.preprocess` processor retains the existing VRT
+implementation and supports `local`, external `dask`, or `slurm` execution. It
+currently preserves each granule's native UTM CRS, so `output_grid.crs` must be
+`native`. See `examples/s2_preprocess_pipeline.yaml` for a complete pipeline and
+`docs/architecture/processing-pipeline.md` for the graph and processor contracts.
+
+The pipeline schema also supports canonical AOI-derived grids for future processors:
+an explicit CRS, scalar or x/y resolution, pixel anchor, and y/x Dask chunk shape are
+converted into aligned bounds, a north-up affine transform, dimensions, and row-major
+chunk windows. The current VRT compatibility processor deliberately rejects that mode
+until raster reads are migrated to the new grid contract.
+
 The AOI selects intersecting local granules; it does not clip their output extent.
-Omit `--aoi` or `--years` to retain all cached granules for that selector. Output VRTs
-preserve each granule's native UTM CRS and apply BOA DN offsets and the requested SCL
-mask lazily when pixels are read.
+Omit `selection.aoi` or `selection.years` to retain all cached granules for that
+selector. Output VRTs preserve each granule's native UTM CRS and apply BOA DN
+offsets, XML-declared radiometric NODATA and SATURATED masks, and the requested SCL
+class mask lazily when pixels are read.
+
+On a Slurm system, replace the example's `execution` section with site-specific
+resources such as:
+
+```yaml
+execution:
+  method: slurm
+  jobs: 16
+  cores_per_job: 8
+  processes_per_job: 8
+  memory_per_job: 64GiB
+  walltime: "04:00:00"
+  queue: regular
+  account: my-project
+  local_directory: /path/to/node/or/scratch/storage
+  job_script_prologue:
+    - source /path/to/sentinel-py/.venv/bin/activate
+```
+
+To use a Dask cluster started outside sentinel-py, select `method: dask` and set
+`scheduler_address`. Workers must see the source data, output directory, and the
+same sentinel-py software environment.
 
 ### Downloading Sentinel-1 from ASF
 

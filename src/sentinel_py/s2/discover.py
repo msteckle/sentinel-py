@@ -82,6 +82,33 @@ def read_l2a_radiometry(metadata_path: Path) -> tuple[dict[str, int], int]:
     return offsets, quantification_value
 
 
+def read_l2a_special_values(metadata_path: Path) -> dict[str, int]:
+    """Read the radiometric NODATA and SATURATED DN codes from L2A XML."""
+    metadata_path = Path(metadata_path)
+    if not metadata_path.is_file():
+        raise FileNotFoundError(
+            f"Sentinel-2 product metadata not found: {metadata_path}"
+        )
+
+    tree = etree.parse(str(metadata_path))
+    values: dict[str, int] = {}
+    for group in tree.xpath('//*[local-name()="Special_Values"]'):
+        names = group.xpath('./*[local-name()="SPECIAL_VALUE_TEXT"]/text()')
+        indexes = group.xpath('./*[local-name()="SPECIAL_VALUE_INDEX"]/text()')
+        if len(names) != 1 or len(indexes) != 1:
+            raise ValueError(f"Malformed Special_Values metadata in {metadata_path}")
+        values[str(names[0]).strip().upper()] = int(float(indexes[0]))
+
+    required = {"NODATA", "SATURATED"}
+    missing = sorted(required - set(values))
+    if missing:
+        raise ValueError(
+            f"Missing Sentinel-2 special value(s) in {metadata_path}: "
+            + ", ".join(missing)
+        )
+    return {name: values[name] for name in sorted(required)}
+
+
 ########################################################################################
 # SAFE product and raster asset discovery
 ########################################################################################

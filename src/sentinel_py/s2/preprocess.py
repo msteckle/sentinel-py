@@ -17,9 +17,9 @@ from sentinel_py.cache import (
     write_parquet_atomic,
 )
 from sentinel_py.s2.base import S2Granule, S2PreprocessConfig, S2PreprocessResult
-from sentinel_py.s2.discover import read_l2a_radiometry
+from sentinel_py.s2.discover import read_l2a_radiometry, read_l2a_special_values
 
-PREPROCESS_ALGORITHM_VERSION = 3
+PREPROCESS_ALGORITHM_VERSION = 4
 PREPROCESS_STATE_NAME = "s2_preprocess.parquet"
 
 
@@ -273,6 +273,9 @@ def _calculation_input(
     source_grid: _RasterGrid,
     output_grid: _RasterGrid,
     resampling: str,
+    *,
+    input_nodata: int | None = None,
+    output_nodata: int | None = None,
 ) -> str:
     """Return a named direct input or lazy alignment pipeline for raster calc."""
     source_path = Path(path).resolve()
@@ -286,7 +289,7 @@ def _calculation_input(
             for source, output in zip(source_transform, output_transform)
         )
     )
-    if same_grid:
+    if same_grid and input_nodata is None and output_nodata is None:
         return f"{name}={source_path}"
 
     # Ask GDAL to serialize an on-the-fly alignment pipeline into the output VRT.
@@ -298,6 +301,10 @@ def _calculation_input(
         f"--resolution {resolution},{resolution} "
         f"--bbox {xmin},{ymin},{xmax},{ymax} --resampling {resampling}"
     )
+    if input_nodata is not None:
+        pipeline += f" --input-nodata {input_nodata}"
+    if output_nodata is not None:
+        pipeline += f" --output-nodata {output_nodata}"
     return f"{name}=[ {pipeline} ]"
 
 
@@ -307,6 +314,7 @@ def _write_preprocessed_vrt(
     output_path: Path,
     offsets: dict[str, int],
     quantification_value: int,
+    special_values: dict[str, int],
 ) -> None:
     """Build and validate one atomic VRT with GDAL's raster calc algorithm."""
     gdal = _gdal()
@@ -317,8 +325,47 @@ def _write_preprocessed_vrt(
     grids = {name: _dataset_grid(path) for name, path in source_paths.items()}
     output_grid = _output_grid(grids, config.resolution_m)
 
-    # Build named inputs and one native muparser calculation for each output band.
-    mask_terms = ["(A[1]==0)", "(SCL[1]==0)", "(SCL[1]>11)"] + [
+    # Apply radiometric special values and offsets on each band's native grid before
+    # resampling. This prevents NODATA or SATURATED DNs from contaminating an average
+    # or interpolation, while preserving valid corrected reflectance values of zero.
+    radiometry_dir = output_path.parent / f".{output_path.stem}.radiometry"
+    radiometry_dir.mkdir(parents=True, exist_ok=True)
+    radiometry_paths: dict[str, Path] = {}
+    invalid_dn = "||".join(
+        f"(A[1]=={value})" for value in sorted(set(special_values.values()))
+    )
+    for band_name in config.bands:
+        radiometry_path = radiometry_dir / f"{band_name}.vrt"
+        temporary_radiometry = radiometry_path.with_name(
+            f".{radiometry_path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            algorithm = gdal.Run(
+                "raster calc",
+                input=[f"A={Path(granule.band_paths[band_name]).resolve()}"],
+                calc=[
+                    f"({invalid_dn})?{config.nodata}:"
+                    f"max(A[1]+({offsets[band_name]}),0)"
+                ],
+                output=temporary_radiometry,
+                output_format="VRT",
+                output_data_type="UInt16",
+                dialect="muparser",
+                nodata=config.nodata,
+                overwrite=True,
+            )
+            algorithm.Finalize()
+            os.replace(temporary_radiometry, radiometry_path)
+        finally:
+            temporary_radiometry.unlink(missing_ok=True)
+        radiometry_paths[band_name] = radiometry_path
+
+    # Align the corrected inputs and apply the categorical SCL mask on the output grid.
+    mask_terms = [
+        f"(A[1]=={config.nodata})",
+        "(SCL[1]==0)",
+        "(SCL[1]>11)",
+    ] + [
         f"(SCL[1]=={value})" for value in config.mask_classes if value != 0
     ]
     mask_expression = "||".join(mask_terms)
@@ -334,16 +381,17 @@ def _write_preprocessed_vrt(
         inputs.append(
             _calculation_input(
                 band_name,
-                granule.band_paths[band_name],
+                radiometry_paths[band_name],
                 grids[band_name],
                 output_grid,
                 resampling,
+                input_nodata=config.nodata,
+                output_nodata=config.nodata,
             )
         )
         band_mask = mask_expression.replace("A[1]", f"{band_name}[1]")
         calculations.append(
-            f"({band_mask})?{config.nodata}:"
-            f"max({band_name}[1]+({offsets[band_name]}),0)"
+            f"({band_mask})?{config.nodata}:{band_name}[1]"
         )
     inputs.append(
         _calculation_input(
@@ -505,12 +553,14 @@ def preprocess_s2_granule(
 
         # Read authoritative product metadata and construct the lazy derived VRT.
         offsets, quantification_value = read_l2a_radiometry(granule.product_metadata)
+        special_values = read_l2a_special_values(granule.product_metadata)
         _write_preprocessed_vrt(
             granule,
             config,
             output_path,
             offsets,
             quantification_value,
+            special_values,
         )
         complete_state_row: dict[str, object] = {
             "task_id": task_id,

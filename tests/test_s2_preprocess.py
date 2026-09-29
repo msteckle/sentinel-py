@@ -9,7 +9,11 @@ from shapely.geometry import box, mapping
 
 from sentinel_py.enums import S2_BAND_IDS, S2Bands
 from sentinel_py.s2.base import S2Granule, S2PreprocessConfig
-from sentinel_py.s2.discover import discover_s2_granules, read_l2a_radiometry
+from sentinel_py.s2.discover import (
+    discover_s2_granules,
+    read_l2a_radiometry,
+    read_l2a_special_values,
+)
 from sentinel_py.s2.preprocess import _gdal_import_error
 
 
@@ -24,7 +28,12 @@ def _metadata(path: Path, *, include_offsets: bool = True) -> Path:
     )
     path.write_text(
         "<Level2A><BOA_QUANTIFICATION_VALUE>10000</BOA_QUANTIFICATION_VALUE>"
-        f"{offsets}</Level2A>"
+        f"{offsets}"
+        "<Special_Values><SPECIAL_VALUE_TEXT>NODATA</SPECIAL_VALUE_TEXT>"
+        "<SPECIAL_VALUE_INDEX>0</SPECIAL_VALUE_INDEX></Special_Values>"
+        "<Special_Values><SPECIAL_VALUE_TEXT>SATURATED</SPECIAL_VALUE_TEXT>"
+        "<SPECIAL_VALUE_INDEX>65535</SPECIAL_VALUE_INDEX></Special_Values>"
+        "</Level2A>"
     )
     return path
 
@@ -97,6 +106,12 @@ def test_read_l2a_radiometry_treats_pre_offset_products_as_zero(tmp_path: Path):
     assert set(offsets.values()) == {0}
 
 
+def test_read_l2a_special_values_uses_product_metadata(tmp_path: Path):
+    values = read_l2a_special_values(_metadata(tmp_path / "MTD.xml"))
+
+    assert values == {"NODATA": 0, "SATURATED": 65535}
+
+
 def test_discovery_filters_local_cache_by_aoi_year_and_season(tmp_path: Path):
     _local_safe(tmp_path, "20230615T120000")
     _local_safe(tmp_path, "20240115T120000")
@@ -143,7 +158,15 @@ def test_preprocessed_vrt_applies_offset_mask_and_cache(tmp_path: Path):
     sources = {}
     for name, size, resolution, values in (
         ("B02", 2, 20, [0, 1100, 2000, 3000]),
-        ("B08", 4, 10, [1400] * 16),
+        # The zero in an otherwise-clear 2x2 source block must be excluded from
+        # average resampling. Including it would yield DN 1050 and corrected DN 50
+        # instead of the expected corrected DN 400.
+        (
+            "B08",
+            4,
+            10,
+            [0] + [1400] * 14 + [65535],
+        ),
         ("SCL", 2, 20, [4, 4, 9, 4]),
     ):
         path = tmp_path / f"{name}.tif"

@@ -1,6 +1,5 @@
 import configparser
 import time
-from enum import Enum
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -9,6 +8,7 @@ import typer
 
 from sentinel_py.cache import DEFAULT_CDSE_CACHE_DIR
 from sentinel_py.cli.download_preflight import confirm_download, echo_storage_summary
+from sentinel_py.enums import S2DownloadAssets, S2Res
 from sentinel_py.log import DEFAULT_LOG_DIR, get_logger
 
 app = typer.Typer()
@@ -27,36 +27,6 @@ REQUIRED_S5_CONFIG_KEYS = (
     "aws_secret_access_key",
     "host_base",
 )
-
-
-class CDSES2Bands(str, Enum):
-    """Enum of valid Sentinel-2 bands for CDSE download."""
-
-    B01 = "B01"
-    B02 = "B02"
-    B03 = "B03"
-    B04 = "B04"
-    B05 = "B05"
-    B06 = "B06"
-    B07 = "B07"
-    B08 = "B08"
-    B8A = "B8A"
-    B09 = "B09"
-    B10 = "B10"
-    B11 = "B11"
-    B12 = "B12"
-    SCL = "SCL"
-    TCI = "TCI"
-    AOT = "AOT"
-    WVP = "WVP"
-
-
-class CDSES2Resolutions(int, Enum):
-    """Enum of valid Sentinel-2 resolutions for CDSE download."""
-
-    R10M = 10
-    R20M = 20
-    R60M = 60
 
 
 def _s5_config_error(config: Path, reason: str) -> typer.BadParameter:
@@ -129,7 +99,7 @@ def download(
         ),
     ],
     res: Annotated[
-        CDSES2Resolutions,
+        S2Res,
         typer.Option(
             help=(
                 "Target resolution in meters for the bands to download. Only used "
@@ -231,13 +201,13 @@ def download(
     if not requested_bands:
         raise typer.BadParameter("--bands must contain at least one band")
     try:
-        band_values = [CDSES2Bands(value).value for value in requested_bands]
+        band_values = [S2DownloadAssets(value).value for value in requested_bands]
     except ValueError as error:
-        supported = ", ".join(band.value for band in CDSES2Bands)
+        supported = ", ".join(asset.value for asset in S2DownloadAssets)
         raise typer.BadParameter(
             f"Unsupported Sentinel-2 band in --bands. Supported values: {supported}"
         ) from error
-    resolution_value = res.value
+    resolution_value = int(res.value)
 
     # Set up logging
     logger = get_logger(name="download_logger", logpath=log, verbose=verbose)

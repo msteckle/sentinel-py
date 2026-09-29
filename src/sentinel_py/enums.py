@@ -1,5 +1,3 @@
-# sentinel_py/common/cdse_types.py
-
 from enum import Enum
 
 
@@ -28,6 +26,55 @@ class GridClipOpts(str, Enum):
 
 
 # Sentinel-1 CVs -----------------------------------------------------------------------
+class ASFOrbitDirection(str, Enum):
+    """ASF orbit-direction selections exposed by the Sentinel-1 query CLI."""
+
+    both = "BOTH"
+    predominant = "PREDOMINANT"
+    ascending = "ASCENDING"
+    descending = "DESCENDING"
+
+
+class ASFProductLevel(str, Enum):
+    """ASF Sentinel-1 product levels exposed by the query CLI."""
+
+    grd_hd = "GRD_HD"
+    grd_hs = "GRD_HS"
+    grd_md = "GRD_MD"
+    grd_ms = "GRD_MS"
+    grd_fd = "GRD_FD"
+    slc = "SLC"
+    raw = "RAW"
+    ocn = "OCN"
+
+
+class ASFBeamMode(str, Enum):
+    """ASF Sentinel-1 beam modes exposed by the query CLI."""
+
+    iw = "IW"
+    ew = "EW"
+    wv = "WV"
+    s1 = "S1"
+    s2 = "S2"
+    s3 = "S3"
+    s4 = "S4"
+    s5 = "S5"
+    s6 = "S6"
+
+
+class ASFPolarization(str, Enum):
+    """ASF Sentinel-1 polarization selections exposed by the query CLI."""
+
+    vv_vh = "VV+VH"
+    hh_hv = "HH+HV"
+    vv = "VV"
+    hh = "HH"
+    dual_vv = "DUAL VV"
+    dual_vh = "DUAL VH"
+    dual_hh = "DUAL HH"
+    dual_hv = "DUAL HV"
+
+
 class S1Products(str, Enum):
     """CDSE Sentinel-1 product types that can be downloaded with this CLI."""
 
@@ -125,6 +172,8 @@ class S2SensorModes(str, Enum):
 
 
 class S2Res(str, Enum):
+    """Native Sentinel-2 image resolutions in meters."""
+
     r10m = "10"
     r20m = "20"
     r60m = "60"
@@ -162,6 +211,28 @@ class S2Bands(str, Enum):
             cls.b11,
             cls.b12,
         ]
+
+
+class S2DownloadAssets(str, Enum):
+    """Sentinel-2 spectral and auxiliary assets supported by CDSE download."""
+
+    b01 = "B01"
+    b02 = "B02"
+    b03 = "B03"
+    b04 = "B04"
+    b05 = "B05"
+    b06 = "B06"
+    b07 = "B07"
+    b08 = "B08"
+    b8a = "B8A"
+    b09 = "B09"
+    b10 = "B10"
+    b11 = "B11"
+    b12 = "B12"
+    scl = "SCL"
+    tci = "TCI"
+    aot = "AOT"
+    wvp = "WVP"
 
 
 # ESA band_id values used by BOA_ADD_OFFSET elements in Level-2A metadata.

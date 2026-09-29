@@ -1,5 +1,4 @@
 import datetime as dt
-from enum import Enum
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -9,6 +8,9 @@ from sentinel_py.cache import DEFAULT_CDSE_CACHE_DIR
 from sentinel_py.enums import (
     CDSECollections,
     CDSEOrbitDirs,
+    S2Products,
+    S2SensorModes,
+    S2SerialIds,
     validate_product,
     validate_sensor_mode,
     validate_serial_id,
@@ -16,23 +18,6 @@ from sentinel_py.enums import (
 from sentinel_py.log import DEFAULT_LOG_DIR, get_logger
 
 app = typer.Typer()
-
-
-class CDSES2Product(str, Enum):
-    S2MSI2A = "S2MSI2A"
-    S2MSI1C = "S2MSI1C"
-
-
-class CDSES2OpsMode(str, Enum):
-    INS_NOBS = "INS-NOBS"
-    INS_RAW = "INS-RAW"
-    INS_VIC = "INS-VIC"
-
-
-class CDSES2SerialID(str, Enum):
-    A = "A"
-    B = "B"
-    C = "C"
 
 
 @app.command(
@@ -83,7 +68,7 @@ def query(
         ),
     ] = dt.datetime(2000, 12, 31),
     product: Annotated[
-        Optional[CDSES2Product],
+        Optional[S2Products],
         typer.Option(
             help=(
                 "Sentinel-2 product type: S2MSI1C (Level-1C top-of-atmosphere "
@@ -130,7 +115,7 @@ def query(
         ),
     ] = None,
     ops_mode: Annotated[
-        Optional[CDSES2OpsMode],
+        Optional[S2SensorModes],
         typer.Option(
             help=(
                 "Sentinel-2 operational mode: INS-NOBS (normal observation), "
@@ -141,7 +126,7 @@ def query(
         ),
     ] = None,
     platform_serial_id: Annotated[
-        Optional[CDSES2SerialID],
+        Optional[S2SerialIds],
         typer.Option(
             help=(
                 "Sentinel-2 satellite identifier: A, B, or C. Availability depends on "

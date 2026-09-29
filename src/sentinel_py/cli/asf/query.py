@@ -1,7 +1,6 @@
 import calendar
 import datetime as dt
 import json
-from enum import Enum
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -21,50 +20,15 @@ from sentinel_py.download.asf import (
     get_predominant_flightdir,
     query_asf,
 )
+from sentinel_py.enums import (
+    ASFBeamMode,
+    ASFOrbitDirection,
+    ASFPolarization,
+    ASFProductLevel,
+)
 from sentinel_py.log import DEFAULT_LOG_DIR, get_logger
 
 app = typer.Typer()
-
-
-class ASFOrbitDirection(str, Enum):
-    both = "BOTH"
-    predominant = "PREDOMINANT"
-    ascending = "ASCENDING"
-    descending = "DESCENDING"
-
-
-class ASFProductLevel(str, Enum):
-    grd_hd = "GRD_HD"
-    grd_hs = "GRD_HS"
-    grd_md = "GRD_MD"
-    grd_ms = "GRD_MS"
-    grd_fd = "GRD_FD"
-    slc = "SLC"
-    raw = "RAW"
-    ocn = "OCN"
-
-
-class ASFBeamMode(str, Enum):
-    iw = "IW"
-    ew = "EW"
-    wv = "WV"
-    s1 = "S1"
-    s2 = "S2"
-    s3 = "S3"
-    s4 = "S4"
-    s5 = "S5"
-    s6 = "S6"
-
-
-class ASFPolarization(str, Enum):
-    vv_vh = "VV+VH"
-    hh_hv = "HH+HV"
-    vv = "VV"
-    hh = "HH"
-    dual_vv = "DUAL VV"
-    dual_vh = "DUAL VH"
-    dual_hh = "DUAL HH"
-    dual_hv = "DUAL HV"
 
 
 def _seasonal_date(year: int, period: dt.datetime) -> dt.date:

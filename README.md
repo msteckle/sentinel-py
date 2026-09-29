@@ -121,6 +121,27 @@ state remains beside the downloaded data because it describes files at that exac
 storage location. Set `SENTINEL_PY_HOME` to move all default reusable caches and logs,
 or pass `--cache-dir` for a command-specific override.
 
+Preprocess a spatial and seasonal subset of the local Level-2A cache into lazy,
+offset-corrected and SCL-masked VRTs:
+
+```bash
+sentinel-py s2 preprocess \
+  --data-cache data/s2/raw \
+  --output-dir data/s2/preprocessed \
+  --aoi data/aois/toolik_025_aoi.geojson \
+  --bands "B02 B03 B04 B08 B11 B12" \
+  --scl-mask-pixels "0 1 3 8 9 10 11" \
+  --res 20 \
+  --years "2023 2024" \
+  --speriod 06-01 \
+  --eperiod 08-31
+```
+
+The AOI selects intersecting local granules; it does not clip their output extent.
+Omit `--aoi` or `--years` to retain all cached granules for that selector. Output VRTs
+preserve each granule's native UTM CRS and apply BOA DN offsets and the requested SCL
+mask lazily when pixels are read.
+
 ### Downloading Sentinel-1 from ASF
 
 Query ASF and save the results as a reusable manifest:

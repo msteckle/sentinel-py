@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -65,6 +65,21 @@ def _parse_mask_classes(value: str) -> tuple[int, ...]:
             f"{', '.join(map(str, unsupported))}. Options: 0 through 11"
         )
     return tuple(sorted(classes))
+
+
+def _parse_years(value: str | None) -> tuple[int, ...] | None:
+    """Parse an optional comma- or space-separated acquisition year list."""
+    if value is None:
+        return None
+    try:
+        years = tuple(sorted({int(item) for item in value.replace(",", " ").split()}))
+    except ValueError as error:
+        raise typer.BadParameter("--years must contain four-digit years") from error
+    if not years:
+        raise typer.BadParameter("--years must contain at least one year")
+    if any(year < 2015 or year > 9999 for year in years):
+        raise typer.BadParameter("--years values must be between 2015 and 9999")
+    return years
 
 
 def _mpi_context():
@@ -159,16 +174,19 @@ def _run_local_tasks(
     ),
 )
 def preprocess(
-    input_dir: Annotated[
+    indir: Annotated[
         Path,
         typer.Option(
             exists=True,
             file_okay=False,
-            help="Directory containing downloaded Sentinel-2 Level-2A SAFE products.",
+            help=(
+                "Local Sentinel-2 data cache containing downloaded Level-2A SAFE "
+                "products."
+            ),
             rich_help_panel="Required Arguments",
         ),
     ],
-    output_dir: Annotated[
+    outdir: Annotated[
         Path,
         typer.Option(
             file_okay=False,
@@ -185,6 +203,44 @@ def preprocess(
             rich_help_panel="Preprocessing Options",
         ),
     ] = DEFAULT_PREPROCESS_BANDS,
+    aoi: Annotated[
+        Path | None,
+        typer.Option(
+            exists=True,
+            dir_okay=False,
+            help=(
+                "Optional AOI file. Only cached granules whose tile footprints "
+                "intersect it are processed. CRS metadata is read from the file."
+            ),
+            rich_help_panel="Selection Options",
+        ),
+    ] = None,
+    years: Annotated[
+        str | None,
+        typer.Option(
+            help=(
+                "Optional space- or comma-separated acquisition years. Omit to "
+                "consider all years in the data cache."
+            ),
+            rich_help_panel="Selection Options",
+        ),
+    ] = None,
+    speriod: Annotated[
+        datetime,
+        typer.Option(
+            help="Start month and day of the inclusive seasonal selection window.",
+            formats=["%m-%d", "%m/%d", "%m %d", "%b-%d", "%b %d", "%B-%d", "%B %d"],
+            rich_help_panel="Selection Options",
+        ),
+    ] = datetime(2000, 1, 1, tzinfo=UTC),
+    eperiod: Annotated[
+        datetime,
+        typer.Option(
+            help="End month and day of the inclusive seasonal selection window.",
+            formats=["%m-%d", "%m/%d", "%m %d", "%b-%d", "%b %d", "%B-%d", "%B %d"],
+            rich_help_panel="Selection Options",
+        ),
+    ] = datetime(2000, 12, 31, tzinfo=UTC),
     res: Annotated[
         S2Res,
         typer.Option(
@@ -196,7 +252,7 @@ def preprocess(
         str,
         typer.Option(
             help=(
-                "Space- or comma-separated SCL classes to mask. Options: 0 no data, "
+                "Space- or comma-separated SCL pixel classes to mask. Options: 0 no data, "
                 "1 saturated/defective, 2 dark-area pixels, 3 cloud shadows, "
                 "4 vegetation, 5 non-vegetated, 6 water, 7 unclassified, "
                 "8 medium-probability cloud, 9 high-probability cloud, "
@@ -240,15 +296,22 @@ def preprocess(
         write_preprocess_results,
     )
 
-    # Parse user-facing lists before discovery or worker startup.
+    # Parse and validate user-facing selectors before discovery or worker startup.
     band_values = _parse_bands(bands)
     mask_values = _parse_mask_classes(mask_classes)
+    year_values = _parse_years(years)
+    start_period = (speriod.month, speriod.day)
+    end_period = (eperiod.month, eperiod.day)
+    if end_period < start_period:
+        raise typer.BadParameter(
+            "--eperiod must be on or after --speriod within each year"
+        )
     config = S2PreprocessConfig(
         bands=band_values,
         resolution_m=int(res.value),
         mask_classes=mask_values,
     )
-    output_dir = Path(output_dir).resolve()
+    output_dir = Path(outdir).resolve()
 
     # Detect an MPI launch automatically while keeping mpi4py optional for local use.
     try:
@@ -258,10 +321,23 @@ def preprocess(
         raise ClickException(str(error)) from error
 
     # Every rank discovers the same immutable tasks, then works a deterministic shard.
-    granules = discover_s2_granules(input_dir, band_values, int(res.value))
+    try:
+        granules = discover_s2_granules(
+            indir,
+            band_values,
+            int(res.value),
+            aoi=aoi,
+            years=year_values,
+            speriod=start_period,
+            eperiod=end_period,
+        )
+    except (FileNotFoundError, TypeError, ValueError) as error:
+        raise ClickException(
+            f"Could not select Sentinel-2 granules: {error}"
+        ) from error
     if not granules:
         if rank == 0:
-            typer.echo(f"Found 0 Sentinel-2 granules in {input_dir}")
+            typer.echo(f"Found 0 Sentinel-2 granules in {indir}")
         raise typer.Exit()
     state = read_preprocess_state(output_dir)
     recipe_id = preprocess_recipe_id(config)

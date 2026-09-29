@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import json
 import struct
 from pathlib import Path
 
 import pytest
+from shapely.geometry import box, mapping
 
 from sentinel_py.enums import S2_BAND_IDS, S2Bands
 from sentinel_py.s2.base import S2Granule, S2PreprocessConfig
-from sentinel_py.s2.discover import read_l2a_radiometry
+from sentinel_py.s2.discover import discover_s2_granules, read_l2a_radiometry
 
 
 def _metadata(path: Path, *, include_offsets: bool = True) -> Path:
@@ -24,6 +26,24 @@ def _metadata(path: Path, *, include_offsets: bool = True) -> Path:
         f"{offsets}</Level2A>"
     )
     return path
+
+
+def _local_safe(root: Path, acquired: str, *, ulx: int = 500000) -> Path:
+    """Create a minimal local SAFE tree suitable for discovery tests."""
+    safe = root / (f"S2A_MSIL2A_{acquired}_N0500_R001_T31NAA_{acquired}.SAFE")
+    granule = safe / "GRANULE" / f"L2A_T31NAA_A000001_{acquired}"
+    image_dir = granule / "IMG_DATA" / "R20m"
+    image_dir.mkdir(parents=True)
+    (safe / "MTD_MSIL2A.xml").write_text("<Level2A/>")
+    (image_dir / f"T31NAA_{acquired}_B02_20m.jp2").touch()
+    (image_dir / f"T31NAA_{acquired}_SCL_20m.jp2").touch()
+    (granule / "MTD_TL.xml").write_text(
+        "<Tile><HORIZONTAL_CS_CODE>EPSG:32631</HORIZONTAL_CS_CODE>"
+        '<Size resolution="10"><NROWS>10</NROWS><NCOLS>10</NCOLS></Size>'
+        f'<Geoposition resolution="10"><ULX>{ulx}</ULX><ULY>100</ULY>'
+        "</Geoposition></Tile>"
+    )
+    return safe
 
 
 def test_s2_metadata_ids_cover_the_canonical_band_enum():
@@ -48,6 +68,31 @@ def test_read_l2a_radiometry_treats_pre_offset_products_as_zero(tmp_path: Path):
     )
 
     assert set(offsets.values()) == {0}
+
+
+def test_discovery_filters_local_cache_by_aoi_year_and_season(tmp_path: Path):
+    _local_safe(tmp_path, "20230615T120000")
+    _local_safe(tmp_path, "20240115T120000")
+    _local_safe(tmp_path, "20240615T120000", ulx=700000)
+    aoi = tmp_path / "aoi.geojson"
+    aoi.write_text(
+        '{"type":"Feature","properties":{},"geometry":'
+        + json.dumps(mapping(box(2.999, -0.001, 3.002, 0.002)))
+        + "}"
+    )
+
+    granules = discover_s2_granules(
+        tmp_path,
+        ("B02",),
+        20,
+        aoi=aoi,
+        years=(2023, 2024),
+        speriod=(6, 1),
+        eperiod=(8, 31),
+    )
+
+    assert [granule.acquisition_time for granule in granules] == ["20230615T120000"]
+    assert granules[0].band_paths["B02"].name.endswith("_B02_20m.jp2")
 
 
 def test_preprocessed_vrt_applies_offset_mask_and_cache(tmp_path: Path):
@@ -78,9 +123,7 @@ def test_preprocessed_vrt_applies_offset_mask_and_cache(tmp_path: Path):
         dataset = gdal.GetDriverByName("GTiff").Create(
             str(path), size, size, 1, gdal.GDT_UInt16
         )
-        dataset.SetGeoTransform(
-            (500000, resolution, 0, 1000000, 0, -resolution)
-        )
+        dataset.SetGeoTransform((500000, resolution, 0, 1000000, 0, -resolution))
         dataset.SetSpatialRef(spatial_reference)
         dataset.GetRasterBand(1).WriteRaster(
             0,

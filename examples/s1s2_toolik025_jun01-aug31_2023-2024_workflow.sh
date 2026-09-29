@@ -1,11 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Restore the selected GDAL library path when macOS strips DYLD variables.
+if [[ "$(uname -s)" == "Darwin" ]] && command -v gdal-config >/dev/null 2>&1; then
+  GDAL_PREFIX="$(gdal-config --prefix)"
+  export GDAL_DATA="$(gdal-config --datadir)"
+  export DYLD_FALLBACK_LIBRARY_PATH="${GDAL_PREFIX}/lib${DYLD_FALLBACK_LIBRARY_PATH:+:${DYLD_FALLBACK_LIBRARY_PATH}}"
+  unset GDAL_PREFIX
+fi
+
 # Paths
 AOI="../data/aois/toolik_025_aoi.geojson"
 LOGPATH="../data/logs/download"
 LOGFILENAME=$(basename "$0")
 OUTPATH="../data"
+
+# Re-used params
+RES=20
+YEARS="2023 2024"
+SPERIOD=06-01
+EPERIOD=08-31
 
 ################################
 # S2
@@ -20,9 +34,9 @@ OUTPATH="../data"
 sentinel-py cdse query \
   --aoi $AOI \
   --crs EPSG:4326 \
-  --years "2023 2024" \
-  --speriod 06-01 \
-  --eperiod 08-31 \
+  --years "$YEARS" \
+  --speriod "$SPERIOD" \
+  --eperiod "$EPERIOD" \
   --product S2MSI2A \
   --log $LOGPATH/${LOGFILENAME}
 
@@ -30,8 +44,18 @@ sentinel-py cdse download \
   --mission S2 \
   --bands "B02 B03 B04 B05 B06 B07 B08 B8A B11 B12 SCL" \
   --outdir $OUTPATH/s2/raw \
-  --res 20 \
+  --res $RES \
   --config $HOME/.s5cfg \
+  --log $LOGPATH/${LOGFILENAME}
+
+sentinel-py s2 preprocess \
+  --indir $OUTPATH/s2/raw \
+  --outdir $OUTPATH/s2/preprocessed \
+  --res $RES \
+  --aoi $AOI \
+  --years "$YEARS" \
+  --speriod "$SPERIOD" \
+  --eperiod "$EPERIOD" \
   --log $LOGPATH/${LOGFILENAME}
 
 ################################
@@ -50,15 +74,15 @@ sentinel-py cdse download \
 
 # And then set the --config flag to point to your .netrc file
 
-# Query/Download all Sentinel-1 summer scenes for 2023–2024
-sentinel-py asf query \
-  --aoi $AOI \
-  --years "2023 2024" \
-  --speriod 06-01 \
-  --eperiod 08-31 \
+# # Query/Download all Sentinel-1 summer scenes for 2023–2024
+# sentinel-py asf query \
+#   --aoi $AOI \
+#   --years "$YEARS" \
+#   --speriod "$SPERIOD" \
+#   --eperiod "$EPERIOD" \
 
-sentinel-py asf download \
-  --outdir $OUTPATH/s1/raw \
-  --config $HOME/.earthdata.netrc \
-  --processes 8 \
+# sentinel-py asf download \
+#   --outdir $OUTPATH/s1/raw \
+#   --config $HOME/.earthdata.netrc \
+#   --processes 8 \
   

@@ -40,16 +40,63 @@ class _RasterGrid(TypedDict):
 ########################################################################################
 
 
+def _import_error_chain(error: ImportError) -> str:
+    """Return concise details from every exception in an import failure chain."""
+    details = []
+    current: BaseException | None = error
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        details.append(f"{type(current).__name__}: {current}")
+        current = current.__cause__ or current.__context__
+    return " | ".join(details)
+
+
+def _gdal_import_error(error: ImportError) -> RuntimeError:
+    """Build an actionable error for missing or unloadable GDAL bindings."""
+    details = _import_error_chain(error)
+    linker_failure = any(
+        marker in details
+        for marker in (
+            "Library not loaded",
+            "cannot open shared object file",
+            "image not found",
+            "Symbol not found",
+        )
+    )
+    if linker_failure:
+        fallback_path = os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "<unset>")
+        return RuntimeError(
+            "GDAL Python bindings are installed, but the native GDAL library could "
+            "not be loaded. On macOS, load your shell profile before running the "
+            "command (for example, 'source ~/.bash_profile') and verify that "
+            "DYLD_FALLBACK_LIBRARY_PATH includes the GDAL lib directory. "
+            f"Current DYLD_FALLBACK_LIBRARY_PATH: {fallback_path}. "
+            f"Import details: {details}"
+        )
+
+    # Distinguish an absent Python package from an installed package that cannot load.
+    if "No module named 'osgeo'" in details or 'No module named "osgeo"' in details:
+        return RuntimeError(
+            "GDAL Python bindings are not installed in the active Python environment. "
+            "Install the processing dependencies with 'uv sync --extra processing', "
+            "then verify with 'python -c \"from osgeo import gdal; "
+            "print(gdal.VersionInfo())\"'. "
+            f"Import details: {details}"
+        )
+    return RuntimeError(
+        "GDAL Python bindings could not be imported. Confirm that the Python GDAL "
+        "package matches the native gdal-config version. "
+        f"Import details: {details}"
+    )
+
+
 def _gdal():
     """Import GDAL only when preprocessing is invoked and enable exceptions."""
     try:
         from osgeo import gdal
     except ImportError as error:
-        raise RuntimeError(
-            "GDAL Python bindings are required for 's2 preprocess'. Install the "
-            "sentinel-py processing dependencies and ensure the matching GDAL "
-            "library is visible to the dynamic linker."
-        ) from error
+        raise _gdal_import_error(error) from error
     gdal.UseExceptions()
     return gdal
 

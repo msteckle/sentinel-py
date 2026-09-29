@@ -10,6 +10,7 @@ from shapely.geometry import box, mapping
 from sentinel_py.enums import S2_BAND_IDS, S2Bands
 from sentinel_py.s2.base import S2Granule, S2PreprocessConfig
 from sentinel_py.s2.discover import discover_s2_granules, read_l2a_radiometry
+from sentinel_py.s2.preprocess import _gdal_import_error
 
 
 def _metadata(path: Path, *, include_offsets: bool = True) -> Path:
@@ -50,6 +51,32 @@ def test_s2_metadata_ids_cover_the_canonical_band_enum():
     assert set(S2_BAND_IDS) == {band.value for band in S2Bands}
     assert S2_BAND_IDS["B01"] == "0"
     assert S2_BAND_IDS["B8A"] == "8"
+
+
+def test_gdal_import_error_reports_missing_python_bindings():
+    error = ModuleNotFoundError("No module named 'osgeo'", name="osgeo")
+
+    message = str(_gdal_import_error(error))
+
+    assert "not installed in the active Python environment" in message
+    assert "uv sync --extra processing" in message
+    assert "ModuleNotFoundError: No module named 'osgeo'" in message
+
+
+def test_gdal_import_error_preserves_native_linker_cause(monkeypatch):
+    monkeypatch.delenv("DYLD_FALLBACK_LIBRARY_PATH", raising=False)
+    linker_error = ImportError(
+        "dlopen(osgeo/_gdal.so): Library not loaded: @rpath/libgdal.39.dylib"
+    )
+    error = ModuleNotFoundError("No module named '_gdal'", name="_gdal")
+    error.__cause__ = linker_error
+
+    message = str(_gdal_import_error(error))
+
+    assert "bindings are installed" in message
+    assert "source ~/.bash_profile" in message
+    assert "DYLD_FALLBACK_LIBRARY_PATH: <unset>" in message
+    assert "Library not loaded: @rpath/libgdal.39.dylib" in message
 
 
 def test_read_l2a_radiometry_uses_esa_band_ids(tmp_path: Path):

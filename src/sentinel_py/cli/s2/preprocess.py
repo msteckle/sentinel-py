@@ -313,11 +313,23 @@ def preprocess(
     )
     output_dir = Path(outdir).resolve()
 
-    # Detect an MPI launch automatically while keeping mpi4py optional for local use.
+    # Detect MPI before opening the rank-zero log shared by preprocessing startup.
     try:
         communicator, rank, mpi_size = _mpi_context()
+    except RuntimeError as error:
+        raise ClickException(str(error)) from error
+    logger = (
+        get_logger(name="s2_preprocess_logger", logpath=log, verbose=verbose)
+        if rank == 0
+        else None
+    )
+
+    # Validate GDAL after logging starts so native import failures reach the log file.
+    try:
         gdal_version = validate_gdal_for_preprocessing()
     except RuntimeError as error:
+        if logger:
+            logger.exception("GDAL preprocessing validation failed")
         raise ClickException(str(error)) from error
 
     # Every rank discovers the same immutable tasks, then works a deterministic shard.
@@ -332,11 +344,15 @@ def preprocess(
             eperiod=end_period,
         )
     except (FileNotFoundError, TypeError, ValueError) as error:
+        if logger:
+            logger.exception("Sentinel-2 granule selection failed")
         raise ClickException(
             f"Could not select Sentinel-2 granules: {error}"
         ) from error
     if not granules:
         if rank == 0:
+            if logger:
+                logger.warning("Found 0 Sentinel-2 granules in %s", indir)
             typer.echo(f"Found 0 Sentinel-2 granules in {indir}")
         raise typer.Exit()
     state = read_preprocess_state(output_dir)
@@ -355,9 +371,7 @@ def preprocess(
     # Report the immutable recipe once and run local work on every MPI rank.
     start_clock = time.monotonic()
     started_at = datetime.now().astimezone()
-    logger = None
     if rank == 0:
-        logger = get_logger(name="s2_preprocess_logger", logpath=log, verbose=verbose)
         typer.echo(f"Found {len(granules)} Sentinel-2 granule(s).")
         typer.echo(f"Preprocessing recipe: {recipe_id}")
         typer.echo(f"GDAL: {gdal_version} with native muparser VRT expressions")

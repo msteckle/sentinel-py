@@ -14,6 +14,7 @@ uv.lock
 # Data files
 data/s1
 data/s2
+data/arcticdem
 data/logs
 data/tests
 data/aois

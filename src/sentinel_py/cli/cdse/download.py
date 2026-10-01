@@ -252,7 +252,7 @@ def download(
         storage.known_additional_bytes,
         storage.unknown_size_assets,
     )
-    confirm_download(assume_yes=yes)
+    confirm_download(assume_yes=yes, storage=storage)
 
     started = time.time()
     started_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started))

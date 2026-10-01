@@ -40,9 +40,17 @@ def echo_storage_summary(summary: DownloadStorageSummary) -> None:
     typer.echo(f"Assets without a reported size: {summary.unknown_size_assets:,}")
 
 
-def confirm_download(*, assume_yes: bool) -> None:
-    """Require standard interactive confirmation unless --yes was supplied."""
+def confirm_download(
+    *, assume_yes: bool, storage: DownloadStorageSummary | None = None
+) -> None:
+    """Require confirmation unless already-complete storage is known."""
     if assume_yes:
+        return
+    if (
+        storage is not None
+        and storage.known_additional_bytes == 0
+        and storage.unknown_size_assets == 0
+    ):
         return
     if not typer.confirm("Continue with download?", default=False):
         typer.echo("Download cancelled.")

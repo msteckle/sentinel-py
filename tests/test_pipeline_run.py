@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import geopandas as gpd
 import numpy as np
-import pytest
 import rasterio
 from pydantic import BaseModel, ConfigDict
 from rasterio.transform import from_origin
 from shapely.geometry import box
 
-from sentinel_py.pipeline import ProcessorRegistry, load_pipeline
+from sentinel_py.pipeline import PipelineConfig
+from sentinel_py.pipeline.processors import ProcessorRegistry
 from sentinel_py.pipeline.run import run_pipeline
 
 
@@ -61,7 +62,7 @@ outputs:
     logger = logging.getLogger("generic-pipeline-test")
     logger.addHandler(logging.NullHandler())
 
-    result = run_pipeline(load_pipeline(pipeline, registry=registry), logger)
+    result = run_pipeline(PipelineConfig.from_file(pipeline, registry=registry), logger)
 
     assert calls == ["source", "result"]
     assert result.node_results == {"source": 1, "result": 3}
@@ -140,10 +141,12 @@ outputs:
     logger = logging.getLogger("pipeline-end-to-end-test")
     logger.addHandler(logging.NullHandler())
 
-    result = run_pipeline(load_pipeline(pipeline), logger)
+    result = run_pipeline(PipelineConfig.from_file(pipeline), logger)
 
     worker_results = result.output_results["result"].results
     assert [item.status for item in worker_results] == ["written", "written"]
-    reflectance = next(item for item in worker_results if item.variable == "reflectance")
+    reflectance = next(
+        item for item in worker_results if item.variable == "reflectance"
+    )
     with rasterio.open(reflectance.output_path) as output:
         assert output.read(1).tolist() == [[65535, 100], [65535, 2000]]

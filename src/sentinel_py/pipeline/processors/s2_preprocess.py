@@ -1,7 +1,3 @@
-"""
-Processor that
-"""
-
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -116,7 +112,7 @@ class S2PreprocessProcessor(Processor):
                 "canonical s2.preprocess currently requires square output pixels"
             )
         # Ensure the outputs are one of the existing formats we have
-        if not outputs or any(
+        if outputs and any(
             output.format not in {"cog", "xarray"} for output in outputs
         ):
             raise ValueError(

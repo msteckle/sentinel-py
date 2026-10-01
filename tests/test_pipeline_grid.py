@@ -1,5 +1,6 @@
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import geopandas as gpd
 import pytest
@@ -7,8 +8,9 @@ from affine import Affine
 from pydantic import BaseModel, ConfigDict
 from shapely.geometry import box
 
-from sentinel_py.pipeline import PipelineConfigError, ProcessorRegistry, load_pipeline
+from sentinel_py.pipeline import PipelineConfig, PipelineConfigError
 from sentinel_py.pipeline.grid import ChunkShape, plan_aoi_grid
+from sentinel_py.pipeline.processors import ProcessorRegistry
 
 
 def _write_aoi(
@@ -16,9 +18,7 @@ def _write_aoi(
     bounds: tuple[float, float, float, float],
     crs: str,
 ) -> Path:
-    gpd.GeoDataFrame(geometry=[box(*bounds)], crs=crs).to_file(
-        path, driver="GeoJSON"
-    )
+    gpd.GeoDataFrame(geometry=[box(*bounds)], crs=crs).to_file(path, driver="GeoJSON")
     return path
 
 
@@ -80,9 +80,7 @@ def test_grid_honors_nonzero_pixel_anchor(tmp_path: Path):
 
 def test_neighboring_aois_share_pixel_boundaries(tmp_path: Path):
     left = _write_aoi(tmp_path / "left.geojson", (0, 0, 100, 100), "EPSG:3857")
-    right = _write_aoi(
-        tmp_path / "right.geojson", (100, 0, 200, 100), "EPSG:3857"
-    )
+    right = _write_aoi(tmp_path / "right.geojson", (100, 0, 200, 100), "EPSG:3857")
     kwargs = {
         "crs": "EPSG:3857",
         "resolution": (30.0, 30.0),
@@ -182,7 +180,7 @@ def test_pipeline_builds_canonical_grid_from_yaml(tmp_path: Path):
   chunks: {y: 4, x: 6}""",
     )
 
-    config = load_pipeline(path, registry=_registry())
+    config = PipelineConfig.from_file(path, registry=_registry())
 
     assert config.output_grid.is_canonical
     assert config.output_grid.resolution == (20.0, 20.0)
@@ -241,7 +239,7 @@ def test_pipeline_rejects_invalid_canonical_grid(
     path = _canonical_pipeline(tmp_path, output_grid)
 
     with pytest.raises(PipelineConfigError, match=message):
-        load_pipeline(path, registry=_registry())
+        PipelineConfig.from_file(path, registry=_registry())
 
 
 def test_canonical_grid_requires_an_aoi(tmp_path: Path):
@@ -255,4 +253,4 @@ def test_canonical_grid_requires_an_aoi(tmp_path: Path):
     )
 
     with pytest.raises(PipelineConfigError, match="selection.aoi is required"):
-        load_pipeline(path, registry=_registry())
+        PipelineConfig.from_file(path, registry=_registry())

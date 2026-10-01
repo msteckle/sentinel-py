@@ -1,6 +1,6 @@
 import pytest
 
-from sentinel_py.pipeline.writer import ArtifactOutputWriter, OutputWriterRegistry
+from sentinel_py.pipeline.writers import ArtifactOutputWriter, OutputWriterRegistry
 
 
 def test_output_writer_registry_rejects_duplicate_formats():

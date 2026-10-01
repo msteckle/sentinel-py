@@ -10,7 +10,7 @@ from typing import Any
 
 from sentinel_py.pipeline.config import PipelineConfig
 from sentinel_py.pipeline.execution import compute_dask_tasks
-from sentinel_py.pipeline.processors.base import ProcessorContext, get_default_registry
+from sentinel_py.pipeline.processors.base import ProcessorContext
 from sentinel_py.pipeline.writers.base import (
     OutputExecutionResult,
     OutputWriterRegistry,
@@ -46,7 +46,7 @@ def run_pipeline(
     # Loop through each processor listed under the YAML ``nodes`` section
     for node in config.ordered_nodes:
         # Get the node's associated processor from the registry
-        registry = get_default_registry()
+        registry = config.registry
         processor = registry.get(node.node_type)
         # Get the node's input artifacts from previously executed nodes
         inputs = {

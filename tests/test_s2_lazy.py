@@ -10,7 +10,7 @@ import rasterio
 from rasterio.transform import from_origin
 from shapely.geometry import box
 
-from sentinel_py.pipeline import load_pipeline
+from sentinel_py.pipeline import PipelineConfig
 from sentinel_py.pipeline.run import run_pipeline
 
 
@@ -32,11 +32,7 @@ def _write_raster(path: Path, values: np.ndarray, resolution: int) -> None:
 
 def _synthetic_pipeline(tmp_path: Path) -> tuple[Path, Path]:
     acquired = "20240615T120000"
-    safe = (
-        tmp_path
-        / "raw"
-        / f"S2A_MSIL2A_{acquired}_N0500_R001_T06ABC_{acquired}.SAFE"
-    )
+    safe = tmp_path / "raw" / f"S2A_MSIL2A_{acquired}_N0500_R001_T06ABC_{acquired}.SAFE"
     granule = safe / "GRANULE" / f"L2A_T06ABC_A000001_{acquired}"
     offsets = "".join(
         f'<BOA_ADD_OFFSET band_id="{band_id}">-1000</BOA_ADD_OFFSET>'
@@ -135,7 +131,7 @@ def test_lazy_s2_processor_defers_reads_and_preserves_grid_masks_and_dtypes(
     logger = logging.getLogger("lazy-s2-test")
     logger.addHandler(logging.NullHandler())
 
-    result = run_pipeline(load_pipeline(pipeline_path), logger)
+    result = run_pipeline(PipelineConfig.from_file(pipeline_path), logger)
     dataset = result.outputs["result"]
 
     assert isinstance(dataset.reflectance.data, da.Array)
@@ -197,7 +193,7 @@ def test_local_dask_cog_outputs_share_reads_and_resume(
     logger = logging.getLogger("local-dask-cog-test")
     logger.addHandler(logging.NullHandler())
 
-    first = run_pipeline(load_pipeline(pipeline_path), logger)
+    first = run_pipeline(PipelineConfig.from_file(pipeline_path), logger)
 
     assert len(reads.read_text().splitlines()) == 4
     for output_id in ("first", "second"):
@@ -216,7 +212,7 @@ def test_local_dask_cog_outputs_share_reads_and_resume(
         assert raster.descriptions[0] == "B02"
 
     reads.unlink()
-    second = run_pipeline(load_pipeline(pipeline_path), logger)
+    second = run_pipeline(PipelineConfig.from_file(pipeline_path), logger)
 
     assert not reads.exists()
     for output_result in second.output_results.values():

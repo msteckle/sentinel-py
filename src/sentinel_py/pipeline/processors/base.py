@@ -85,16 +85,11 @@ class ProcessorRegistry:
         return tuple(sorted(self._processors))
 
 
-_DEFAULT_REGISTRY: ProcessorRegistry | None = None
-
-
 def get_default_registry() -> ProcessorRegistry:
     """Return the process-wide registry populated with built-in processors."""
-    global _DEFAULT_REGISTRY
-    if _DEFAULT_REGISTRY is None:
-        from sentinel_py.pipeline.processors import register_builtin_processors
+    from sentinel_py.pipeline.processors import register_builtin_processors
 
-        registry = ProcessorRegistry()
-        register_builtin_processors(cast(Any, registry))
-        _DEFAULT_REGISTRY = registry
+    registry = ProcessorRegistry()
+    register_builtin_processors(cast(Any, registry))
+    _DEFAULT_REGISTRY = registry
     return _DEFAULT_REGISTRY

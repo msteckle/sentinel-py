@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 
-from dask import delayed
+from dask.delayed import delayed
 
 from sentinel_py.pipeline.config import ExecutionConfig
 from sentinel_py.pipeline.execution import compute_dask_tasks

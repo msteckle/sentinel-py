@@ -25,7 +25,7 @@ from sentinel_py.pipeline.grid import (
     GridSpec,
     plan_aoi_grid,
 )
-from sentinel_py.pipeline.processor import ProcessorRegistry, get_default_registry
+from sentinel_py.pipeline.processors import ProcessorRegistry, get_default_registry
 
 _SEASON_PATTERN = re.compile(r"^(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$")
 
@@ -861,7 +861,7 @@ class PipelineConfig:
         )
 
         # Determine the processor registry to use, defaulting if none is provided
-        registry = get_default_registry()
+        registry = registry or get_default_registry()
 
         # Parse the individual sections of the pipeline configuration
         base_dir = pipeline_path.parent

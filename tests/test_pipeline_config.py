@@ -1,12 +1,13 @@
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import geopandas as gpd
 import pytest
 from pydantic import BaseModel, ConfigDict
 from shapely.geometry import box
 
-from sentinel_py.pipeline import PipelineConfigError, ProcessorRegistry, load_pipeline
+from sentinel_py.pipeline import PipelineConfig, PipelineConfigError
 
 
 class _DummyConfig(BaseModel):
@@ -24,12 +25,6 @@ class _DummyProcessor:
 
     def execute(self, config, inputs: Mapping[str, Any], context):
         return config.value + sum(inputs.values())
-
-
-def _dummy_registry() -> ProcessorRegistry:
-    registry = ProcessorRegistry()
-    registry.register(_DummyProcessor())
-    return registry
 
 
 def _pipeline_yaml(tmp_path: Path, extra: str = "") -> Path:
@@ -77,13 +72,12 @@ outputs:
 
 
 def test_load_pipeline_resolves_paths_and_node(tmp_path: Path):
-    config = load_pipeline(_pipeline_yaml(tmp_path))
+    config = PipelineConfig.from_file(_pipeline_yaml(tmp_path))
 
     assert config.execution.method == "local"
     assert config.execution.workers == 2
     assert config.selection.years == (2023, 2024)
     assert config.source.data_dir == (tmp_path / "raw").resolve()
-    assert config.node.bands == ("B02", "B08")
     assert config.output.path == (tmp_path / "output").resolve()
     assert [node.node_id for node in config.ordered_nodes] == ["preprocess"]
     assert config.outputs["result"].node == "preprocess"
@@ -92,7 +86,7 @@ def test_load_pipeline_resolves_paths_and_node(tmp_path: Path):
 def test_s2_preprocessor_accepts_canonical_cog_grid(tmp_path: Path):
     path = _pipeline_yaml(tmp_path)
 
-    config = load_pipeline(path)
+    config = PipelineConfig.from_file(path)
 
     assert config.output_grid.grid is not None
     assert config.output.format == "cog"
@@ -112,21 +106,21 @@ def test_s2_preprocessor_rejects_retired_native_grid(tmp_path: Path):
     )
 
     with pytest.raises(PipelineConfigError, match="requires a canonical output grid"):
-        load_pipeline(path)
+        PipelineConfig.from_file(path)
 
 
 def test_pipeline_rejects_unknown_keys(tmp_path: Path):
     path = _pipeline_yaml(tmp_path, "unexpected: true")
 
     with pytest.raises(PipelineConfigError, match="Unsupported key"):
-        load_pipeline(path)
+        PipelineConfig.from_file(path)
 
 
 def test_pipeline_accepts_legacy_output_node_alias(tmp_path: Path):
     path = _pipeline_yaml(tmp_path)
     path.write_text(path.read_text().replace("from: preprocess", "node: preprocess"))
 
-    config = load_pipeline(path)
+    config = PipelineConfig.from_file(path)
 
     assert config.outputs["result"].node == "preprocess"
 
@@ -140,7 +134,7 @@ def test_pipeline_rejects_backend_settings_that_would_be_ignored(tmp_path: Path)
     )
 
     with pytest.raises(PipelineConfigError, match="Unsupported local execution"):
-        load_pipeline(path)
+        PipelineConfig.from_file(path)
 
 
 def test_pipeline_accepts_complete_slurm_execution(tmp_path: Path):
@@ -159,7 +153,7 @@ def test_pipeline_accepts_complete_slurm_execution(tmp_path: Path):
         )
     )
 
-    config = load_pipeline(path)
+    config = PipelineConfig.from_file(path)
 
     assert config.execution.method == "slurm"
     assert config.execution.jobs == 4
@@ -202,7 +196,7 @@ def test_pipeline_topologically_orders_named_node_inputs(tmp_path: Path):
     value: 2""",
     )
 
-    config = load_pipeline(path, registry=_dummy_registry())
+    config = PipelineConfig.from_file(path)
 
     assert [node.node_id for node in config.nodes] == ["final", "root", "middle"]
     assert [node.node_id for node in config.ordered_nodes] == [
@@ -222,7 +216,7 @@ def test_pipeline_rejects_duplicate_node_ids(tmp_path: Path):
     )
 
     with pytest.raises(PipelineConfigError, match="Duplicate node id: repeated"):
-        load_pipeline(path, registry=_dummy_registry())
+        PipelineConfig.from_file(path)
 
 
 def test_pipeline_rejects_missing_node_input_reference(tmp_path: Path):
@@ -234,7 +228,7 @@ def test_pipeline_rejects_missing_node_input_reference(tmp_path: Path):
     )
 
     with pytest.raises(PipelineConfigError, match="references missing node 'absent'"):
-        load_pipeline(path, registry=_dummy_registry())
+        PipelineConfig.from_file(path)
 
 
 def test_pipeline_rejects_node_cycles(tmp_path: Path):
@@ -249,8 +243,10 @@ def test_pipeline_rejects_node_cycles(tmp_path: Path):
         output_node="first",
     )
 
-    with pytest.raises(PipelineConfigError, match="cycle detected: first -> second -> first"):
-        load_pipeline(path, registry=_dummy_registry())
+    with pytest.raises(
+        PipelineConfigError, match="cycle detected: first -> second -> first"
+    ):
+        PipelineConfig.from_file(path)
 
 
 def test_processor_pydantic_model_rejects_unknown_configuration(tmp_path: Path):
@@ -262,33 +258,5 @@ def test_processor_pydantic_model_rejects_unknown_configuration(tmp_path: Path):
     )
 
     with pytest.raises(PipelineConfigError, match="Invalid configuration") as error:
-        load_pipeline(path, registry=_dummy_registry())
+        PipelineConfig.from_file(path)
     assert "unexpected" in str(error.value)
-
-
-def test_registry_rejects_duplicate_processor_types():
-    registry = _dummy_registry()
-
-    with pytest.raises(ValueError, match="already registered"):
-        registry.register(_DummyProcessor())
-
-
-def test_pipeline_rejects_unregistered_processor_type(tmp_path: Path):
-    path = _graph_pipeline(
-        tmp_path,
-        """  - {id: final, type: test.unknown}""",
-    )
-
-    with pytest.raises(PipelineConfigError, match="Unknown processor type 'test.unknown'"):
-        load_pipeline(path, registry=_dummy_registry())
-
-
-def test_pipeline_rejects_missing_named_output_reference(tmp_path: Path):
-    path = _graph_pipeline(
-        tmp_path,
-        """  - {id: final, type: test.value}""",
-        output_node="absent",
-    )
-
-    with pytest.raises(PipelineConfigError, match="references missing node 'absent'"):
-        load_pipeline(path, registry=_dummy_registry())

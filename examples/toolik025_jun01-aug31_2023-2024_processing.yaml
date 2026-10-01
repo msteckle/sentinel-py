@@ -5,8 +5,8 @@ execution:
   # dask: connect to scheduler_address
   # slurm: create workers through dask-jobqueue
   method: local
-  workers: 4
-  threads_per_worker: 1
+  workers: 2
+  threads_per_worker: 2
 
 selection:
   aoi: ../data/aois/toolik_025_aoi.geojson
@@ -26,7 +26,11 @@ sources:
     type: s2.l2a.local
     data_dir: ../data/s2/raw
 
-# processing pipeline
+  arcticdem:
+    type: dem.local
+    data_dir: ../data/arcticdem/10m
+    pattern: "*.tif"
+
 nodes:
   - id: preprocess
     type: s2.preprocess
@@ -46,8 +50,21 @@ nodes:
     inputs: {data: all-composite}
     indices: [NDGI, NDWI1]
 
+  - id: terrain
+    type: dem
+    source: arcticdem
+    features: [elevation, aspect, slope, hillshade]
+    algorithm: Horn
+    hillshade_azimuth: 315
+    hillshade_altitude: 45
+
 outputs:
   composited:
     from: indices
     path: ../data/s2/summer_15D_med_indices
+    format: cog
+
+  terrain:
+    from: terrain
+    path: ../data/arcticdem/terrain_toolik025
     format: cog

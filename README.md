@@ -287,7 +287,7 @@ sentinel-py pgc query \
   --aoi data/aois/toolik_025_aoi.geojson
 ```
 
-The query manifest is cached under `~/.sentinel-py/cache/pgc/<QUERY_KEY>/manifest.parquet`. Repeating an identical query uses the cached manifest without contacting PGC. The manifest stores tile geometry and metadata so cached tile selections can be filtered by AOI without scanning local or remote directory structures.
+The query manifest is cached under `~/.sentinel-py/cache/pgc/<QUERY_KEY>/manifest.parquet`. Repeating an identical query uses the cached manifest without contacting PGC. Point and multipoint AOIs are queried independently, while multi-feature and multipolygon AOIs are queried component-by-component; returned footprints are exact-filtered and deduplicated so globally dispersed geometries do not create a large enclosing-bbox query. The manifest stores tile geometry and metadata so cached tile selections can be filtered by AOI without scanning local or remote directory structures.
 
 Download the latest cached PGC query in parallel:
 

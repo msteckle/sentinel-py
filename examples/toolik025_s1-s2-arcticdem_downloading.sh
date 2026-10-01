@@ -14,9 +14,9 @@ YEARS="2023 2024"
 SPERIOD=06-01
 EPERIOD=08-31
 
-################################
+########################################################################################
 # S2
-################################
+########################################################################################
 
 # Set up user/password for CDSE
 # Note: you need to have an account with CDSE to download S2 data
@@ -41,12 +41,9 @@ sentinel-py cdse download \
   --config $HOME/.s5cfg \
   --log $LOGPATH/${LOGFILENAME}
 
-sentinel-py run "$PIPELINE" \
-  --log $LOGPATH/${LOGFILENAME}
-
-################################
+########################################################################################
 # S1
-################################
+########################################################################################
 
 # Set up user/password for ASF
 # Note: you need to have an account with earthdata to download. You can do:
@@ -60,15 +57,32 @@ sentinel-py run "$PIPELINE" \
 
 # And then set the --config flag to point to your .netrc file
 
-# # Query/Download all Sentinel-1 summer scenes for 2023–2024
-# sentinel-py asf query \
-#   --aoi $AOI \
-#   --years "$YEARS" \
-#   --speriod "$SPERIOD" \
-#   --eperiod "$EPERIOD" \
+# Query/Download all Sentinel-1 summer scenes for 2023–2024
+sentinel-py asf query \
+  --aoi $AOI \
+  --years "$YEARS" \
+  --speriod "$SPERIOD" \
+  --eperiod "$EPERIOD"
 
-# sentinel-py asf download \
-#   --outdir $OUTPATH/s1/raw \
-#   --config $HOME/.earthdata.netrc \
-#   --processes 8 \
-  
+sentinel-py asf download \
+  --outdir $OUTPATH/s1/raw \
+  --config $HOME/.netrc \
+  --processes 8
+
+########################################################################################
+# ArcticDEM
+########################################################################################
+
+# Query ArcticDEM v4.1 10m mosaic tiles intersecting the AOI
+# PGC access is public; no credentials are required
+sentinel-py pgc query \
+  --aoi "$AOI" \
+  --crs EPSG:4326 \
+  --log "$LOGPATH/${LOGFILENAME}"
+
+# Download the cached ArcticDEM DEM GeoTIFF assets in parallel
+sentinel-py pgc download \
+  --outdir "$OUTPATH/arcticdem/10m" \
+  --processes 8 \
+  --retries 3 \
+  --log "$LOGPATH/${LOGFILENAME}"

@@ -3,10 +3,9 @@
 - Python 3.13+
 - [uv 0.11.7+](https://docs.astral.sh/uv/getting-started/installation/)
 
-Querying and downloading data do not require the Python GDAL bindings or SNAP.
-Sentinel-2 raster processing currently uses GDAL 3.13.3; install it with the
-optional `processing` dependency described below. The Python bindings must be built
-against the same version of the native GDAL library available in the environment.
+Querying and downloading data do not require raster-processing libraries or SNAP.
+Sentinel-2 raster processing uses Rasterio, xarray, and Dask through the optional
+`processing` dependency described below.
 
 ### Installation
 
@@ -44,15 +43,10 @@ For Slurm execution through Dask, install both processing and HPC extras:
 uv sync --no-dev --extra processing --extra hpc
 ```
 
-GDAL's Python package compiles against a native GDAL installation. If this command
-cannot find `gdal-config`, or reports a version mismatch, install/load native GDAL
-3.13.3 first and ensure its `gdal-config` is on `PATH`. This does not affect
-the default query/download installation.
-
 ### NERSC (Perlmutter)
 
-For query and download work on Perlmutter, no GDAL module or GDAL Python binding is
-needed. After cloning the repository and installing
+For query and download work on Perlmutter, no raster-processing extra is needed.
+After cloning the repository and installing
 [uv](https://docs.astral.sh/uv/getting-started/installation/) in your user account:
 
 ```bash
@@ -62,8 +56,7 @@ uv run sentinel-py --help
 ```
 
 The first command creates `.venv` and installs only the base query/download
-dependencies. Do not pass `--extra processing` unless the job will run the
-GDAL-based Sentinel-2 processing commands.
+dependencies. Add `--extra processing` only for Sentinel-2 processing jobs.
 
 Large downloads should go to Perlmutter scratch rather than your home directory.
 For example:
@@ -138,23 +131,28 @@ sentinel-py run examples/s2_preprocess_pipeline.yaml
 Paths inside the YAML are resolved relative to the YAML file. Nodes form a validated
 directed acyclic graph: each registered processor owns its Pydantic configuration,
 and named `inputs` refer to upstream node IDs. Named outputs use `from` to select the
-node to materialize. The initial `s2.preprocess` processor retains the existing VRT
-implementation and supports `local`, external `dask`, or `slurm` execution. It
-currently preserves each granule's native UTM CRS, so `output_grid.crs` must be
-`native`. See `examples/s2_preprocess_pipeline.yaml` for a complete pipeline and
-`docs/architecture/processing-pipeline.md` for the graph and processor contracts.
+node to materialize. The `s2.preprocess` processor returns an xarray Dataset backed
+by Dask. An explicit projected metre CRS, scalar or x/y
+resolution, pixel anchor, and y/x chunk shape define aligned bounds and chunk windows.
+Each scene/chunk task directly reads all requested bands and SCL, applies XML NODATA
+and SATURATED masks before BOA offsets and resampling, aligns to the canonical grid,
+and applies the SCL mask. Reflectance DN remains `uint16`; SCL is `uint8`.
 
-The pipeline schema also supports canonical AOI-derived grids for future processors:
-an explicit CRS, scalar or x/y resolution, pixel anchor, and y/x Dask chunk shape are
-converted into aligned bounds, a north-up affine transform, dimensions, and row-major
-chunk windows. The current VRT compatibility processor deliberately rejects that mode
-until raster reads are migrated to the new grid contract.
+Building this Dataset performs SAFE discovery and reads XML metadata, but raster I/O
+remains deferred until an output writer requests Dask computation. The example's
+`format: cog` writer creates compressed, internally tiled COGs for each scene,
+variable, and canonical spatial chunk. It writes files atomically and records
+resumable state under the output directory. Use `format: xarray` only when the caller
+needs the lazy in-memory artifact without materialization.
 
-The AOI selects intersecting local granules; it does not clip their output extent.
-Omit `selection.aoi` or `selection.years` to retain all cached granules for that
-selector. Output VRTs preserve each granule's native UTM CRS and apply BOA DN
-offsets, XML-declared radiometric NODATA and SATURATED masks, and the requested SCL
-class mask lazily when pixels are read.
+All requested outputs are combined into one Dask computation so they reuse common
+upstream reads. Local execution uses isolated Dask worker processes; external Dask
+and Slurm submit the same graph to their configured clusters. Native raster calls
+are serialized between threads within each worker process. Workers return structured
+results while logging and state updates remain centralized. See
+`examples/s2_preprocess_pipeline.yaml` and
+`docs/architecture/processing-pipeline.md` for the complete configuration and
+contracts.
 
 On a Slurm system, replace the example's `execution` section with site-specific
 resources such as:

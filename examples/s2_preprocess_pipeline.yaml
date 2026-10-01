@@ -1,7 +1,7 @@
 version: 1
 
 execution:
-  # local: process workers on this machine
+  # local: isolated Dask worker processes on this machine
   # dask: connect to scheduler_address
   # slurm: create workers through dask-jobqueue
   method: local
@@ -15,11 +15,11 @@ selection:
   eperiod: "08-31"
 
 output_grid:
-  # The current VRT compatibility processor preserves each granule's native UTM CRS.
-  # Canonical-grid processors instead use explicit crs, resolution, extent: aoi,
-  # anchor: [x, y], and chunks: {y: ..., x: ...}.
-  crs: native
-  resolution_m: 20
+  crs: EPSG:3338
+  resolution: 20
+  extent: aoi
+  anchor: [0, 0]
+  chunks: {y: 1024, x: 1024}
 
 sources:
   s2:
@@ -38,4 +38,4 @@ outputs:
   preprocessed:
     from: preprocess
     path: ../data/s2/preprocessed
-    format: vrt
+    format: cog

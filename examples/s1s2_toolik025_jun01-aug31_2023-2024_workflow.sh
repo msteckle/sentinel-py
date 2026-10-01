@@ -1,14 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Restore the selected GDAL library path when macOS strips DYLD variables.
-if [[ "$(uname -s)" == "Darwin" ]] && command -v gdal-config >/dev/null 2>&1; then
-  GDAL_PREFIX="$(gdal-config --prefix)"
-  export GDAL_DATA="$(gdal-config --datadir)"
-  export DYLD_FALLBACK_LIBRARY_PATH="${GDAL_PREFIX}/lib${DYLD_FALLBACK_LIBRARY_PATH:+:${DYLD_FALLBACK_LIBRARY_PATH}}"
-  unset GDAL_PREFIX
-fi
-
 # Paths
 AOI="../data/aois/toolik_025_aoi.geojson"
 LOGPATH="../data/logs/download"

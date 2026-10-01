@@ -32,7 +32,8 @@ dependencies = [
 [project.optional-dependencies]
 processing = [
     "dask[distributed]>=2025.9.0",
-    "gdal[numpy]==3.13.3",
+    "rasterio>=1.4.4",
+    "xarray>=2025.1.1",
 ]
 hpc = [
     "dask-jobqueue>=0.9.0",

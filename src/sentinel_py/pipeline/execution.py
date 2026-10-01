@@ -1,70 +1,32 @@
-"""Execution backends for pipeline preprocessing tasks."""
+"""Dask execution backends shared by pipeline output writers."""
 
 from __future__ import annotations
 
-import multiprocessing
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from pathlib import Path
+from typing import Any
 
 from sentinel_py.pipeline.config import ExecutionConfig
-from sentinel_py.s2.base import S2Granule, S2PreprocessConfig, S2PreprocessResult
 
 
-def _preprocess_one(
-    granule: S2Granule,
-    config: S2PreprocessConfig,
-    output_dir: Path,
-    cached_row: dict[str, object] | None,
-) -> S2PreprocessResult:
-    from sentinel_py.s2.preprocess import preprocess_s2_granule
-
-    return preprocess_s2_granule(granule, config, output_dir, cached_row)
-
-
-def _cached_row(
-    granule: S2Granule,
-    rows: dict[tuple[str, str], dict[str, object]],
-) -> dict[str, object] | None:
-    return rows.get((granule.product_id, granule.granule_id))
-
-
-def _run_local(
-    granules: list[S2Granule],
-    config: S2PreprocessConfig,
-    output_dir: Path,
-    cached_rows: dict[tuple[str, str], dict[str, object]],
-    execution: ExecutionConfig,
-) -> list[S2PreprocessResult]:
-    if execution.workers == 1:
-        return [
-            _preprocess_one(granule, config, output_dir, _cached_row(granule, cached_rows))
-            for granule in granules
-        ]
-    context = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(
-        max_workers=execution.workers, mp_context=context
-    ) as executor:
-        futures = [
-            executor.submit(
-                _preprocess_one,
-                granule,
-                config,
-                output_dir,
-                _cached_row(granule, cached_rows),
-            )
-            for granule in granules
-        ]
-        return [future.result() for future in as_completed(futures)]
+def _collect_results(*results: Any) -> tuple[Any, ...]:
+    return tuple(results)
 
 
 def _dask_client(execution: ExecutionConfig):
     try:
-        from distributed import Client
+        from distributed import Client, LocalCluster
     except ImportError as error:
         raise RuntimeError(
             "Dask execution is not installed. Install the processing dependencies."
         ) from error
 
+    if execution.method == "local":
+        cluster = LocalCluster(
+            n_workers=execution.workers,
+            threads_per_worker=execution.threads_per_worker,
+            processes=True,
+            dashboard_address=None,
+        )
+        return Client(cluster), cluster
     if execution.method == "dask":
         return Client(execution.scheduler_address), None
 
@@ -96,47 +58,25 @@ def _dask_client(execution: ExecutionConfig):
     return Client(cluster), cluster
 
 
-def _run_dask(
-    granules: list[S2Granule],
-    config: S2PreprocessConfig,
-    output_dir: Path,
-    cached_rows: dict[tuple[str, str], dict[str, object]],
+def compute_dask_tasks(
+    tasks: tuple[Any, ...] | list[Any],
     execution: ExecutionConfig,
-) -> list[S2PreprocessResult]:
+) -> tuple[Any, ...]:
+    """Compute one combined graph on local, external, or Slurm Dask."""
+    if not tasks:
+        return ()
     try:
-        from distributed import as_completed
+        from dask import delayed
     except ImportError as error:
         raise RuntimeError(
             "Dask execution is not installed. Install the processing dependencies."
         ) from error
+    combined = delayed(_collect_results, pure=False)(*tasks)
     client, cluster = _dask_client(execution)
     try:
-        futures = [
-            client.submit(
-                _preprocess_one,
-                granule,
-                config,
-                output_dir,
-                _cached_row(granule, cached_rows),
-                pure=False,
-            )
-            for granule in granules
-        ]
-        return [future.result() for future in as_completed(futures)]
+        future = client.compute(combined, optimize_graph=False)
+        return tuple(client.gather(future))
     finally:
         client.close()
         if cluster is not None:
             cluster.close()
-
-
-def run_preprocess_tasks(
-    granules: list[S2Granule],
-    config: S2PreprocessConfig,
-    output_dir: Path,
-    cached_rows: dict[tuple[str, str], dict[str, object]],
-    execution: ExecutionConfig,
-) -> list[S2PreprocessResult]:
-    """Execute preprocessing with the configured local or distributed backend."""
-    if execution.method == "local":
-        return _run_local(granules, config, output_dir, cached_rows, execution)
-    return _run_dask(granules, config, output_dir, cached_rows, execution)

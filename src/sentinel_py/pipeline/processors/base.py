@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 from pydantic import BaseModel
 
@@ -15,6 +16,7 @@ class ProcessorConfig(Protocol):
 
     def model_dump(self, **kwargs: Any) -> dict[str, Any]:
         """Return the validated configuration as ordinary Python values."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -93,6 +95,6 @@ def get_default_registry() -> ProcessorRegistry:
         from sentinel_py.pipeline.processors import register_builtin_processors
 
         registry = ProcessorRegistry()
-        register_builtin_processors(registry)
+        register_builtin_processors(cast(Any, registry))
         _DEFAULT_REGISTRY = registry
     return _DEFAULT_REGISTRY

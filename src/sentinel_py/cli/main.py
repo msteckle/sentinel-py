@@ -1,3 +1,5 @@
+"""Central CLI entry point of subcommands"""
+
 import typer
 
 from .asf import app as asf_app

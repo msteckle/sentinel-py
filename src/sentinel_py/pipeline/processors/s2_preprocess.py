@@ -1,21 +1,32 @@
-"""Adapter exposing the existing Sentinel-2 VRT workflow as a processor."""
+"""
+Processor that
+"""
 
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pyproj import CRS
 
+from sentinel_py.cache import deterministic_cache_key
 from sentinel_py.enums import S2Bands
-from sentinel_py.pipeline.execution import run_preprocess_tasks
-from sentinel_py.pipeline.processor import ProcessorConfig, ProcessorContext
-from sentinel_py.s2.base import S2PreprocessConfig, S2PreprocessResult
+from sentinel_py.pipeline.processors.base import (
+    Processor,
+    ProcessorConfig,
+    ProcessorContext,
+)
 
 DEFAULT_BANDS = ("B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12")
 DEFAULT_MASK_CLASSES = (0, 1, 3, 8, 9, 10, 11)
+
+########################################################################################
+# s2.preprocess
+########################################################################################
+
+
+# Pydantic validation model for s2.preprocess parameters -------------------------------
 
 
 class S2PreprocessNodeConfig(BaseModel):
@@ -32,7 +43,7 @@ class S2PreprocessNodeConfig(BaseModel):
     @classmethod
     def validate_bands(cls, value: Any) -> tuple[str, ...]:
         if not isinstance(value, (list, tuple)):
-            raise ValueError("bands must be a list")
+            raise TypeError("bands must be a list")
         bands = tuple(dict.fromkeys(str(item).upper() for item in value))
         supported = {band.value for band in S2Bands}
         if not bands or any(band not in supported for band in bands):
@@ -43,7 +54,7 @@ class S2PreprocessNodeConfig(BaseModel):
     @classmethod
     def validate_mask_classes(cls, value: Any) -> tuple[int, ...]:
         if not isinstance(value, (list, tuple)):
-            raise ValueError("mask_classes must be a list")
+            raise TypeError("mask_classes must be a list")
         if any(isinstance(item, bool) or not isinstance(item, int) for item in value):
             raise ValueError("mask_classes must contain integers")
         classes = tuple(sorted(set(value)))
@@ -52,17 +63,11 @@ class S2PreprocessNodeConfig(BaseModel):
         return classes
 
 
-@dataclass(frozen=True)
-class S2PreprocessArtifact:
-    """Materialized result returned by the compatibility VRT processor."""
-
-    recipe_id: str
-    state_path: Path
-    results: tuple[S2PreprocessResult, ...]
+# Processor implementation for s2.preprocess -------------------------------------------
 
 
-class S2PreprocessProcessor:
-    """Run the existing S2 preprocessing implementation behind the node contract."""
+class S2PreprocessProcessor(Processor):
+    """Build a lazy canonical-grid dataset without reading raster pixels."""
 
     type_name = "s2.preprocess"
     config_model = S2PreprocessNodeConfig
@@ -77,25 +82,45 @@ class S2PreprocessProcessor:
         outputs: tuple[Any, ...],
         output_grid: Any,
     ) -> None:
+
+        # Ensure the configuration is of the correct type
         if not isinstance(config, S2PreprocessNodeConfig):
             raise TypeError(f"{node_id} has an invalid s2.preprocess configuration")
+        # Ensure no inputs are provided (preprocessing should always come first)
         if inputs:
-            raise ValueError(
-                "s2.preprocess does not accept node inputs while using the "
-                "legacy VRT implementation"
-            )
+            raise ValueError("s2.preprocess does not accept node inputs")
+        # Ensure the source is configured and of the correct type
         source = sources.get(config.source)
         if source is None:
             raise ValueError(f"{node_id}.source does not reference a configured source")
+        # Ensure the source is of the correct type
         if getattr(source, "source_type", None) != "s2.l2a.local":
             raise ValueError(f"{node_id}.source must reference an s2.l2a.local source")
-        if output_grid.crs != "native":
-            raise ValueError("output_grid.crs must be 'native' for s2.preprocess")
-        if output_grid.resolution_m not in {10, 20, 60}:
-            raise ValueError("output_grid.resolution_m must be 10, 20, or 60")
-        if len(outputs) != 1 or outputs[0].format != "vrt":
+        # Ensure the output grid is configured and of the correct type
+        if output_grid.grid is None:
+            raise ValueError("s2.preprocess requires a canonical output grid")
+        target_crs = CRS.from_user_input(output_grid.grid.crs)
+        if not target_crs.is_projected or any(
+            not abs(axis.unit_conversion_factor - 1.0) < 1e-12
+            for axis in target_crs.axis_info
+        ):
             raise ValueError(
-                "s2.preprocess currently requires exactly one named VRT output"
+                "canonical s2.preprocess currently requires a projected metre CRS"
+            )
+        # Ensure the nodata value is set correctly
+        if config.nodata != 65535:
+            raise ValueError("canonical s2.preprocess currently requires nodata 65535")
+        # Ensure the output pixels are square
+        if output_grid.grid.resolution[0] != output_grid.grid.resolution[1]:
+            raise ValueError(
+                "canonical s2.preprocess currently requires square output pixels"
+            )
+        # Ensure the outputs are one of the existing formats we have
+        if not outputs or any(
+            output.format not in {"cog", "xarray"} for output in outputs
+        ):
+            raise ValueError(
+                "canonical s2.preprocess requires named COG or xarray outputs"
             )
 
     def execute(
@@ -103,86 +128,72 @@ class S2PreprocessProcessor:
         config: ProcessorConfig,
         inputs: Mapping[str, Any],
         context: ProcessorContext,
-    ) -> S2PreprocessArtifact:
+    ) -> Any:
+        # Validate the configuration and inputs before proceeding
         if not isinstance(config, S2PreprocessNodeConfig):
             raise TypeError("Invalid s2.preprocess configuration")
         if inputs:
             raise ValueError("s2.preprocess does not accept upstream artifacts yet")
 
+        # Import functions for discovering granules and building lazy datasets
         from sentinel_py.s2.discover import discover_s2_granules
-        from sentinel_py.s2.preprocess import (
-            preprocess_recipe_id,
-            read_preprocess_state,
-            validate_gdal_for_preprocessing,
-            write_preprocess_results,
-        )
+        from sentinel_py.s2.lazy import build_lazy_s2_dataset
 
-        clock = time.monotonic()
+        # Access the pipeline and output grid
         pipeline = context.pipeline
+        grid = pipeline.output_grid.grid
+        if grid is None:
+            raise ValueError("Lazy S2 preprocessing requires a canonical output grid")
+        # Access the source and determine the asset resolution
         source = pipeline.sources[config.source]
-        output = context.outputs[0]
-        gdal_version = validate_gdal_for_preprocessing()
-        preprocess_config = S2PreprocessConfig(
-            bands=config.bands,
-            resolution_m=pipeline.output_grid.resolution_m,
-            mask_classes=config.mask_classes,
-            nodata=config.nodata,
-        )
-        recipe_id = preprocess_recipe_id(preprocess_config)
-        context.logger.info(
-            "Starting pipeline=%s node=%s recipe=%s execution=%s GDAL=%s",
-            pipeline.path,
-            context.node.node_id,
-            recipe_id,
-            pipeline.execution.method,
-            gdal_version,
-        )
+        asset_resolution = round(min(grid.resolution))
+        # Discover the granules matching the selection criteria
         granules = discover_s2_granules(
             source.data_dir,
             config.bands,
-            pipeline.output_grid.resolution_m,
+            asset_resolution,
             aoi=pipeline.selection.aoi,
             years=pipeline.selection.years,
             speriod=pipeline.selection.start_period,
             eperiod=pipeline.selection.end_period,
         )
+        # Ensure that at least one granule was found
         if not granules:
             raise RuntimeError(
                 f"Found 0 Sentinel-2 granules in {source.data_dir} for this selection"
             )
-        state = read_preprocess_state(output.path)
-        cached_rows: dict[tuple[str, str], dict[str, object]] = {}
-        if not state.empty:
-            matching = state[state["recipe_id"] == recipe_id]
-            cached_rows = {
-                (str(row["product_id"]), str(row["granule_id"])): {
-                    str(key): value for key, value in row.items()
-                }
-                for row in matching.to_dict("records")
-            }
-        context.logger.info("Planned %d Sentinel-2 granule task(s)", len(granules))
-        results = run_preprocess_tasks(
-            granules,
-            preprocess_config,
-            output.path,
-            cached_rows,
-            pipeline.execution,
-        )
-        results.sort(key=lambda item: (item.product_id, item.granule_id))
-        state_path = write_preprocess_results(output.path, state, results)
-        for result in results:
-            log = context.logger.error if result.status == "failed" else context.logger.info
-            log(
-                "task=%s product=%s granule=%s status=%s error=%s",
-                result.task_id,
-                result.product_id,
-                result.granule_id,
-                result.status,
-                result.error,
-            )
+        # Log the details of the lazy dataset being built
         context.logger.info(
-            "Completed node=%s elapsed_seconds=%.1f",
+            "Building lazy node=%s scenes=%d spatial_chunks=%d",
             context.node.node_id,
-            time.monotonic() - clock,
+            len(granules),
+            grid.chunk_grid_shape[0] * grid.chunk_grid_shape[1],
         )
-        return S2PreprocessArtifact(recipe_id, state_path, tuple(results))
+        # Build the lazy dataset for the discovered granules
+        dataset = build_lazy_s2_dataset(
+            granules,
+            grid,
+            bands=config.bands,
+            mask_classes=config.mask_classes,
+            nodata=config.nodata,
+        )
+        # Update the dataset attributes with pipeline and processing information
+        dataset.attrs.update(
+            pipeline=str(pipeline.path),
+            processor=self.type_name,
+            node=context.node.node_id,
+            recipe_id=deterministic_cache_key(
+                {
+                    "processor": self.type_name,
+                    "bands": config.bands,
+                    "mask_classes": config.mask_classes,
+                    "nodata": config.nodata,
+                    "crs": grid.crs,
+                    "transform": tuple(grid.affine[:6]),
+                    "shape": grid.shape,
+                    "chunks": (grid.chunks.y, grid.chunks.x),
+                }
+            )[:12],
+        )
+        # Return the constructed lazy dataset
+        return dataset

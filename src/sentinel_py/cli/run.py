@@ -25,7 +25,7 @@ def run(
         bool,
         typer.Option(
             "--validate-only",
-            help="Validate and resolve the YAML without importing GDAL or executing tasks.",
+            help="Validate and resolve the YAML without raster I/O or task execution.",
         ),
     ] = False,
     log: Annotated[
@@ -38,22 +38,21 @@ def run(
     ] = False,
 ) -> None:
     """Run a validated processing pipeline from YAML."""
-    from sentinel_py.pipeline import PipelineConfigError, load_pipeline
+    from sentinel_py.pipeline import PipelineConfig, PipelineConfigError
 
+    # Load and validate the pipeline configuration from the provided YAML file
     try:
-        config = load_pipeline(pipeline)
+        config = PipelineConfig.from_file(pipeline)
     except PipelineConfigError as error:
         raise ClickException(f"Invalid pipeline: {error}") from error
 
+    # Display basic pipeline information
     typer.echo(f"Pipeline:      {config.path}")
     typer.echo(f"Execution:     {config.execution.method}")
     for source in config.sources.values():
         typer.echo(f"Source:        {source.source_id} ({source.data_dir})")
     if config.output_grid.grid is None:
-        typer.echo(
-            f"Output grid:   native, {config.output_grid.resolution_m} m "
-            "(legacy compatibility mode)"
-        )
+        typer.echo(f"Output grid:   native, {config.output_grid.resolution} m")
     else:
         grid = config.output_grid.grid
         typer.echo(
@@ -78,6 +77,7 @@ def run(
         typer.echo("Pipeline is valid. No tasks were executed.")
         return
 
+    # Execute the pipeline with the configured logger
     logger = get_logger(name="pipeline_logger", logpath=log, verbose=verbose)
     try:
         from sentinel_py.pipeline.run import run_pipeline
@@ -87,17 +87,37 @@ def run(
         logger.exception("Pipeline execution failed")
         raise ClickException(f"Pipeline execution failed: {error}") from error
 
-    preprocessed = sum(item.status == "preprocessed" for item in result.results)
-    skipped = sum(item.status == "skipped" for item in result.results)
-    failed = sum(item.status == "failed" for item in result.results)
+    # Display a summary of the pipeline execution results
     typer.echo("Summary:")
     typer.echo(f"  Started:     {result.started_at:%Y-%m-%d %H:%M:%S}")
     typer.echo(f"  Ended:       {result.ended_at:%Y-%m-%d %H:%M:%S}")
     typer.echo(f"  Elapsed:     {result.elapsed_seconds:.1f} seconds")
-    typer.echo(f"  Recipe:      {result.recipe_id}")
-    typer.echo(
-        f"  Results:     {preprocessed} preprocessed, {skipped} skipped, {failed} failed"
-    )
-    typer.echo(f"  State:       {result.state_path}")
-    if failed:
-        raise typer.Exit(code=1)
+    worker_results = [
+        worker_result
+        for output_result in result.output_results.values()
+        for worker_result in output_result.results
+    ]
+    if worker_results:
+        written = sum(item.status == "written" for item in worker_results)
+        skipped = sum(item.status == "skipped" for item in worker_results)
+        failed = sum(item.status == "failed" for item in worker_results)
+        typer.echo(
+            f"  COG tiles:   {written} written, {skipped} skipped, {failed} failed"
+        )
+        if failed:
+            raise typer.Exit(code=1)
+        return
+    lazy_datasets = [
+        artifact
+        for artifact in result.outputs.values()
+        if hasattr(artifact, "data_vars") and hasattr(artifact, "chunks")
+    ]
+    if lazy_datasets:
+        dataset = lazy_datasets[0]
+        typer.echo(
+            f"  Lazy data:   {dataset.sizes.get('time', 0)} scene(s), "
+            f"{dataset.sizes.get('band', 0)} band(s), "
+            f"{dataset.sizes.get('x', 0)} × {dataset.sizes.get('y', 0)} pixels"
+        )
+        typer.echo("  Raster I/O:  deferred (no output writer requested computation)")
+        return

@@ -14,21 +14,35 @@ def test_legacy_s2_command_is_retired():
     assert "No such command 's2'" in result.output
 
 
-def test_run_validate_only_does_not_require_gdal(tmp_path: Path):
+def test_run_validate_only_does_not_perform_raster_io(tmp_path: Path):
     (tmp_path / "raw").mkdir()
+    (tmp_path / "aoi.geojson").write_text(
+        '{"type":"FeatureCollection","features":[{"type":"Feature",'
+        '"properties":{},"geometry":{"type":"Polygon","coordinates":'
+        '[[[-150,68],[-149.9,68],[-149.9,68.1],[-150,68.1],[-150,68]]]}}]}'
+    )
     pipeline = tmp_path / "pipeline.yaml"
     pipeline.write_text(
         """
 version: 1
 execution: {method: local}
-selection: {years: [2024], speriod: "06-01", eperiod: "08-31"}
-output_grid: {crs: native, resolution_m: 20}
+selection:
+  aoi: aoi.geojson
+  years: [2024]
+  speriod: "06-01"
+  eperiod: "08-31"
+output_grid:
+  crs: EPSG:3338
+  resolution: 20
+  extent: aoi
+  anchor: [0, 0]
+  chunks: {y: 512, x: 512}
 sources:
   s2: {type: s2.l2a.local, data_dir: raw}
 nodes:
   - {id: preprocess, type: s2.preprocess, source: s2, bands: [B02]}
 outputs:
-  result: {from: preprocess, path: output, format: vrt}
+  result: {from: preprocess, path: output, format: cog}
 """
     )
 

@@ -34,7 +34,9 @@ def _dummy_registry() -> ProcessorRegistry:
 
 def _pipeline_yaml(tmp_path: Path, extra: str = "") -> Path:
     (tmp_path / "raw").mkdir()
-    (tmp_path / "aoi.geojson").write_text("{}")
+    gpd.GeoDataFrame(
+        geometry=[box(500000, 999960, 500040, 1000000)], crs="EPSG:32606"
+    ).to_file(tmp_path / "aoi.geojson", driver="GeoJSON")
     path = tmp_path / "pipeline.yaml"
     path.write_text(
         f"""
@@ -48,8 +50,11 @@ selection:
   speriod: "06-01"
   eperiod: "08-31"
 output_grid:
-  crs: native
-  resolution_m: 20
+  crs: EPSG:32606
+  resolution: 20
+  extent: aoi
+  anchor: [0, 0]
+  chunks: {{y: 512, x: 512}}
 sources:
   s2:
     type: s2.l2a.local
@@ -64,7 +69,7 @@ outputs:
   result:
     from: preprocess
     path: output
-    format: vrt
+    format: cog
 {extra}
 """
     )
@@ -84,23 +89,29 @@ def test_load_pipeline_resolves_paths_and_node(tmp_path: Path):
     assert config.outputs["result"].node == "preprocess"
 
 
-def test_legacy_preprocessor_rejects_canonical_grid(tmp_path: Path):
+def test_s2_preprocessor_accepts_canonical_cog_grid(tmp_path: Path):
     path = _pipeline_yaml(tmp_path)
-    gpd.GeoDataFrame(
-        geometry=[box(-150.0, 68.0, -149.75, 68.25)], crs="EPSG:4326"
-    ).to_file(tmp_path / "aoi.geojson", driver="GeoJSON")
+
+    config = load_pipeline(path)
+
+    assert config.output_grid.grid is not None
+    assert config.output.format == "cog"
+
+
+def test_s2_preprocessor_rejects_retired_native_grid(tmp_path: Path):
+    path = _pipeline_yaml(tmp_path)
     path.write_text(
         path.read_text().replace(
-            "  crs: native\n  resolution_m: 20",
-            "  crs: EPSG:3338\n"
+            "  crs: EPSG:32606\n"
             "  resolution: 20\n"
             "  extent: aoi\n"
             "  anchor: [0, 0]\n"
             "  chunks: {y: 512, x: 512}",
+            "  crs: native\n  resolution_m: 20",
         )
     )
 
-    with pytest.raises(PipelineConfigError, match="must be 'native' for s2.preprocess"):
+    with pytest.raises(PipelineConfigError, match="requires a canonical output grid"):
         load_pipeline(path)
 
 

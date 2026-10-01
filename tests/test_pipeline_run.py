@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import logging
-import struct
 from pathlib import Path
 from typing import Any, Mapping
 
+import geopandas as gpd
+import numpy as np
 import pytest
+import rasterio
 from pydantic import BaseModel, ConfigDict
+from rasterio.transform import from_origin
+from shapely.geometry import box
 
 from sentinel_py.pipeline import ProcessorRegistry, load_pipeline
 from sentinel_py.pipeline.run import run_pipeline
@@ -48,7 +52,7 @@ nodes:
   - {id: result, type: test.value, inputs: {data: source}, value: 2}
   - {id: source, type: test.value, value: 1}
 outputs:
-  total: {from: result, path: output, format: test}
+  total: {from: result, path: output, format: xarray}
 """
     )
     calls: list[str] = []
@@ -65,16 +69,6 @@ outputs:
 
 
 def test_pipeline_runs_preprocess_node_end_to_end(tmp_path: Path):
-    gdal = pytest.importorskip("osgeo.gdal")
-    from osgeo import osr
-
-    from sentinel_py.s2.preprocess import validate_gdal_for_preprocessing
-
-    try:
-        validate_gdal_for_preprocessing()
-    except RuntimeError as error:
-        pytest.skip(str(error))
-
     raw = tmp_path / "raw"
     acquired = "20240615T120000"
     safe = raw / f"S2A_MSIL2A_{acquired}_N0500_R001_T06ABC_{acquired}.SAFE"
@@ -94,33 +88,53 @@ def test_pipeline_runs_preprocess_node_end_to_end(tmp_path: Path):
         "<SPECIAL_VALUE_INDEX>65535</SPECIAL_VALUE_INDEX></Special_Values>"
         "</Level2A>"
     )
-    spatial_reference = osr.SpatialReference()
-    spatial_reference.ImportFromEPSG(32606)
+    (granule / "MTD_TL.xml").write_text(
+        "<Tile><HORIZONTAL_CS_CODE>EPSG:32606</HORIZONTAL_CS_CODE>"
+        '<Size resolution="20"><NROWS>2</NROWS><NCOLS>2</NCOLS></Size>'
+        '<Geoposition resolution="20"><ULX>500000</ULX>'
+        "<ULY>1000000</ULY></Geoposition></Tile>"
+    )
     for name, values in (("B02", [0, 1100, 2000, 3000]), ("SCL", [4, 4, 9, 4])):
         path = image_dir / f"T06ABC_{acquired}_{name}_20m.jp2"
-        dataset = gdal.GetDriverByName("GTiff").Create(
-            str(path), 2, 2, 1, gdal.GDT_UInt16
-        )
-        dataset.SetGeoTransform((500000, 20, 0, 1000000, 0, -20))
-        dataset.SetSpatialRef(spatial_reference)
-        dataset.GetRasterBand(1).WriteRaster(
-            0, 0, 2, 2, struct.pack("<4H", *values), buf_type=gdal.GDT_UInt16
-        )
-        dataset = None
+        with rasterio.open(
+            path,
+            "w",
+            driver="GTiff",
+            width=2,
+            height=2,
+            count=1,
+            dtype="uint16",
+            crs="EPSG:32606",
+            transform=from_origin(500000, 1000000, 20, 20),
+        ) as dataset:
+            dataset.write(np.asarray(values, dtype=np.uint16).reshape(2, 2), 1)
+
+    gpd.GeoDataFrame(
+        geometry=[box(500000, 999960, 500040, 1000000)], crs="EPSG:32606"
+    ).to_file(tmp_path / "aoi.geojson", driver="GeoJSON")
 
     pipeline = tmp_path / "pipeline.yaml"
     pipeline.write_text(
         """
 version: 1
 execution: {method: local, workers: 1}
-selection: {years: [2024], speriod: "06-01", eperiod: "08-31"}
-output_grid: {crs: native, resolution_m: 20}
+selection:
+  aoi: aoi.geojson
+  years: [2024]
+  speriod: "06-01"
+  eperiod: "08-31"
+output_grid:
+  crs: EPSG:32606
+  resolution: 20
+  extent: aoi
+  anchor: [0, 0]
+  chunks: {y: 2, x: 2}
 sources:
   s2: {type: s2.l2a.local, data_dir: raw}
 nodes:
   - {id: preprocess, type: s2.preprocess, source: s2, bands: [B02]}
 outputs:
-  result: {from: preprocess, path: output, format: vrt}
+  result: {from: preprocess, path: output, format: cog}
 """
     )
     logger = logging.getLogger("pipeline-end-to-end-test")
@@ -128,10 +142,8 @@ outputs:
 
     result = run_pipeline(load_pipeline(pipeline), logger)
 
-    assert [item.status for item in result.results] == ["preprocessed"]
-    assert result.state_path.is_file()
-    output = gdal.Open(str(result.results[0].output_path))
-    assert output.GetRasterBand(1).ReadAsArray().tolist() == [
-        [65535, 100],
-        [65535, 2000],
-    ]
+    worker_results = result.output_results["result"].results
+    assert [item.status for item in worker_results] == ["written", "written"]
+    reflectance = next(item for item in worker_results if item.variable == "reflectance")
+    with rasterio.open(reflectance.output_path) as output:
+        assert output.read(1).tolist() == [[65535, 100], [65535, 2000]]

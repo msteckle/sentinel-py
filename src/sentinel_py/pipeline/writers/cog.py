@@ -78,6 +78,8 @@ def _write_cog_tile(
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         array = np.asarray(values)
+        if np.issubdtype(array.dtype, np.floating):
+            array = np.where(np.isfinite(array), array, nodata).astype(array.dtype)
         if array.ndim == 2:
             array = array[np.newaxis, ...]
         with (

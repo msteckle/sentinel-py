@@ -26,6 +26,7 @@ sources:
     type: s2.l2a.local
     data_dir: ../data/s2/raw
 
+# processing pipeline
 nodes:
   - id: preprocess
     type: s2.preprocess
@@ -34,14 +35,19 @@ nodes:
     mask_classes: [0, 1, 3, 8, 9, 10, 11]
     nodata: 65535
 
-  - id: composite
+  - id: all-composite
     type: composite
     inputs: {data: preprocess}
-    period: 15D
+    period: all
     aggregation: median
+
+  - id: indices
+    type: s2.index
+    inputs: {data: all-composite}
+    indices: [NDGI, NDWI1]
 
 outputs:
   composited:
-    from: composite
-    path: ../data/s2/summer_15D_med_composite
+    from: indices
+    path: ../data/s2/summer_15D_med_indices
     format: cog

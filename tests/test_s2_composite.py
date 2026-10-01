@@ -143,6 +143,11 @@ def test_composite_defaults_to_all_and_ignores_nodata():
     )
 
 
+@pytest.mark.parametrize("period", ["all", "ALL", " All "])
+def test_composite_accepts_all_period(period: str):
+    assert S2CompositeNodeConfig(period=period).period == "all"
+
+
 @pytest.mark.parametrize("period", ["15", "0D", "day", "1H"])
 def test_composite_rejects_unsupported_period(period: str):
     with pytest.raises(ValueError):

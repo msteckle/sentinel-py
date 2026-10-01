@@ -37,12 +37,12 @@ class S2CompositeNodeConfig(BaseModel):
         if not isinstance(value, str):
             raise TypeError("period must be a string such as '15D' or 'all'")
         normalized = value.strip().upper()
-        if normalized != "all" and _PERIOD_PATTERN.fullmatch(normalized) is None:
+        if normalized != "ALL" and _PERIOD_PATTERN.fullmatch(normalized) is None:
             raise ValueError(
                 "period must be 'all' or a positive period such as '15D', '2W', "
                 "'1M', or '1Y'"
             )
-        return normalized
+        return "all" if normalized == "ALL" else normalized
 
 
 def _canonical_date(value: np.datetime64, *, year: int = 2000) -> np.datetime64:

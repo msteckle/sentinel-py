@@ -151,9 +151,8 @@ class COGOutputWriter:
             raise RuntimeError("COG output requires xarray and Dask") from error
         if not isinstance(artifact, xr.Dataset):
             raise TypeError("COG output requires an xarray Dataset artifact")
-        required = {"reflectance", "scl"}
-        if not required.issubset(artifact.data_vars):
-            raise ValueError("COG output requires reflectance and scl variables")
+        if "reflectance" not in artifact.data_vars:
+            raise ValueError("COG output requires a reflectance variable")
 
         state_path = cog_state_path(output.path)
         state = pd.read_parquet(state_path) if state_path.is_file() else pd.DataFrame()
@@ -166,6 +165,7 @@ class COGOutputWriter:
         x_resolution = transform[0]
         y_resolution = abs(transform[4])
         recipe_id = str(artifact.attrs["recipe_id"])
+        reflectance = artifact.reflectance.chunk({"band": -1})
         tasks = []
         completed = []
 
@@ -173,15 +173,22 @@ class COGOutputWriter:
             product_id = str(artifact.product_id.values[time_index])
             granule_id = str(artifact.granule_id.values[time_index])
             source_fingerprint = str(artifact.source_fingerprint.values[time_index])
-            for variable, nodata, descriptions in (
+            variables = [
                 (
                     "reflectance",
-                    int(artifact.reflectance.attrs["nodata"]),
+                    int(reflectance.attrs["nodata"]),
                     tuple(str(value) for value in artifact.band.values),
-                ),
-                ("scl", int(artifact.scl.attrs["nodata"]), ("SCL",)),
-            ):
-                array = artifact[variable].data[time_index]
+                )
+            ]
+            if "scl" in artifact.data_vars:
+                variables.append(
+                    ("scl", int(artifact.scl.attrs["nodata"]), ("SCL",))
+                )
+            for variable, nodata, descriptions in variables:
+                data_array = (
+                    reflectance if variable == "reflectance" else artifact[variable]
+                )
+                array = data_array.data[time_index]
                 delayed_blocks = array.to_delayed(optimize_graph=False)
                 y_chunks = array.chunks[-2]
                 x_chunks = array.chunks[-1]
@@ -190,10 +197,6 @@ class COGOutputWriter:
                     column_offset = 0
                     for column_index, width in enumerate(x_chunks):
                         if variable == "reflectance":
-                            if len(array.chunks[0]) != 1:
-                                raise ValueError(
-                                    "COG output requires all bands in one Dask chunk"
-                                )
                             block = delayed_blocks[0, row_index, column_index]
                         else:
                             block = delayed_blocks[row_index, column_index]

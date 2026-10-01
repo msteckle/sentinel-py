@@ -416,4 +416,7 @@ def build_lazy_s2_dataset(
             "nodata": nodata,
         },
     )
+    # Keep all spectral bands together so downstream band-wise operations and
+    # multi-band COG writes do not need to rechunk the reflectance cube.
+    dataset["reflectance"] = dataset.reflectance.chunk({"band": -1})
     return dataset

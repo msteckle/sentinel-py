@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from types import SimpleNamespace
 
 import numpy as np
@@ -162,11 +163,13 @@ def test_index_masks_nodata_and_zero_denominator() -> None:
     source["reflectance"].values[1, 4, 0, 0] = 13
     source["reflectance"].values[1, 2, 0, 0] = 13
 
-    result = S2IndexProcessor().execute(
-        S2IndexNodeConfig(indices=["NDGI", "NDWI1"]),
-        {"data": source},
-        _context(),
-    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        result = S2IndexProcessor().execute(
+            S2IndexNodeConfig(indices=["NDGI", "NDWI1"]),
+            {"data": source},
+            _context(),
+        )
 
     assert np.isnan(result.reflectance.sel(band="NDGI").values[0, 0, 0])
     assert np.isnan(result.reflectance.sel(band="NDWI1").values[1, 0, 0])

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -35,6 +35,9 @@ def run_pipeline(
     logger,
     *,
     writer_registry: OutputWriterRegistry | None = None,
+    progress_callback: Callable[[Any], None] | None = None,
+    progress_start_callback: Callable[[int], None] | None = None,
+    task_progress_callback: Callable[[int, int], None] | None = None,
 ) -> PipelineRunResult:
     """Build every processor and execute all requested outputs as one Dask graph."""
 
@@ -93,12 +96,33 @@ def run_pipeline(
         plans[output_id] = writer, plan
 
     # Execute all tasks using Dask and collect the results
+    total_tasks = sum(
+        len(plan.tasks) + len(plan.completed) for _, plan in plans.values()
+    )
+    if progress_start_callback is not None and total_tasks:
+        progress_start_callback(total_tasks)
+    if progress_callback is not None:
+        for _, plan in plans.values():
+            for completed in plan.completed:
+                progress_callback(completed)
+    if task_progress_callback is not None:
+        completed_count = 0
+        for _, plan in plans.values():
+            for _ in plan.completed:
+                completed_count += 1
+                task_progress_callback(completed_count, total_tasks)
     logger.info(
         "Computing %d output task(s) together with Dask backend=%s",
         len(all_tasks),
         config.execution.method,
     )
-    computed = compute_dask_tasks(tuple(all_tasks), config.execution)
+    computed = compute_dask_tasks(
+        tuple(all_tasks),
+        config.execution,
+        progress_callback=progress_callback,
+        task_progress_callback=task_progress_callback,
+        initial_completed_tasks=sum(len(plan.completed) for _, plan in plans.values()),
+    )
     output_results = {}
     for output_id, output in config.outputs.items():
         writer, plan = plans[output_id]

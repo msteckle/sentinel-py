@@ -16,6 +16,11 @@ from sentinel_py.pipeline.processors.base import (
 )
 
 
+def _safe_divide(numerator: Any, denominator: Any) -> Any:
+    """Divide while converting zero denominators to NaN before arithmetic."""
+    return numerator / denominator.where(denominator != 0)
+
+
 class SpectralIndex:
     """Base class and automatic registry for one Sentinel-2 spectral index."""
 
@@ -70,7 +75,7 @@ class NDGI(SpectralIndex):
     def formula(cls, values: Any) -> Any:
         """Calculate NDGI from Sentinel-2 bands B03, B04, and B08."""
         green = 0.62 * values.sel(band="B03") + 0.38 * values.sel(band="B08")
-        return (green - values.sel(band="B04")) / cls.denominator(values)
+        return _safe_divide(green - values.sel(band="B04"), cls.denominator(values))
 
     @classmethod
     def denominator(cls, values: Any) -> Any:
@@ -88,8 +93,9 @@ class NDWI1(SpectralIndex):
     @classmethod
     def formula(cls, values: Any) -> Any:
         """Calculate NDWI1 from Sentinel-2 bands B08, B11, and B12."""
-        return (values.sel(band="B08") - values.sel(band="B11")) / cls.denominator(
-            values
+        return _safe_divide(
+            values.sel(band="B08") - values.sel(band="B11"),
+            cls.denominator(values),
         )
 
     @classmethod

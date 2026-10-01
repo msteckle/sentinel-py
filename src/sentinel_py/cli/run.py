@@ -7,6 +7,16 @@ from typing import Annotated
 
 import typer
 from click import ClickException
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskID,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 
 from sentinel_py.log import DEFAULT_LOG_DIR, get_logger
 
@@ -79,13 +89,64 @@ def run(
 
     # Execute the pipeline with the configured logger
     logger = get_logger(name="pipeline_logger", logpath=log, verbose=verbose)
+    progress: Progress | None = None
+    progress_task_id: TaskID | None = None
+    progress_counts = {"written": 0, "skipped": 0, "failed": 0}
+
+    def start_progress(total: int) -> None:
+        nonlocal progress, progress_task_id
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            TextColumn("[cyan]{task.fields[status]}"),
+        )
+        progress.start()
+        progress_task_id = progress.add_task(
+            "Processing outputs",
+            total=total,
+            status="written 0 · skipped 0 · failed 0",
+        )
+
+    def update_output_progress(result: object) -> None:
+        if progress is None or progress_task_id is None:
+            return
+        status = getattr(result, "status", "complete")
+        if status in progress_counts:
+            progress_counts[status] += 1
+        progress.update(
+            progress_task_id,
+            status=(
+                f"written {progress_counts['written']} · "
+                f"skipped {progress_counts['skipped']} · "
+                f"failed {progress_counts['failed']}"
+            ),
+        )
+
+    def update_task_progress(completed: int, total: int) -> None:
+        if progress is None or progress_task_id is None:
+            return
+        progress.update(progress_task_id, total=total, completed=completed)
+
     try:
         from sentinel_py.pipeline.run import run_pipeline
 
-        result = run_pipeline(config, logger)
+        result = run_pipeline(
+            config,
+            logger,
+            progress_callback=update_output_progress,
+            progress_start_callback=start_progress,
+            task_progress_callback=update_task_progress,
+        )
     except (FileNotFoundError, RuntimeError, TypeError, ValueError) as error:
         logger.exception("Pipeline execution failed")
         raise ClickException(f"Pipeline execution failed: {error}") from error
+    finally:
+        if progress is not None:
+            progress.stop()
 
     # Display a summary of the pipeline execution results
     typer.echo("Summary:")

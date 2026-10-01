@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import geopandas as gpd
@@ -15,6 +16,7 @@ from shapely.geometry import box
 from sentinel_py.pipeline import PipelineConfig
 from sentinel_py.pipeline.processors import ProcessorRegistry
 from sentinel_py.pipeline.run import run_pipeline
+from sentinel_py.pipeline.writers import OutputWritePlan, OutputWriterRegistry
 
 
 class _ValueConfig(BaseModel):
@@ -36,6 +38,54 @@ class _ValueProcessor:
     def execute(self, config, inputs: Mapping[str, Any], context):
         self.calls.append(context.node.node_id)
         return config.value + sum(inputs.values())
+
+
+class _SkippedWriter:
+    format_name = "test.skipped"
+
+    def build(self, artifact, output, pipeline):
+        del artifact, pipeline
+        return OutputWritePlan(output, completed=(SimpleNamespace(status="skipped"),))
+
+    def finalize(self, plan, computed):
+        del plan
+        return computed
+
+
+def test_pipeline_reports_resumed_tasks_to_progress_callback(tmp_path: Path):
+    (tmp_path / "raw").mkdir()
+    pipeline = tmp_path / "graph.yaml"
+    pipeline.write_text(
+        """
+version: 1
+execution: {method: local}
+selection: {years: [2024]}
+output_grid: {crs: native, resolution_m: 20}
+sources:
+  s2: {type: s2.l2a.local, data_dir: raw}
+nodes:
+  - {id: source, type: test.value, value: 1}
+outputs:
+  result: {from: source, path: output, format: test.skipped}
+"""
+    )
+    processors = ProcessorRegistry()
+    processors.register(_ValueProcessor([]))
+    writers = OutputWriterRegistry()
+    writers.register(_SkippedWriter())
+    started: list[int] = []
+    completed: list[str] = []
+
+    run_pipeline(
+        PipelineConfig.from_file(pipeline, registry=processors),
+        logging.getLogger("progress-test"),
+        writer_registry=writers,
+        progress_start_callback=started.append,
+        progress_callback=lambda result: completed.append(result.status),
+    )
+
+    assert started == [1]
+    assert completed == ["skipped"]
 
 
 def test_pipeline_executes_registered_processors_in_dependency_order(tmp_path: Path):

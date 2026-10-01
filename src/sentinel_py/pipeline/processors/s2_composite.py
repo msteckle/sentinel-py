@@ -190,12 +190,15 @@ class S2CompositeProcessor(Processor):
         source_fingerprints = []
         for group_index, members in enumerate(groups):
             subset = values.isel(time=list(members))
+            valid = subset.notnull().any(dim="time")
+            safe_subset = subset.where(valid, 0)
             if config.aggregation == "mean":
-                composite = subset.mean(dim="time", skipna=True)
+                composite = safe_subset.mean(dim="time", skipna=True)
             elif config.aggregation == "median":
-                composite = subset.median(dim="time", skipna=True)
+                composite = safe_subset.median(dim="time", skipna=True)
             else:
-                composite = subset.max(dim="time", skipna=True)
+                composite = safe_subset.max(dim="time", skipna=True)
+            composite = composite.where(valid)
             if nodata is not None:
                 composite = composite.fillna(nodata).astype(np.float32)
             reductions.append(

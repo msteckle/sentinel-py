@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from types import SimpleNamespace
 
 import numpy as np
@@ -141,6 +142,21 @@ def test_composite_defaults_to_all_and_ignores_nodata():
         result.reflectance.values[0, :, 0, 0],
         np.array([4, 5.3333335], dtype=np.float32),
     )
+
+
+def test_composite_masks_all_nodata_without_runtime_warning():
+    source = _source()
+    source["reflectance"].values[:] = 65535
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        result = S2CompositeProcessor().execute(
+            S2CompositeNodeConfig(period="15D", aggregation="median"),
+            {"data": source},
+            _context(),
+        )
+
+    assert np.all(result.reflectance.values == 65535)
 
 
 @pytest.mark.parametrize("period", ["all", "ALL", " All "])

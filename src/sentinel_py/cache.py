@@ -23,6 +23,7 @@ SENTINEL_PY_HOME = Path(
 DEFAULT_CACHE_DIR = SENTINEL_PY_HOME / "cache"
 DEFAULT_ASF_CACHE_DIR = DEFAULT_CACHE_DIR / "asf"
 DEFAULT_CDSE_CACHE_DIR = DEFAULT_CACHE_DIR / "cdse"
+DEFAULT_PGC_CACHE_DIR = DEFAULT_CACHE_DIR / "pgc"
 
 
 def deterministic_cache_key(payload: dict[str, Any]) -> str:

@@ -87,3 +87,26 @@ nodes:
     inputs: {data: summer_composites}
     indices: [NDGI, NDWI1]
 ```
+
+## DEM terrain features
+
+The built-in ``dem`` processor reads local ArcticDEM GeoTIFFs and returns a single canonical-grid feature cube. It supports ``elevation``, ``aspect``, ``slope``, and ``hillshade`` bands. Slope, aspect, and hillshade use GDAL-compatible Horn semantics by default; ``ZevenbergenThorne`` is also available. Derivatives are calculated on the native projected DEM grid before reprojection to the pipeline output grid.
+
+```yaml
+sources:
+  arcticdem:
+    type: dem.local
+    data_dir: ../data/arcticdem
+    pattern: "*.tif"
+
+nodes:
+  - id: terrain
+    type: dem
+    source: arcticdem
+    features: [elevation, aspect, slope, hillshade]
+    algorithm: Horn
+    hillshade_azimuth: 315
+    hillshade_altitude: 45
+```
+
+New DEM-derived bands can be added by defining and registering a ``DEMFeature`` subclass in ``sentinel_py.pipeline.processors.dem``. The processor validates feature names from the shared registry and assembles the selected bands without changing YAML dispatch.

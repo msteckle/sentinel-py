@@ -125,6 +125,7 @@ class S2CompositeProcessor(Processor):
 
     type_name = "composite"
     config_model = S2CompositeNodeConfig
+    version = 2
 
     def validate(
         self,
@@ -220,10 +221,17 @@ class S2CompositeProcessor(Processor):
                 )
             )
 
+        chunking = {"time": -1, "band": -1}
+        output_grid = getattr(context.pipeline, "output_grid", None)
+        if output_grid is not None and output_grid.grid is not None:
+            chunking.update(
+                y=output_grid.grid.chunks.y,
+                x=output_grid.grid.chunks.x,
+            )
         result = (
             xr.concat(reductions, dim="time")
             .to_dataset(name="reflectance")
-            .chunk({"time": -1, "band": -1})
+            .chunk(chunking)
         )
         result = result.assign_coords(
             product_id=("time", [composite_name] * len(groups)),
@@ -241,6 +249,7 @@ class S2CompositeProcessor(Processor):
             recipe_id=deterministic_cache_key(
                 {
                     "processor": self.type_name,
+                    "version": self.version,
                     "period": config.period,
                     "aggregation": config.aggregation,
                     "source_recipe": source.attrs.get("recipe_id"),

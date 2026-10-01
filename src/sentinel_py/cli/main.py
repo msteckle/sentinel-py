@@ -4,6 +4,7 @@ import typer
 
 from .asf import app as asf_app
 from .cdse import app as cdse_app
+from .pgc import app as pgc_app
 from .run import run
 from .utils import app as utils_app
 
@@ -19,6 +20,9 @@ app.add_typer(
 )
 app.add_typer(
     cdse_app, name="cdse", help="Commands for querying and downloading from CDSE."
+)
+app.add_typer(
+    pgc_app, name="pgc", help="Commands for querying and downloading ArcticDEM from PGC."
 )
 app.command(
     "run",

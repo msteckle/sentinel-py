@@ -15,6 +15,7 @@ from sentinel_py.pipeline.processors.s2_index import (
     SpectralIndex,
 )
 from sentinel_py.pipeline.processors.s2_preprocess import S2PreprocessProcessor
+from sentinel_py.pipeline.processors.dem import DEMProcessor
 
 
 def register_builtin_processors(registry: ProcessorRegistry) -> None:
@@ -22,6 +23,7 @@ def register_builtin_processors(registry: ProcessorRegistry) -> None:
     registry.register(cast(Processor, S2PreprocessProcessor()))
     registry.register(cast(Processor, S2CompositeProcessor()))
     registry.register(cast(Processor, S2IndexProcessor()))
+    registry.register(cast(Processor, DEMProcessor()))
 
 
 __all__ = [
@@ -35,4 +37,5 @@ __all__ = [
     "NDWI1",
     "get_default_registry",
     "register_builtin_processors",
+    "DEMProcessor",
 ]

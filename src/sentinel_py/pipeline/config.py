@@ -639,6 +639,59 @@ class S2SourceConfig:
 
 
 @dataclass(frozen=True)
+class DEMSourceConfig:
+    """Data class representing a local collection of DEM GeoTIFFs."""
+
+    source_id: str
+    data_dir: Path
+    pattern: str = "*.tif"
+    source_type: str = "dem.local"
+
+
+SourceConfig = S2SourceConfig | DEMSourceConfig
+
+
+def parse_sources(raw: Any, base_dir: Path) -> dict[str, SourceConfig]:
+    """Parse configured Sentinel-2 and local DEM sources."""
+    values = _mapping(raw, "sources")
+    if not values:
+        raise PipelineConfigError("sources must define at least one source")
+    sources: dict[str, SourceConfig] = {}
+    for raw_id, raw_source in values.items():
+        source_id = _identifier(raw_id, "source identifiers")
+        value = _mapping(raw_source, f"sources.{source_id}")
+        source_type = _required(value, "type", f"sources.{source_id}")
+        if source_type == "s2.l2a.local":
+            _only_keys(value, {"type", "data_dir"}, f"sources.{source_id}")
+            data_dir = _resolve_path(
+                _required(value, "data_dir", f"sources.{source_id}"),
+                base_dir,
+                f"sources.{source_id}.data_dir",
+            )
+            if not data_dir.is_dir():
+                raise PipelineConfigError(f"S2 source directory does not exist: {data_dir}")
+            sources[source_id] = S2SourceConfig(source_id, data_dir)
+        elif source_type == "dem.local":
+            _only_keys(value, {"type", "data_dir", "pattern"}, f"sources.{source_id}")
+            data_dir = _resolve_path(
+                _required(value, "data_dir", f"sources.{source_id}"),
+                base_dir,
+                f"sources.{source_id}.data_dir",
+            )
+            if not data_dir.is_dir():
+                raise PipelineConfigError(f"DEM source directory does not exist: {data_dir}")
+            pattern = value.get("pattern", "*.tif")
+            if not isinstance(pattern, str) or not pattern.strip():
+                raise PipelineConfigError(f"sources.{source_id}.pattern must be a string")
+            sources[source_id] = DEMSourceConfig(source_id, data_dir, pattern.strip())
+        else:
+            raise PipelineConfigError(
+                f"sources.{source_id}.type must be s2.l2a.local or dem.local"
+            )
+    return sources
+
+
+@dataclass(frozen=True)
 class OutputConfig:
     """Named materialization target associated with a pipeline node."""
 
@@ -803,7 +856,7 @@ class PipelineConfig:
     execution: ExecutionConfig
     selection: SelectionConfig
     output_grid: OutputGridConfig
-    sources: Mapping[str, S2SourceConfig]
+    sources: Mapping[str, SourceConfig]
     nodes: tuple[NodeConfig, ...]
     ordered_nodes: tuple[NodeConfig, ...]
     outputs: Mapping[str, OutputConfig]
@@ -879,7 +932,7 @@ class PipelineConfig:
             _required(root, "output_grid", "pipeline"), selection
         )
         # Sources section
-        sources = S2SourceConfig.from_mapping(
+        sources = parse_sources(
             _required(root, "sources", "pipeline"), base_dir
         )
         # Nodes section

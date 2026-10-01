@@ -277,3 +277,25 @@ progress bar reports completed products and running downloaded, skipped, and fai
 counts. Transient DNS, connection, timeout, HTTP 429/5xx, truncated-download, and
 checksum failures are retried with exponential backoff. The command exits nonzero if
 any required product still fails.
+
+### Downloading ArcticDEM 10m mosaics from PGC
+
+PGC's public Dynamic STAC API can query ArcticDEM v4.1 10m mosaic tiles by AOI without Earthdata credentials. The workflow follows the [PGC Dynamic STAC API tutorial](https://polargeospatialcenter.github.io/pgc-code-tutorials/dynamic_stac_api/web_files/stac_api_demo_workflow.html) and downloads only each tile's `dem` GeoTIFF asset.
+
+```bash
+sentinel-py pgc query \
+  --aoi data/aois/toolik_025_aoi.geojson
+```
+
+The query manifest is cached under `~/.sentinel-py/cache/pgc/<QUERY_KEY>/manifest.parquet`. Repeating an identical query uses the cached manifest without contacting PGC. The manifest stores tile geometry and metadata so cached tile selections can be filtered by AOI without scanning local or remote directory structures.
+
+Download the latest cached PGC query in parallel:
+
+```bash
+sentinel-py pgc download \
+  --outdir data/arcticdem/10m \
+  --processes 4 \
+  --retries 3
+```
+
+Download state is stored at `<outdir>/.sentinel-py/pgc_downloads.parquet`. It records each tile's URL, local path, size, status, and last action. Existing files are checked only when referenced by the manifest and verified complete files are skipped; the output directory is never recursively crawled. Downloads use atomic temporary files, retries, and a Rich progress bar. PGC ArcticDEM mosaics use EPSG:3413 and ellipsoidal heights; follow PGC's attribution requirements when publishing results.

@@ -1,20 +1,20 @@
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated
 
 import pandas as pd
 import typer
 
 from sentinel_py.cache import DEFAULT_ASF_CACHE_DIR, find_latest_cache_file
-from sentinel_py.cli.download_preflight import (
-    confirm_download,
-    echo_storage_summary,
-)
 from sentinel_py.download.asf import (
     _product_filename,
     download_asf,
     earthdata_netrc_credentials,
 )
-from sentinel_py.download.preflight import DownloadStorageSummary
+from sentinel_py.download.preflight import (
+    DownloadStorageSummary,
+    confirm_download,
+    echo_storage_summary,
+)
 from sentinel_py.log import DEFAULT_LOG_DIR, get_logger
 
 app = typer.Typer()
@@ -99,7 +99,7 @@ def download(
         ),
     ],
     query: Annotated[
-        Optional[Path],
+        Path | None,
         typer.Option(
             help="Explicit ASF manifest.parquet instead of the latest cached query.",
             exists=True,
@@ -142,7 +142,7 @@ def download(
         ),
     ] = DEFAULT_ASF_CACHE_DIR,
     log: Annotated[
-        Optional[Path],
+        Path | None,
         typer.Option(
             help=(
                 "Log file path for download execution logs. If omitted, logs are saved "

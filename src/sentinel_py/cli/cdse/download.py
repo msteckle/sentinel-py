@@ -1,13 +1,13 @@
 import configparser
 import time
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated
 
 import pandas as pd
 import typer
 
 from sentinel_py.cache import DEFAULT_CDSE_CACHE_DIR
-from sentinel_py.cli.download_preflight import confirm_download, echo_storage_summary
+from sentinel_py.download.preflight import confirm_download, echo_storage_summary
 from sentinel_py.enums import S2DownloadAssets, S2Res
 from sentinel_py.log import DEFAULT_LOG_DIR, get_logger
 
@@ -119,7 +119,7 @@ def download(
         ),
     ],
     query: Annotated[
-        Optional[Path],
+        Path | None,
         typer.Option(
             help=("Path to a cache of CDSE query results stored as a parquet."),
             exists=True,
@@ -164,7 +164,7 @@ def download(
         ),
     ] = DEFAULT_CDSE_CACHE_DIR,
     log: Annotated[
-        Optional[Path],
+        Path | None,
         typer.Option(
             help=(
                 "Log file path for download execution logs. If omitted, logs are saved "

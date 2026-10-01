@@ -236,7 +236,7 @@ def discover_s2_granules(
     input_dir
         Directory containing ``*.SAFE`` products.
     bands
-        Spectral bands required in each preprocessed VRT.
+        Spectral bands required in each lazy preprocessed scene.
     resolution_m
         Target grid resolution used to select the closest local asset.
     aoi

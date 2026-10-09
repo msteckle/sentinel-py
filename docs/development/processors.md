@@ -1,13 +1,11 @@
 # Add processors
 
-To create a processor, you need to define a class that inherits from the base ``Processor`` class and implements the required methods for processing the data. You also need to define a corresponding configuration class that inherits from ``ProcessorConfig`` and specifies the parameters for the processor. Once the processor and its configuration are defined, you can reference the processor in the YAML configuration file and provide the necessary parameters for its execution.
-
-The ``Processor`` base class is located in ``sentinel_py/pipeline/processors/base.py``. A ``Processor`` must assign the ``type_name`` attribute, which is the name assigned to the processor that can be called in the ``YAML``. It must also assign the ``config_model`` attribute, which is a pydantic ``BaseModel`` that defines what parameters the processor accepts, plus validation rules for those parameters. This ensures that the processor receives the correct input and behaves as expected during execution.
+Pipeline extensions use parallel contracts: readers acquire source data, processors apply semantic transformations, and writers materialize typed artifacts. A processor must inherit from ``BaseProcessor``, declare ``type_name`` and a frozen Pydantic ``config_model``, and implement both ``execute_raster()`` and ``execute_points()``. The base class dispatches from the validated AOI mode, so processors never need geometry-mode ``isinstance`` branches. Raster hooks exchange ``RasterArtifact`` objects containing lazy xarray datasets; point hooks exchange compact ``PointSampleArtifact`` tables.
 
 Below is an example of how to create a custom processor in ``sentinel-py``. This processor, named ``AdditionProcessor``, adds a specified value to each pixel of the input data. We will require the data source (defined in the ``YAML`` under ``sources``) and the integer we want to add to each pixel. Thus, we will start by creating our pydantic BaseModel to define and validate the configuration parameters for the processor.
 
 ```python
-from sentinel_py.pipeline.processors.base import Processor, ProcessorConfig
+from sentinel_py.pipeline.processors.base import BaseProcessor, ProcessorConfig, ProcessorContext
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 from typing import Any, Mapping
 
@@ -30,7 +28,7 @@ class AdditionProcessorConfig(BaseModel):
 Next, we can build the actual processor class. First, we will instantiate the ``validate`` function, which ensures that the parameters provided in the ``YAML`` configuration file meet the requirements we designed above in the ``AdditionProcessorConfig``.
 
 ```python
-class AdditionProcessor(Processor):
+class AdditionProcessor(BaseProcessor):
     type_name = "addition"
     config_model = AdditionProcessorConfig
 
@@ -48,6 +46,14 @@ class AdditionProcessor(Processor):
         # Ensure the configuration is of the correct type
         if not isinstance(config, AdditionProcessorConfig):
             raise TypeError(f"{node_id} has an invalid addition configuration")
+
+    def execute_raster(self, config, inputs, context: ProcessorContext):
+        """Return a RasterArtifact without materializing source chunks."""
+        ...
+
+    def execute_points(self, config, inputs, context: ProcessorContext):
+        """Return a PointSampleArtifact with normalized wide value columns."""
+        ...
 ```
 
 ## Seasonal composites

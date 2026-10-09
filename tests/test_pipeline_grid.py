@@ -18,7 +18,7 @@ def _write_aoi(
     bounds: tuple[float, float, float, float],
     crs: str,
 ) -> Path:
-    gpd.GeoDataFrame(geometry=[box(*bounds)], crs=crs).to_file(path, driver="GeoJSON")
+    gpd.GeoDataFrame({"site": ["site-1"]}, geometry=[box(*bounds)], crs=crs).to_file(path, driver="GeoJSON")
     return path
 
 
@@ -150,7 +150,7 @@ def _canonical_pipeline(
     (tmp_path / "raw").mkdir(exist_ok=True)
     if include_aoi:
         _write_aoi(tmp_path / "aoi.geojson", (105, 205, 299, 401), "EPSG:3857")
-    selection = "aoi: aoi.geojson" if include_aoi else "years: [2024]"
+    selection = "aoi: aoi.geojson, aoi_id_field: site" if include_aoi else "years: [2024]"
     path = tmp_path / "pipeline.yaml"
     path.write_text(
         f"""
@@ -185,9 +185,10 @@ def test_pipeline_builds_canonical_grid_from_yaml(tmp_path: Path):
     assert config.output_grid.is_canonical
     assert config.output_grid.resolution == (20.0, 20.0)
     assert config.output_grid.anchor == (0.0, 0.0)
-    assert config.output_grid.grid is not None
-    assert config.output_grid.grid.bounds == (100.0, 200.0, 300.0, 420.0)
-    assert config.output_grid.grid.chunks == ChunkShape(y=4, x=6)
+    assert config.aoi_plan is not None
+    assert config.aoi_plan.units[0].grid is not None
+    assert config.aoi_plan.units[0].grid.bounds == (100.0, 200.0, 300.0, 420.0)
+    assert config.aoi_plan.units[0].grid.chunks == ChunkShape(y=4, x=6)
 
 
 @pytest.mark.parametrize(

@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict
 from shapely.geometry import box
 
 from sentinel_py.pipeline import PipelineConfig, PipelineConfigError
+from sentinel_py.pipeline.processors.base import ProcessorRegistry
 
 
 class _DummyConfig(BaseModel):
@@ -27,10 +28,17 @@ class _DummyProcessor:
         return config.value + sum(inputs.values())
 
 
+def _dummy_registry() -> ProcessorRegistry:
+    """Return a registry used by graph-validation tests."""
+    registry = ProcessorRegistry()
+    registry.register(_DummyProcessor())
+    return registry
+
+
 def _pipeline_yaml(tmp_path: Path, extra: str = "") -> Path:
     (tmp_path / "raw").mkdir()
     gpd.GeoDataFrame(
-        geometry=[box(500000, 999960, 500040, 1000000)], crs="EPSG:32606"
+        {"site": ["site-1"]}, geometry=[box(500000, 999960, 500040, 1000000)], crs="EPSG:32606"
     ).to_file(tmp_path / "aoi.geojson", driver="GeoJSON")
     path = tmp_path / "pipeline.yaml"
     path.write_text(
@@ -41,6 +49,7 @@ execution:
   workers: 2
 selection:
   aoi: aoi.geojson
+  aoi_id_field: site
   years: [2023, 2024]
   speriod: "06-01"
   eperiod: "08-31"
@@ -88,7 +97,8 @@ def test_s2_preprocessor_accepts_canonical_cog_grid(tmp_path: Path):
 
     config = PipelineConfig.from_file(path)
 
-    assert config.output_grid.grid is not None
+    assert config.aoi_plan is not None
+    assert config.aoi_plan.units[0].grid is not None
     assert config.output.format == "cog"
 
 
@@ -105,7 +115,7 @@ def test_s2_preprocessor_rejects_retired_native_grid(tmp_path: Path):
         )
     )
 
-    with pytest.raises(PipelineConfigError, match="requires a canonical output grid"):
+    with pytest.raises(PipelineConfigError, match="canonical output_grid"):
         PipelineConfig.from_file(path)
 
 
@@ -196,7 +206,7 @@ def test_pipeline_topologically_orders_named_node_inputs(tmp_path: Path):
     value: 2""",
     )
 
-    config = PipelineConfig.from_file(path)
+    config = PipelineConfig.from_file(path, registry=_dummy_registry())
 
     assert [node.node_id for node in config.nodes] == ["final", "root", "middle"]
     assert [node.node_id for node in config.ordered_nodes] == [
@@ -216,7 +226,7 @@ def test_pipeline_rejects_duplicate_node_ids(tmp_path: Path):
     )
 
     with pytest.raises(PipelineConfigError, match="Duplicate node id: repeated"):
-        PipelineConfig.from_file(path)
+        PipelineConfig.from_file(path, registry=_dummy_registry())
 
 
 def test_pipeline_rejects_missing_node_input_reference(tmp_path: Path):
@@ -228,7 +238,7 @@ def test_pipeline_rejects_missing_node_input_reference(tmp_path: Path):
     )
 
     with pytest.raises(PipelineConfigError, match="references missing node 'absent'"):
-        PipelineConfig.from_file(path)
+        PipelineConfig.from_file(path, registry=_dummy_registry())
 
 
 def test_pipeline_rejects_node_cycles(tmp_path: Path):
@@ -246,7 +256,7 @@ def test_pipeline_rejects_node_cycles(tmp_path: Path):
     with pytest.raises(
         PipelineConfigError, match="cycle detected: first -> second -> first"
     ):
-        PipelineConfig.from_file(path)
+        PipelineConfig.from_file(path, registry=_dummy_registry())
 
 
 def test_processor_pydantic_model_rejects_unknown_configuration(tmp_path: Path):
@@ -258,5 +268,5 @@ def test_processor_pydantic_model_rejects_unknown_configuration(tmp_path: Path):
     )
 
     with pytest.raises(PipelineConfigError, match="Invalid configuration") as error:
-        PipelineConfig.from_file(path)
+        PipelineConfig.from_file(path, registry=_dummy_registry())
     assert "unexpected" in str(error.value)

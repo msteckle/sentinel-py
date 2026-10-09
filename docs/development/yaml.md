@@ -2,7 +2,7 @@
 
 In the ``sentinel-py run`` command, users supply a YAML configuration file to initiate a processing pipeline. The YAML file is divided into sections, each corresponding to a specific aspect of the pipeline configuration. To change, add, or remove allowed sections of the YAML, users need to modify the ``pipeline/config.py`` file and the corresponding frozen dataclasses.
 
-There is one dataclass for each section of the YAML configuration file. For example, the ``SelectionConfig`` dataclass corresponds to the ``selection`` section of the YAML, and dictates what keys are allowed under that section, plus validation rules for each key's associated value(s). The dataclass should be frozen and is named after the section it represents, with the suffix ``Config``. The ``selection`` section is used to specify a user's study area of interest (AOI), the years of interest, and the start and end of season (or any set period) within each year. That information is used to subselect the relevant data to use for the processing pipeline. At the start of a new dataclass, developers should specify what keys are needed and their allowed data types:
+There is one dataclass for each section of the YAML configuration file. For example, the ``SelectionConfig`` dataclass corresponds to the ``selection`` section of the YAML, and dictates what keys are allowed under that section, plus validation rules for each key's associated value(s). The dataclass should be frozen and is named after the section it represents, with the suffix ``Config``. The ``selection`` section is used to specify a user's study area of interest (AOI), the years of interest, and the start and end of season (or any set period) within each year. That information is used to subselect the relevant data to use for the processing pipeline. AOI files must include a stable, unique feature attribute named by ``selection.aoi_id_field``. Each feature is planned independently; disconnected multipart polygon components share their AOI ID but have separate aligned grids. Polygon AOIs use COG outputs and point AOIs use Parquet outputs. At the start of a new dataclass, developers should specify what keys are needed and their allowed data types:
 
 ```python
 @dataclass(frozen=True)
@@ -14,6 +14,8 @@ class SelectionConfig:
     ---------
     aoi : Path | None
         Area of interest file path (default is None).
+    aoi_id_field : str | None
+        Required stable, unique feature attribute when an AOI is supplied.
     years : tuple[int, ...] | None
         Years to select (default is None).
     start_period : tuple[int, int]
@@ -23,6 +25,7 @@ class SelectionConfig:
     """
 
     aoi: Path | None
+    aoi_id_field: str | None
     years: tuple[int, ...] | None
     start_period: tuple[int, int]
     end_period: tuple[int, int]
@@ -37,7 +40,7 @@ Then, users should create a classmethod that, given a raw mapping (typically par
 
         # Extract the "selection" section from the raw mapping and validate its keys
         value = _mapping(raw, "selection")
-        _only_keys(value, {"aoi", "years", "speriod", "eperiod"}, "selection")
+        _only_keys(value, {"aoi", "aoi_id_field", "years", "speriod", "eperiod"}, "selection")
 
         # Resolve the area of interest (AOI) file path and validate its existence
         aoi = (

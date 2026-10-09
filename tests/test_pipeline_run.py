@@ -161,7 +161,7 @@ def test_pipeline_runs_preprocess_node_end_to_end(tmp_path: Path):
             dataset.write(np.asarray(values, dtype=np.uint16).reshape(2, 2), 1)
 
     gpd.GeoDataFrame(
-        geometry=[box(500000, 999960, 500040, 1000000)], crs="EPSG:32606"
+        {"site": ["site-1"]}, geometry=[box(500000, 999960, 500040, 1000000)], crs="EPSG:32606"
     ).to_file(tmp_path / "aoi.geojson", driver="GeoJSON")
 
     pipeline = tmp_path / "pipeline.yaml"
@@ -171,6 +171,7 @@ version: 1
 execution: {method: local, workers: 1}
 selection:
   aoi: aoi.geojson
+  aoi_id_field: site
   years: [2024]
   speriod: "06-01"
   eperiod: "08-31"

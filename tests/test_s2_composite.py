@@ -5,11 +5,13 @@ import warnings
 from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
 import pytest
 
 xr = pytest.importorskip("xarray")
 
 from sentinel_py.pipeline.processors.base import ProcessorContext  # noqa: E402
+from sentinel_py.pipeline.artifacts import PointSampleArtifact  # noqa: E402
 from sentinel_py.pipeline.processors.s2_composite import (  # noqa: E402
     S2CompositeNodeConfig,
     S2CompositeProcessor,
@@ -157,6 +159,30 @@ def test_composite_masks_all_nodata_without_runtime_warning():
         )
 
     assert np.all(result.reflectance.values == 65535)
+
+
+def test_point_composite_ignores_s2_nodata_sentinel():
+    """Masked S2 rows must not dominate a point median composite."""
+    rows = pd.DataFrame([
+        {"aoi_id": "site", "component_id": "part-0000", "point_index": 0,
+         "longitude": 0.0, "latitude": 0.0, "time": "2024-06-01",
+         "product_id": "p1", "granule_id": "g1", "time_representation": "acquisition",
+         "source_fingerprint": "one", "B02": 0},
+        {"aoi_id": "site", "component_id": "part-0000", "point_index": 0,
+         "longitude": 0.0, "latitude": 0.0, "time": "2024-06-05",
+         "product_id": "p2", "granule_id": "g2", "time_representation": "acquisition",
+         "source_fingerprint": "two", "B02": 400},
+        {"aoi_id": "site", "component_id": "part-0000", "point_index": 0,
+         "longitude": 0.0, "latitude": 0.0, "time": "2024-06-10",
+         "product_id": "p3", "granule_id": "g3", "time_representation": "acquisition",
+         "source_fingerprint": "three", "B02": 600},
+    ])
+    result = S2CompositeProcessor().execute_points(
+        S2CompositeNodeConfig(period="all", aggregation="median"),
+        {"data": PointSampleArtifact(rows, SimpleNamespace())},
+        _context(),
+    )
+    assert result.rows.loc[0, "B02"] == 500
 
 
 @pytest.mark.parametrize("period", ["all", "ALL", " All "])

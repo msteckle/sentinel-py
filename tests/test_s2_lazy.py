@@ -80,6 +80,7 @@ def _synthetic_pipeline(tmp_path: Path) -> tuple[Path, Path]:
     )
     aoi = tmp_path / "aoi.geojson"
     gpd.GeoDataFrame(
+        {"site": ["test-site"]},
         geometry=[box(500000, 999960, 500040, 1000000)], crs="EPSG:32606"
     ).to_file(aoi, driver="GeoJSON")
     pipeline = tmp_path / "pipeline.yaml"
@@ -89,6 +90,7 @@ version: 1
 execution: {method: local}
 selection:
   aoi: aoi.geojson
+  aoi_id_field: site
   years: [2024]
   speriod: "06-01"
   eperiod: "08-31"
@@ -132,7 +134,8 @@ def test_lazy_s2_processor_defers_reads_and_preserves_grid_masks_and_dtypes(
     logger.addHandler(logging.NullHandler())
 
     result = run_pipeline(PipelineConfig.from_file(pipeline_path), logger)
-    dataset = result.outputs["result"]
+    collection = result.outputs["result"]
+    dataset = collection.datasets[("test-site", "part-0000")]
 
     assert isinstance(dataset.reflectance.data, da.Array)
     assert isinstance(dataset.scl.data, da.Array)
@@ -151,7 +154,7 @@ def test_lazy_s2_processor_defers_reads_and_preserves_grid_masks_and_dtypes(
     np.testing.assert_array_equal(
         computed.reflectance.values,
         np.array(
-            [[[[300, 1300], [2200, 65535]], [[0, 100], [65535, 65535]]]],
+                [[[[300, 1300], [2200, 65535]], [[65535, 100], [65535, 65535]]]],
             dtype=np.uint16,
         ),
     )
@@ -200,7 +203,7 @@ def test_local_dask_cog_outputs_share_reads_and_resume(
         output_result = first.output_results[output_id]
         assert len(output_result.results) == 8
         assert {item.status for item in output_result.results} == {"written"}
-        assert cog_state_path(tmp_path / output_id).is_file()
+        assert cog_state_path(tmp_path / output_id / "test-site" / "part-0000").is_file()
         assert len(list((tmp_path / output_id).rglob("*.tif"))) == 8
         assert not list((tmp_path / output_id).rglob("*.tmp.tif"))
 

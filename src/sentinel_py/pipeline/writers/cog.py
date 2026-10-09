@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from dataclasses import replace
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,6 +20,7 @@ from sentinel_py.cache import (
     write_parquet_atomic,
 )
 from sentinel_py.pipeline.writers import OutputWritePlan
+from sentinel_py.pipeline.artifacts import ArtifactKind
 
 COG_WRITER_VERSION = 1
 COG_STATE_NAME = "cog_outputs.parquet"
@@ -144,6 +146,7 @@ class COGOutputWriter:
     """Build chunk-level COG tasks and maintain output-scoped resume state."""
 
     format_name = "cog"
+    accepted_artifact_kinds = frozenset({ArtifactKind.RASTER})
 
     def build(self, artifact: Any, output: Any, pipeline: Any) -> OutputWritePlan:
         try:
@@ -151,6 +154,21 @@ class COGOutputWriter:
             from dask import delayed
         except ImportError as error:
             raise RuntimeError("COG output requires xarray and Dask") from error
+        from sentinel_py.pipeline.artifacts import RasterArtifact
+        if isinstance(artifact, RasterArtifact):
+            if artifact.plan.kind != "polygon":
+                raise ValueError("COG output requires polygon AOIs")
+            subplans = []
+            for key, dataset in artifact.datasets.items():
+                unit = artifact.plan.by_key[key]
+                scoped_output = replace(output, path=output.path / unit.aoi_id / unit.component_id)
+                subplans.append(self.build(dataset, scoped_output, pipeline))
+            return OutputWritePlan(
+                output,
+                tuple(task for plan in subplans for task in plan.tasks),
+                tuple(result for plan in subplans for result in plan.completed),
+                {"subplans": tuple(subplans)},
+            )
         if not isinstance(artifact, xr.Dataset):
             raise TypeError("COG output requires an xarray Dataset artifact")
         if "reflectance" not in artifact.data_vars:
@@ -290,6 +308,14 @@ class COGOutputWriter:
         plan: OutputWritePlan,
         computed: tuple[Any, ...],
     ) -> tuple[COGWriteResult, ...]:
+        if "subplans" in plan.metadata:
+            results = []
+            offset = 0
+            for subplan in plan.metadata["subplans"]:
+                count = len(subplan.tasks)
+                results.extend(self.finalize(subplan, computed[offset:offset + count]))
+                offset += count
+            return tuple(results)
         results = tuple(plan.completed) + tuple(computed)
         state = merge_state_rows(
             plan.metadata["state"],

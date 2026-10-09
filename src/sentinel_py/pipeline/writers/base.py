@@ -6,6 +6,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from sentinel_py.pipeline.artifacts import ArtifactKind
+
 
 @dataclass(frozen=True)
 class OutputWritePlan:
@@ -38,6 +40,7 @@ class OutputWriter(Protocol):
     """Build delayed materialization tasks and finalize their central state."""
 
     format_name: str
+    accepted_artifact_kinds: frozenset[ArtifactKind]
 
     def build(self, artifact: Any, output: Any, pipeline: Any) -> OutputWritePlan:
         """Return delayed tasks without computing them."""
@@ -55,6 +58,7 @@ class ArtifactOutputWriter:
 
     def __init__(self, format_name: str):
         self.format_name = format_name
+        self.accepted_artifact_kinds = frozenset({ArtifactKind.RASTER, ArtifactKind.POINT})
 
     def build(self, artifact: Any, output: Any, pipeline: Any) -> OutputWritePlan:
         del artifact, pipeline
@@ -98,9 +102,11 @@ def get_default_writer_registry() -> OutputWriterRegistry:
     global _DEFAULT_WRITERS
     if _DEFAULT_WRITERS is None:
         from sentinel_py.pipeline.writers.cog import COGOutputWriter
+        from sentinel_py.pipeline.writers.parquet import ParquetOutputWriter
 
         registry = OutputWriterRegistry()
         registry.register(COGOutputWriter())
+        registry.register(ParquetOutputWriter())
         registry.register(ArtifactOutputWriter("xarray"))
         _DEFAULT_WRITERS = registry
     return _DEFAULT_WRITERS

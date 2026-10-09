@@ -17,6 +17,8 @@ from sentinel_py.pipeline.writers.base import (
     get_default_writer_registry,
 )
 
+MAX_MATERIALIZATION_TASKS_PER_BATCH = 10_000
+
 
 @dataclass(frozen=True)
 class PipelineRunResult:
@@ -89,7 +91,19 @@ def run_pipeline(
             raise ValueError(
                 f"Output {output_id!r} uses unregistered format {output.format!r}"
             ) from error
-        plan = writer.build(named_outputs[output_id], output, config)
+        artifact = named_outputs[output_id]
+        artifact_kind = getattr(artifact, "kind", None)
+        accepted_kinds = getattr(writer, "accepted_artifact_kinds", None)
+        # Third-party writers written before typed artifacts remain usable for
+        # non-pipeline values; built-in writers always declare accepted kinds.
+        if accepted_kinds is not None and artifact_kind is not None and artifact_kind not in accepted_kinds:
+            accepted = ", ".join(sorted(kind.value for kind in accepted_kinds))
+            actual = getattr(artifact_kind, "value", type(artifact).__name__)
+            raise ValueError(
+                f"Output {output_id!r} format {output.format!r} accepts {accepted} "
+                f"artifacts, not {actual}"
+            )
+        plan = writer.build(artifact, output, config)
         start = len(all_tasks)
         all_tasks.extend(plan.tasks)
         task_ranges[output_id] = start, len(all_tasks)
@@ -116,13 +130,19 @@ def run_pipeline(
         len(all_tasks),
         config.execution.method,
     )
-    computed = compute_dask_tasks(
-        tuple(all_tasks),
-        config.execution,
-        progress_callback=progress_callback,
-        task_progress_callback=task_progress_callback,
-        initial_completed_tasks=sum(len(plan.completed) for _, plan in plans.values()),
-    )
+    initial_completed = sum(len(plan.completed) for _, plan in plans.values())
+    computed_parts = []
+    for offset in range(0, len(all_tasks), MAX_MATERIALIZATION_TASKS_PER_BATCH):
+        batch = tuple(all_tasks[offset:offset + MAX_MATERIALIZATION_TASKS_PER_BATCH])
+        logger.info("Computing output task batch %d-%d of %d", offset + 1, offset + len(batch), len(all_tasks))
+        computed_parts.extend(compute_dask_tasks(
+            batch,
+            config.execution,
+            progress_callback=progress_callback,
+            task_progress_callback=task_progress_callback,
+            initial_completed_tasks=initial_completed + offset,
+        ))
+    computed = tuple(computed_parts)
     output_results = {}
     for output_id, output in config.outputs.items():
         writer, plan = plans[output_id]

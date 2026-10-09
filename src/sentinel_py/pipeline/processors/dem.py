@@ -11,7 +11,6 @@ import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from sentinel_py.cache import deterministic_cache_key
-from sentinel_py.pipeline.lazy import read_reprojected_window
 from sentinel_py.pipeline.processors.base import BaseProcessor, ProcessorConfig, ProcessorContext
 
 
@@ -162,12 +161,55 @@ def _native_feature_chunk(paths: tuple[Path, ...], grid: Any, window: Any, confi
     with rasterio.open(paths[0]) as first:
         source_crs = first.crs
         source_res = (abs(first.transform.a), abs(first.transform.e))
+        source_transform = first.transform
     with rasterio.Env():
         datasets = [rasterio.open(path) for path in paths]
         try:
-            bounds = transform_bounds(grid.crs, source_crs, *window.bounds, densify_pts=21)
-            bounds = (bounds[0] - source_res[0], bounds[1] - source_res[1],
-                      bounds[2] + source_res[0], bounds[3] + source_res[1])
+            projected_bounds = transform_bounds(
+                grid.crs, source_crs, *window.bounds, densify_pts=21
+            )
+            # Derivative and bilinear reprojection results must not depend on
+            # the requested output-window extent.  Align every native read to
+            # the source pixel lattice and retain a two-pixel halo: one pixel
+            # for the 3x3 terrain derivative and one for resampling support.
+            inverse = ~source_transform
+            corners = [
+                inverse * (x, y)
+                for x, y in (
+                    (projected_bounds[0], projected_bounds[1]),
+                    (projected_bounds[0], projected_bounds[3]),
+                    (projected_bounds[2], projected_bounds[1]),
+                    (projected_bounds[2], projected_bounds[3]),
+                )
+            ]
+            halo = 2
+            native_chunk = 1024
+            # Snap to a fixed native chunk lattice, rather than merely to a
+            # pixel.  A point request and a polygon request that cover the
+            # same source pixel therefore use the same terrain neighborhood.
+            column_start = (
+                math.floor(min(point[0] for point in corners) / native_chunk)
+                * native_chunk
+                - halo
+            )
+            column_end = (
+                math.ceil(max(point[0] for point in corners) / native_chunk)
+                * native_chunk
+                + halo
+            )
+            row_start = (
+                math.floor(min(point[1] for point in corners) / native_chunk)
+                * native_chunk
+                - halo
+            )
+            row_end = (
+                math.ceil(max(point[1] for point in corners) / native_chunk)
+                * native_chunk
+                + halo
+            )
+            left, top = source_transform * (column_start, row_start)
+            right, bottom = source_transform * (column_end, row_end)
+            bounds = (left, bottom, right, top)
             source, transform = merge(datasets, bounds=bounds, nodata=datasets[0].nodata, masked=True)
             elevation = source[0].filled(np.nan).astype(np.float32)
         finally:
@@ -202,7 +244,10 @@ class DEMProcessor(BaseProcessor):
 
     type_name = "dem"
     config_model = DEMNodeConfig
-    version = 2
+    # Version 3 aligns native source windows to a stable halo/chunk lattice.
+    # It intentionally invalidates COG resume keys from extent-dependent terrain
+    # derivatives produced by earlier versions.
+    version = 3
 
     def validate(self, config: ProcessorConfig, *, node_id: str, inputs: Mapping[str, str], sources: Mapping[str, Any], outputs: tuple[Any, ...], output_grid: Any) -> None:
         if not isinstance(config, DEMNodeConfig):

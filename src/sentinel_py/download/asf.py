@@ -16,6 +16,7 @@ import requests
 from asf_search.download import download_url as asf_download_url
 from asf_search.exceptions import ASFAuthenticationError
 from shapely import wkt
+from shapely.geometry.polygon import orient
 from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
@@ -246,8 +247,24 @@ def query_asf(
             len(points),
             len(spatial_option_batches),
         )
+    elif aoi_geometry.geom_type == "MultiPolygon":
+        # ASF's geometry repair can reverse rings while attempting to merge
+        # disconnected polygons, yielding an invalid clockwise CMR polygon.
+        # Query each independently oriented component instead; this also avoids
+        # an accidental world-spanning envelope for distant AOI features.
+        spatial_option_batches = [
+            {"intersectsWith": orient(polygon, sign=1.0).wkt}
+            for polygon in aoi_geometry.geoms
+            if not polygon.is_empty
+        ]
+        if not spatial_option_batches:
+            raise ValueError("MultiPolygon AOI contains no usable polygons")
+        logger.info(
+            "Querying ASF MultiPolygon AOI as %d independent polygon filters",
+            len(spatial_option_batches),
+        )
     else:
-        spatial_option_batches = [{"intersectsWith": aoi_wkt}]
+        spatial_option_batches = [{"intersectsWith": orient(aoi_geometry, sign=1.0).wkt}]
 
     # Search ASF for products matching the criteria using the asf_search library
     try:

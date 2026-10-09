@@ -7,6 +7,8 @@ from typing import Annotated, Optional
 import geopandas as gpd
 import pandas as pd
 import typer
+from shapely.geometry import MultiPoint
+from shapely.geometry.polygon import orient
 
 from sentinel_py.cache import (
     DEFAULT_ASF_CACHE_DIR,
@@ -20,6 +22,7 @@ from sentinel_py.download.asf import (
     get_predominant_flightdir,
     query_asf,
 )
+from sentinel_py.download.pgc import atomic_aoi_geometries
 from sentinel_py.enums import (
     ASFBeamMode,
     ASFOrbitDirection,
@@ -207,8 +210,20 @@ def query(
         raise typer.BadParameter(f"AOI contains no features: {aoi}")
     if aoi_gdf.crs is None:
         aoi_gdf = aoi_gdf.set_crs(crs)
-    aoi_geometry = aoi_gdf.to_crs("EPSG:4326").geometry.union_all()
-    aoi_wkt = aoi_geometry.wkt
+    aoi_components = atomic_aoi_geometries(aoi_gdf.to_crs("EPSG:4326").geometry)
+    if not aoi_components:
+        raise typer.BadParameter(f"AOI contains no usable geometries: {aoi}")
+    if all(geometry.geom_type == "Point" for geometry in aoi_components):
+        # ASF's point OR query is compact and avoids creating an enormous
+        # polygon envelope around widely separated sample points.
+        aoi_wkts = [MultiPoint(aoi_components).wkt]
+        spatial_query_strategy = "cmr_point_or_v1"
+    else:
+        if any(geometry.geom_type != "Polygon" for geometry in aoi_components):
+            raise typer.BadParameter("AOI must contain only points or only polygons")
+        # Never union disconnected boxes: each is an independent ASF filter.
+        aoi_wkts = [orient(geometry, sign=1.0).wkt for geometry in aoi_components]
+        spatial_query_strategy = "independent_polygon_v1"
 
     product_level_value = product_levels.value
     beam_mode_value = beam_mode.value
@@ -229,7 +244,7 @@ def query(
     query_payload = {
         "provider": "ASF",
         "platform": "SENTINEL-1",
-        "aoi_wkt": aoi_wkt,
+        "aoi_wkts": aoi_wkts,
         "years": parsed_years,
         "speriod": f"{speriod.month:02d}-{speriod.day:02d}",
         "eperiod": f"{eperiod.month:02d}-{eperiod.day:02d}",
@@ -244,10 +259,7 @@ def query(
         "relative_orbit": relative_orbit,
         "max_results": max_results,
     }
-    if aoi_geometry.geom_type == "MultiPoint":
-        # Invalidate manifests cached by older versions that queried ASF's convex
-        # hull, as well as the temporary per-point implementation.
-        query_payload["spatial_query_strategy"] = "cmr_point_or_v1"
+    query_payload["spatial_query_strategy"] = spatial_query_strategy
     query_dir = cache_directory(
         cache_dir,
         deterministic_cache_key(query_payload),
@@ -284,19 +296,23 @@ def query(
     # Otherwise, run the query and cache the results
     else:
         try:
-            manifest = query_asf(
-                aoi_wkt=aoi_wkt,
-                date_start=query_range[0],
-                date_end=query_range[1],
-                product_levels=levels,
-                season=season,
-                beam_mode=beam_mode_value,
-                flight_direction=query_direction,
-                polarization=polarization_value,
-                relative_orbit=relative_orbit,
-                max_results=max_results,
-                logger=logger,
-            )
+            manifests = [
+                query_asf(
+                    aoi_wkt=aoi_wkt,
+                    date_start=query_range[0],
+                    date_end=query_range[1],
+                    product_levels=levels,
+                    season=season,
+                    beam_mode=beam_mode_value,
+                    flight_direction=query_direction,
+                    polarization=polarization_value,
+                    relative_orbit=relative_orbit,
+                    max_results=max_results,
+                    logger=logger,
+                )
+                for aoi_wkt in aoi_wkts
+            ]
+            manifest = pd.concat(manifests, ignore_index=True)
         except ValueError as error:
             logger.error("Invalid ASF query: %s", error)
             raise typer.BadParameter(str(error)) from error

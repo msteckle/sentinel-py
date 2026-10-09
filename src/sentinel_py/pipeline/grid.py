@@ -10,6 +10,7 @@ from typing import Iterator
 import geopandas as gpd
 from affine import Affine
 from pyproj import CRS, Transformer
+from shapely.geometry.base import BaseGeometry
 
 
 class GridPlanningError(ValueError):
@@ -98,39 +99,29 @@ def _aligned_ceil(value: float, anchor: float, resolution: float) -> float:
     return anchor + math.ceil(pixel - 1e-9) * resolution
 
 
-def plan_aoi_grid(
-    aoi: Path,
+def plan_geometry_grid(
+    geometry: BaseGeometry,
+    geometry_crs: str,
     *,
     crs: str,
     resolution: tuple[float, float],
     anchor: tuple[float, float],
     chunks: ChunkShape,
 ) -> GridSpec:
-    """Transform an AOI and snap its bounds outward to a shared pixel lattice."""
+    """Transform one AOI geometry and snap its bounds to a shared pixel lattice."""
     try:
         target_crs = CRS.from_user_input(crs)
     except Exception as error:
         raise GridPlanningError(f"Invalid output grid CRS {crs!r}: {error}") from error
 
-    try:
-        aoi_frame = gpd.read_file(aoi)
-    except Exception as error:
-        raise GridPlanningError(f"Could not read selection AOI {aoi}: {error}") from error
-    if aoi_frame.empty:
-        raise GridPlanningError(f"Selection AOI contains no geometry: {aoi}")
-    if aoi_frame.crs is None:
-        raise GridPlanningError(f"Selection AOI has no CRS metadata: {aoi}")
-    valid_geometry = aoi_frame.geometry.notna() & ~aoi_frame.geometry.is_empty
-    if not valid_geometry.any():
-        raise GridPlanningError(f"Selection AOI contains no geometry: {aoi}")
-    source_bounds = tuple(
-        float(value) for value in aoi_frame.loc[valid_geometry].total_bounds
-    )
+    if geometry is None or geometry.is_empty:
+        raise GridPlanningError("AOI geometry must be non-empty")
+    source_bounds = tuple(float(value) for value in geometry.bounds)
     if not all(math.isfinite(value) for value in source_bounds):
         raise GridPlanningError("Selection AOI bounds must be finite")
     try:
         transformer = Transformer.from_crs(
-            aoi_frame.crs, target_crs, always_xy=True
+            geometry_crs, target_crs, always_xy=True
         )
         xmin, ymin, xmax, ymax = transformer.transform_bounds(
             *source_bounds,
@@ -174,4 +165,33 @@ def plan_aoi_grid(
         width=width,
         height=height,
         chunks=chunks,
+    )
+
+
+def plan_aoi_grid(
+    aoi: Path,
+    *,
+    crs: str,
+    resolution: tuple[float, float],
+    anchor: tuple[float, float],
+    chunks: ChunkShape,
+) -> GridSpec:
+    """Backward-compatible helper for planning one single-feature AOI file.
+
+    Pipeline execution plans each feature/component with ``plan_geometry_grid``.
+    This helper remains for external callers that have a one-feature file.
+    """
+    try:
+        frame = gpd.read_file(aoi)
+    except Exception as error:
+        raise GridPlanningError(f"Could not read selection AOI {aoi}: {error}") from error
+    if frame.empty or frame.crs is None:
+        raise GridPlanningError(f"Selection AOI contains no geometry or CRS: {aoi}")
+    geometries = frame.geometry.dropna()
+    geometries = geometries[~geometries.is_empty]
+    if len(geometries) != 1:
+        raise GridPlanningError("plan_aoi_grid requires exactly one non-empty geometry")
+    return plan_geometry_grid(
+        geometries.iloc[0], str(frame.crs), crs=crs, resolution=resolution,
+        anchor=anchor, chunks=chunks,
     )

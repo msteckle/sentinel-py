@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from sentinel_py.cache import deterministic_cache_key
 from sentinel_py.pipeline.processors.base import (
-    Processor,
+    BaseProcessor,
     ProcessorConfig,
     ProcessorContext,
 )
@@ -120,11 +120,12 @@ def _composite_name(source: Any, selection: Any, aggregation: str) -> str:
     )
 
 
-class S2CompositeProcessor(Processor):
+class S2CompositeProcessor(BaseProcessor):
     """Aggregate an upstream lazy Sentinel-2 cube into seasonal composites."""
 
     type_name = "composite"
     config_model = S2CompositeNodeConfig
+    input_kind = None
     version = 2
 
     def validate(
@@ -143,10 +144,10 @@ class S2CompositeProcessor(Processor):
             raise TypeError(f"{node_id} has an invalid composite configuration")
         if len(inputs) != 1:
             raise ValueError("composite requires exactly one upstream input")
-        if any(output.format not in {"cog", "xarray"} for output in outputs):
+        if any(output.format not in {"cog", "xarray", "parquet"} for output in outputs):
             raise ValueError("composite requires named COG or xarray outputs")
 
-    def execute(
+    def execute_raster(
         self,
         config: ProcessorConfig,
         inputs: Mapping[str, Any],
@@ -164,6 +165,13 @@ class S2CompositeProcessor(Processor):
             raise RuntimeError("Composite processing requires xarray") from error
 
         source = next(iter(inputs.values()))
+        from sentinel_py.pipeline.artifacts import RasterArtifact
+        if isinstance(source, RasterArtifact):
+            datasets = {
+                key: self.execute(config, {"data": dataset}, context)
+                for key, dataset in source.datasets.items()
+            }
+            return RasterArtifact(source.plan, datasets)
         if not isinstance(source, xr.Dataset) or "reflectance" not in source:
             raise TypeError(
                 "composite input must be an xarray Dataset with reflectance"
@@ -223,11 +231,8 @@ class S2CompositeProcessor(Processor):
 
         chunking = {"time": -1, "band": -1}
         output_grid = getattr(context.pipeline, "output_grid", None)
-        if output_grid is not None and output_grid.grid is not None:
-            chunking.update(
-                y=output_grid.grid.chunks.y,
-                x=output_grid.grid.chunks.x,
-            )
+        if output_grid is not None and output_grid.chunks is not None:
+            chunking.update(y=output_grid.chunks.y, x=output_grid.chunks.x)
         result = (
             xr.concat(reductions, dim="time")
             .to_dataset(name="reflectance")
@@ -246,6 +251,7 @@ class S2CompositeProcessor(Processor):
             composite_name=composite_name,
             aggregation=config.aggregation,
             period=config.period,
+            time_representation="composite",
             recipe_id=deterministic_cache_key(
                 {
                     "processor": self.type_name,
@@ -264,3 +270,42 @@ class S2CompositeProcessor(Processor):
             config.period,
         )
         return result
+
+    def execute_points(
+        self,
+        config: ProcessorConfig,
+        inputs: Mapping[str, Any],
+        context: ProcessorContext,
+    ) -> Any:
+        """Aggregate normalized point observations without constructing raster tasks."""
+        import pandas as pd
+        from sentinel_py.pipeline.artifacts import PointSampleArtifact
+
+        if not isinstance(config, S2CompositeNodeConfig) or len(inputs) != 1:
+            raise TypeError("Invalid composite configuration or inputs")
+        source = next(iter(inputs.values()))
+        if not isinstance(source, PointSampleArtifact):
+            raise TypeError("composite point input must be a PointSampleArtifact")
+        rows = source.rows.copy()
+        metadata = {
+            "aoi_id", "component_id", "point_index", "longitude", "latitude",
+            "time", "product_id", "granule_id", "time_representation", "source_fingerprint",
+        }
+        value_columns = [name for name in rows.columns if name not in metadata]
+        group_columns = ["aoi_id", "component_id", "point_index", "longitude", "latitude"]
+        if config.period == "all":
+            # S2 source rows may carry 0 (no-data) or 65535 (saturated) from
+            # older caches; neither may participate in a point composite.
+            for column in value_columns:
+                rows[column] = rows[column].replace((0, 65535), np.nan)
+            grouped = rows.groupby(group_columns, dropna=False, sort=False)
+            aggregate = getattr(grouped[value_columns], {"mean": "mean", "median": "median", "maximum": "max"}[config.aggregation])().reset_index()
+            aggregate["time"] = f"{context.pipeline.selection.start_period[0]:02d}-{context.pipeline.selection.start_period[1]:02d}"
+            aggregate["product_id"] = "composite"
+            aggregate["granule_id"] = "all"
+            aggregate["time_representation"] = "composite"
+            aggregate["source_fingerprint"] = "composite"
+            return PointSampleArtifact(aggregate, source.plan)
+        # Preserve acquisition rows for non-all bins until binning rules are expanded.
+        # This is explicit rather than silently applying a different calendar policy.
+        raise ValueError("Point composites currently support period: all only")

@@ -19,12 +19,8 @@ from typing import Any, Literal, cast
 import yaml
 from pydantic import BaseModel, ValidationError
 
-from sentinel_py.pipeline.grid import (
-    ChunkShape,
-    GridPlanningError,
-    GridSpec,
-    plan_aoi_grid,
-)
+from sentinel_py.pipeline.grid import ChunkShape, GridSpec
+from sentinel_py.pipeline.aoi import AOIPlan, load_aoi_plan
 from sentinel_py.pipeline.processors import ProcessorRegistry, get_default_registry
 
 _SEASON_PATTERN = re.compile(r"^(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$")
@@ -413,6 +409,7 @@ class SelectionConfig:
     """
 
     aoi: Path | None
+    aoi_id_field: str | None
     years: tuple[int, ...] | None
     start_period: tuple[int, int]
     end_period: tuple[int, int]
@@ -422,7 +419,7 @@ class SelectionConfig:
 
         # Extract the "selection" section from the raw mapping and validate its keys
         value = _mapping(raw, "selection")
-        _only_keys(value, {"aoi", "years", "speriod", "eperiod"}, "selection")
+        _only_keys(value, {"aoi", "aoi_id_field", "years", "speriod", "eperiod"}, "selection")
 
         # Resolve the area of interest (AOI) file path and validate its existence
         aoi = (
@@ -432,6 +429,9 @@ class SelectionConfig:
         )
         if aoi is not None and not aoi.is_file():
             raise PipelineConfigError(f"selection.aoi does not exist: {aoi}")
+        aoi_id_field = value.get("aoi_id_field")
+        if aoi is not None and (not isinstance(aoi_id_field, str) or not aoi_id_field.strip()):
+            raise PipelineConfigError("selection.aoi_id_field must be a non-empty string")
 
         # Process the years selection and validate the values
         raw_years = value.get("years")
@@ -459,7 +459,7 @@ class SelectionConfig:
             )
 
         # Return the validated values
-        return cls(aoi=aoi, years=years, start_period=start, end_period=end)
+        return cls(aoi=aoi, aoi_id_field=aoi_id_field, years=years, start_period=start, end_period=end)
 
 
 @dataclass(frozen=True)
@@ -493,7 +493,7 @@ class OutputGridConfig:
     @property
     def is_canonical(self) -> bool:
         """Return whether this request has a concrete AOI-derived pixel grid."""
-        return self.grid is not None
+        return self.chunks is not None and self.crs != "native"
 
     @staticmethod
     def _parse_chunks(raw: Any) -> ChunkShape:
@@ -525,6 +525,12 @@ class OutputGridConfig:
             )
             resolution = float(resolution_m), float(resolution_m)
             return OutputGridConfig("native", resolution)
+        try:
+            from pyproj import CRS
+
+            CRS.from_user_input(crs)
+        except Exception as error:
+            raise PipelineConfigError(f"Invalid output grid CRS: {crs}") from error
 
         # Ensure only the expected keys are present in the output grid configuration
         _only_keys(
@@ -562,26 +568,14 @@ class OutputGridConfig:
 
         chunks = cls._parse_chunks(_required(value, "chunks", "output_grid"))
 
-        # Plan the canonical output grid based on the AOI, resolution, anchor, and chunks
-        try:
-            grid = plan_aoi_grid(
-                selection.aoi,
-                crs=crs,
-                resolution=resolution,
-                anchor=anchor,
-                chunks=chunks,
-            )
-        except GridPlanningError as error:
-            raise PipelineConfigError(f"Could not plan output grid: {error}") from error
-
-        # Return the finalized output grid configuration
+        # AOI feature grids are planned after parsing, one component at a time.
         return cls(
-            grid.crs,
+            crs,
             resolution,
             extent="aoi",
             anchor=anchor,
             chunks=chunks,
-            grid=grid,
+            grid=None,
         )
 
 
@@ -652,42 +646,31 @@ SourceConfig = S2SourceConfig | DEMSourceConfig
 
 
 def parse_sources(raw: Any, base_dir: Path) -> dict[str, SourceConfig]:
-    """Parse configured Sentinel-2 and local DEM sources."""
+    """Parse sources through the built-in reader registry."""
+    from sentinel_py.pipeline.readers import get_default_reader_registry
+
     values = _mapping(raw, "sources")
     if not values:
         raise PipelineConfigError("sources must define at least one source")
     sources: dict[str, SourceConfig] = {}
+    readers = get_default_reader_registry()
     for raw_id, raw_source in values.items():
         source_id = _identifier(raw_id, "source identifiers")
         value = _mapping(raw_source, f"sources.{source_id}")
         source_type = _required(value, "type", f"sources.{source_id}")
-        if source_type == "s2.l2a.local":
-            _only_keys(value, {"type", "data_dir"}, f"sources.{source_id}")
-            data_dir = _resolve_path(
-                _required(value, "data_dir", f"sources.{source_id}"),
-                base_dir,
-                f"sources.{source_id}.data_dir",
-            )
-            if not data_dir.is_dir():
-                raise PipelineConfigError(f"S2 source directory does not exist: {data_dir}")
-            sources[source_id] = S2SourceConfig(source_id, data_dir)
-        elif source_type == "dem.local":
-            _only_keys(value, {"type", "data_dir", "pattern"}, f"sources.{source_id}")
-            data_dir = _resolve_path(
-                _required(value, "data_dir", f"sources.{source_id}"),
-                base_dir,
-                f"sources.{source_id}.data_dir",
-            )
-            if not data_dir.is_dir():
-                raise PipelineConfigError(f"DEM source directory does not exist: {data_dir}")
-            pattern = value.get("pattern", "*.tif")
-            if not isinstance(pattern, str) or not pattern.strip():
-                raise PipelineConfigError(f"sources.{source_id}.pattern must be a string")
-            sources[source_id] = DEMSourceConfig(source_id, data_dir, pattern.strip())
-        else:
+        if not isinstance(source_type, str):
             raise PipelineConfigError(
-                f"sources.{source_id}.type must be s2.l2a.local or dem.local"
+                f"sources.{source_id}.type must name a registered reader"
             )
+        try:
+            source = readers.get(source_type).parse_config(source_id, value, base_dir)
+        except KeyError as error:
+            available = ", ".join(readers.source_types)
+            raise PipelineConfigError(
+                f"sources.{source_id}.type {source_type!r} is not registered "
+                f"(available: {available})"
+            ) from error
+        sources[source_id] = cast(SourceConfig, source)
     return sources
 
 
@@ -856,6 +839,7 @@ class PipelineConfig:
     execution: ExecutionConfig
     selection: SelectionConfig
     output_grid: OutputGridConfig
+    aoi_plan: AOIPlan | None
     sources: Mapping[str, SourceConfig]
     nodes: tuple[NodeConfig, ...]
     ordered_nodes: tuple[NodeConfig, ...]
@@ -931,6 +915,21 @@ class PipelineConfig:
         output_grid = OutputGridConfig.from_mapping(
             _required(root, "output_grid", "pipeline"), selection
         )
+        aoi_plan = None
+        if selection.aoi is not None:
+            if selection.aoi_id_field is None or output_grid.chunks is None:
+                raise PipelineConfigError("selection.aoi_id_field and canonical output_grid are required")
+            try:
+                aoi_plan = load_aoi_plan(
+                    selection.aoi,
+                    id_field=selection.aoi_id_field,
+                    crs=output_grid.crs,
+                    resolution=output_grid.resolution,
+                    anchor=output_grid.anchor,
+                    chunks=output_grid.chunks,
+                )
+            except ValueError as error:
+                raise PipelineConfigError(f"Invalid selection AOI: {error}") from error
         # Sources section
         sources = parse_sources(
             _required(root, "sources", "pipeline"), base_dir
@@ -942,6 +941,11 @@ class PipelineConfig:
         outputs = OutputConfig.parse_many(
             _required(root, "outputs", "pipeline"), nodes, base_dir
         )
+        invalid_format = "parquet" if aoi_plan is not None and aoi_plan.kind == "polygon" else "cog"
+        if aoi_plan is not None and any(output.format == invalid_format for output in outputs.values()):
+            raise PipelineConfigError(
+                f"{invalid_format} output is incompatible with {aoi_plan.kind} AOIs"
+            )
 
         # Validate each processor specified under the nodes section
         cls._validate_processors(nodes, sources, outputs, output_grid, registry)
@@ -950,6 +954,7 @@ class PipelineConfig:
             execution,
             selection,
             output_grid,
+            aoi_plan,
             sources,
             nodes,
             ordered_nodes,

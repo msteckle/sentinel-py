@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from sentinel_py.cache import deterministic_cache_key
 from sentinel_py.pipeline.lazy import read_reprojected_window
-from sentinel_py.pipeline.processors.base import Processor, ProcessorConfig, ProcessorContext
+from sentinel_py.pipeline.processors.base import BaseProcessor, ProcessorConfig, ProcessorContext
 
 
 class DEMFeature:
@@ -197,7 +197,7 @@ def _native_feature_chunk(paths: tuple[Path, ...], grid: Any, window: Any, confi
     return np.stack(bands)
 
 
-class DEMProcessor(Processor):
+class DEMProcessor(BaseProcessor):
     """Build a lazy, canonical-grid DEM terrain feature cube."""
 
     type_name = "dem"
@@ -212,12 +212,12 @@ class DEMProcessor(Processor):
         source = sources.get(config.source)
         if getattr(source, "source_type", None) != "dem.local":
             raise ValueError("dem.source must reference a dem.local source")
-        if output_grid.grid is None:
+        if output_grid.chunks is None:
             raise ValueError("dem requires a canonical output grid")
-        if any(output.format not in {"cog", "xarray"} for output in outputs):
+        if any(output.format not in {"cog", "xarray", "parquet"} for output in outputs):
             raise ValueError("dem requires named COG or xarray outputs")
 
-    def execute(self, config: ProcessorConfig, inputs: Mapping[str, Any], context: ProcessorContext) -> Any:
+    def execute_raster(self, config: ProcessorConfig, inputs: Mapping[str, Any], context: ProcessorContext) -> Any:
         if not isinstance(config, DEMNodeConfig) or inputs:
             raise TypeError("Invalid dem configuration or inputs")
         try:
@@ -226,22 +226,33 @@ class DEMProcessor(Processor):
             from dask import delayed
         except ImportError as error:
             raise RuntimeError("DEM processing requires xarray and Dask") from error
+        from sentinel_py.pipeline.aoi import point_grid
+        from sentinel_py.pipeline.readers.arcticdem import select_dem_paths
+        from sentinel_py.pipeline.readers.base import apply_polygon_mask
         source = context.pipeline.sources[config.source]
         paths = tuple(sorted(source.data_dir.glob(source.pattern)))
         if not paths:
             raise RuntimeError(f"No DEM GeoTIFFs matched {source.data_dir / source.pattern}")
-        grid = context.pipeline.output_grid.grid
-        arrays = []
-        for window in grid.iter_windows():
-            task = delayed(_native_feature_chunk)(paths, grid, window, config)
-            arrays.append(da.from_delayed(task, shape=(len(config.features), window.height, window.width), dtype=np.float32))
-        rows = []
-        index = 0
-        for row in range(grid.chunk_grid_shape[0]):
-            rows.append(da.concatenate(arrays[index:index + grid.chunk_grid_shape[1]], axis=2))
-            index += grid.chunk_grid_shape[1]
-        data = da.concatenate(rows, axis=1)[None, ...]
-        dataset = xr.Dataset(
+        pipeline = context.pipeline
+        if pipeline.output_grid.chunks is None:
+            raise ValueError("DEM requires output-grid chunks")
+        datasets = {}
+        for unit in pipeline.aoi_plan.units:
+            grid = unit.grid or point_grid(unit, crs=pipeline.output_grid.crs, resolution=pipeline.output_grid.resolution, anchor=pipeline.output_grid.anchor, chunks=pipeline.output_grid.chunks)
+            selected_paths = select_dem_paths(paths, unit, grid=grid)
+            if not selected_paths:
+                raise RuntimeError(f"No DEM GeoTIFFs intersect AOI {unit.aoi_id}")
+            arrays = []
+            for window in grid.iter_windows():
+                task = delayed(_native_feature_chunk)(selected_paths, grid, window, config)
+                arrays.append(da.from_delayed(task, shape=(len(config.features), window.height, window.width), dtype=np.float32))
+            rows = []
+            index = 0
+            for row in range(grid.chunk_grid_shape[0]):
+                rows.append(da.concatenate(arrays[index:index + grid.chunk_grid_shape[1]], axis=2))
+                index += grid.chunk_grid_shape[1]
+            data = da.concatenate(rows, axis=1)[None, ...]
+            dataset = xr.Dataset(
             {"reflectance": (("time", "band", "y", "x"), data)},
             coords={"time": np.array(["1970-01-01"], dtype="datetime64[ns]"), "band": list(config.features),
                     "y": np.arange(grid.height), "x": np.arange(grid.width),
@@ -249,7 +260,38 @@ class DEMProcessor(Processor):
                     "source_fingerprint": ("time", [deterministic_cache_key([str(path) for path in paths])])},
             attrs={"crs": grid.crs, "transform": tuple(grid.affine[:6]), "nodata": -9999.0,
                    "processor": self.type_name,
+                   "time_representation": "static",
                    "recipe_id": deterministic_cache_key({"version": self.version, **config.model_dump()})[:12]},
-        )
-        dataset["reflectance"].attrs["nodata"] = -9999.0
-        return dataset
+            )
+            dataset["reflectance"].attrs["nodata"] = -9999.0
+            datasets[(unit.aoi_id, unit.component_id)] = apply_polygon_mask(dataset, unit)
+        from sentinel_py.pipeline.artifacts import RasterArtifact
+        return RasterArtifact(pipeline.aoi_plan, datasets)
+
+    def execute_points(
+        self, config: ProcessorConfig, inputs: Mapping[str, Any], context: ProcessorContext
+    ) -> Any:
+        """Materialize only terrain-feature point pixels as normalized rows."""
+        import pandas as pd
+        from sentinel_py.pipeline.artifacts import PointSampleArtifact
+
+        raster = self.execute_raster(config, inputs, context)
+        records: list[dict[str, Any]] = []
+        for key, dataset in raster.datasets.items():
+            unit = raster.plan.by_key[key]
+            values = dataset.reflectance.compute().values[0, :, 0, 0]
+            record = {
+                "aoi_id": unit.aoi_id,
+                "component_id": unit.component_id,
+                "point_index": int(unit.component_id.rsplit("-", 1)[-1]),
+                "longitude": float(unit.geometry_wgs84.x),
+                "latitude": float(unit.geometry_wgs84.y),
+                "time": "1970-01-01",
+                "product_id": "dem",
+                "granule_id": "dem",
+                "time_representation": "static",
+                "source_fingerprint": str(dataset.source_fingerprint.values[0]),
+            }
+            record.update({feature: value.item() for feature, value in zip(config.features, values)})
+            records.append(record)
+        return PointSampleArtifact(pd.DataFrame.from_records(records), context.pipeline.aoi_plan)

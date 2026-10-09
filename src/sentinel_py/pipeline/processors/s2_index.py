@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from sentinel_py.cache import deterministic_cache_key
 from sentinel_py.pipeline.processors.base import (
-    Processor,
+    BaseProcessor,
     ProcessorConfig,
     ProcessorContext,
 )
@@ -128,11 +128,48 @@ class S2IndexNodeConfig(BaseModel):
         return names
 
 
-class S2IndexProcessor(Processor):
+def _append_indices(source: Any, config: S2IndexNodeConfig) -> Any:
+    """Append configured indices to one lazy xarray dataset."""
+    import xarray as xr
+    if not isinstance(source, xr.Dataset) or "reflectance" not in source:
+        raise TypeError("s2.index input must be an xarray Dataset with reflectance")
+    reflectance = source["reflectance"]
+    available = {str(value) for value in reflectance.band.values}
+    required = tuple(dict.fromkeys(
+        band for index_name in config.indices for band in SpectralIndex.registry[index_name].bands
+    ))
+    missing = tuple(band for band in required if band not in available)
+    if missing:
+        raise ValueError("s2.index input is missing bands: " + ", ".join(missing))
+    values = reflectance.sel(band=list(required)).astype(np.float32)
+    nodata = reflectance.attrs.get("nodata")
+    if nodata is not None:
+        values = values.where(values != nodata)
+    arrays = []
+    for index_name in config.indices:
+        index_class = SpectralIndex.registry[index_name]
+        selected = values.sel(band=list(index_class.bands))
+        result = index_class.formula(selected).where(index_class.denominator(selected) != 0).astype(np.float32)
+        result.attrs.update(long_name=f"Sentinel-2 {index_name} spectral index", index_name=index_name, nodata=nodata)
+        arrays.append(result.expand_dims(band=[index_name]))
+    combined = xr.concat([reflectance.astype(np.float32), *arrays], dim="band")
+    combined.attrs.update(reflectance.attrs)
+    combined.attrs["nodata"] = nodata
+    result = source.drop_vars("reflectance").assign_coords(band=combined.band)
+    result["reflectance"] = combined
+    recipe_id = deterministic_cache_key({"processor": "s2.index", "version": 1, "indices": config.indices, "source_recipe": source.attrs.get("recipe_id")})[:12]
+    if "source_fingerprint" in source.coords:
+        result = result.assign_coords(source_fingerprint=("time", [deterministic_cache_key({"source": str(value), "indices": config.indices, "recipe_id": recipe_id}) for value in source.source_fingerprint.values]))
+    result.attrs.update(source.attrs, processor="s2.index", indices=config.indices, recipe_id=recipe_id)
+    return result
+
+
+class S2IndexProcessor(BaseProcessor):
     """Append requested spectral index bands to one lazy Sentinel-2 cube."""
 
     type_name = "s2.index"
     config_model = S2IndexNodeConfig
+    input_kind = None
     version = 1
 
     def validate(
@@ -151,10 +188,10 @@ class S2IndexProcessor(Processor):
             raise TypeError(f"{node_id} has an invalid s2.index configuration")
         if len(inputs) != 1:
             raise ValueError("s2.index requires exactly one upstream input")
-        if any(output.format not in {"cog", "xarray"} for output in outputs):
+        if any(output.format not in {"cog", "xarray", "parquet"} for output in outputs):
             raise ValueError("s2.index requires named COG or xarray outputs")
 
-    def execute(
+    def execute_raster(
         self,
         config: ProcessorConfig,
         inputs: Mapping[str, Any],
@@ -172,6 +209,11 @@ class S2IndexProcessor(Processor):
             raise RuntimeError("Index processing requires xarray") from error
 
         source = next(iter(inputs.values()))
+        from sentinel_py.pipeline.artifacts import RasterArtifact
+        if isinstance(source, RasterArtifact):
+            result = source.map_datasets(lambda dataset, unit: _append_indices(dataset, config))
+            context.logger.info("Built index node=%s indices=%s AOI units=%d", context.node.node_id, ",".join(config.indices), len(result.datasets))
+            return result
         if not isinstance(source, xr.Dataset) or "reflectance" not in source:
             raise TypeError("s2.index input must be an xarray Dataset with reflectance")
         reflectance = source["reflectance"]
@@ -252,3 +294,34 @@ class S2IndexProcessor(Processor):
             result.sizes.get("time", 0),
         )
         return result
+
+    def execute_points(
+        self,
+        config: ProcessorConfig,
+        inputs: Mapping[str, Any],
+        context: ProcessorContext,
+    ) -> Any:
+        """Append spectral-index columns to normalized point observations."""
+        from sentinel_py.pipeline.artifacts import PointSampleArtifact
+
+        if not isinstance(config, S2IndexNodeConfig) or len(inputs) != 1:
+            raise TypeError("Invalid s2.index configuration or inputs")
+        source = next(iter(inputs.values()))
+        if not isinstance(source, PointSampleArtifact):
+            raise TypeError("s2.index point input must be a PointSampleArtifact")
+        rows = source.rows.copy()
+        for index_name in config.indices:
+            index = SpectralIndex.registry[index_name]
+            missing = [band for band in index.bands if band not in rows]
+            if missing:
+                raise ValueError("s2.index input is missing bands: " + ", ".join(missing))
+            values = {band: rows[band].astype(np.float32) for band in index.bands}
+
+            class _Values:
+                def sel(self, *, band: str) -> Any:
+                    return values[band]
+
+            selected = _Values()
+            denominator = index.denominator(selected)
+            rows[index_name] = index.formula(selected).where(denominator != 0).astype(np.float32)
+        return PointSampleArtifact(rows, source.plan)

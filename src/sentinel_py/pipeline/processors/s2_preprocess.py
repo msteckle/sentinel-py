@@ -9,7 +9,7 @@ from pyproj import CRS
 from sentinel_py.cache import deterministic_cache_key
 from sentinel_py.enums import S2Bands
 from sentinel_py.pipeline.processors.base import (
-    Processor,
+    BaseProcessor,
     ProcessorConfig,
     ProcessorContext,
 )
@@ -62,7 +62,7 @@ class S2PreprocessNodeConfig(BaseModel):
 # Processor implementation for s2.preprocess -------------------------------------------
 
 
-class S2PreprocessProcessor(Processor):
+class S2PreprocessProcessor(BaseProcessor):
     """Build a lazy canonical-grid dataset without reading raster pixels."""
 
     type_name = "s2.preprocess"
@@ -93,9 +93,9 @@ class S2PreprocessProcessor(Processor):
         if getattr(source, "source_type", None) != "s2.l2a.local":
             raise ValueError(f"{node_id}.source must reference an s2.l2a.local source")
         # Ensure the output grid is configured and of the correct type
-        if output_grid.grid is None:
+        if output_grid.chunks is None:
             raise ValueError("s2.preprocess requires a canonical output grid")
-        target_crs = CRS.from_user_input(output_grid.grid.crs)
+        target_crs = CRS.from_user_input(output_grid.crs)
         if not target_crs.is_projected or any(
             not abs(axis.unit_conversion_factor - 1.0) < 1e-12
             for axis in target_crs.axis_info
@@ -107,19 +107,19 @@ class S2PreprocessProcessor(Processor):
         if config.nodata != 65535:
             raise ValueError("canonical s2.preprocess currently requires nodata 65535")
         # Ensure the output pixels are square
-        if output_grid.grid.resolution[0] != output_grid.grid.resolution[1]:
+        if output_grid.resolution[0] != output_grid.resolution[1]:
             raise ValueError(
                 "canonical s2.preprocess currently requires square output pixels"
             )
         # Ensure the outputs are one of the existing formats we have
         if outputs and any(
-            output.format not in {"cog", "xarray"} for output in outputs
+            output.format not in {"cog", "xarray", "parquet"} for output in outputs
         ):
             raise ValueError(
                 "canonical s2.preprocess requires named COG or xarray outputs"
             )
 
-    def execute(
+    def execute_raster(
         self,
         config: ProcessorConfig,
         inputs: Mapping[str, Any],
@@ -131,65 +131,121 @@ class S2PreprocessProcessor(Processor):
         if inputs:
             raise ValueError("s2.preprocess does not accept upstream artifacts yet")
 
-        # Import functions for discovering granules and building lazy datasets
-        from sentinel_py.s2.discover import discover_s2_granules
-        from sentinel_py.s2.lazy import build_lazy_s2_dataset
+        from sentinel_py.pipeline.aoi import point_grid
+        from sentinel_py.pipeline.readers.s2 import read_s2_unit
 
         # Access the pipeline and output grid
         pipeline = context.pipeline
-        grid = pipeline.output_grid.grid
-        if grid is None:
-            raise ValueError("Lazy S2 preprocessing requires a canonical output grid")
-        # Access the source and determine the asset resolution
+        if pipeline.output_grid.chunks is None:
+            raise ValueError("Lazy S2 preprocessing requires output-grid chunks")
         source = pipeline.sources[config.source]
-        asset_resolution = round(min(grid.resolution))
-        # Discover the granules matching the selection criteria
-        granules = discover_s2_granules(
-            source.data_dir,
-            config.bands,
-            asset_resolution,
-            aoi=pipeline.selection.aoi,
+        datasets = {}
+        for unit in pipeline.aoi_plan.units:
+            grid = unit.grid or point_grid(
+                unit, crs=pipeline.output_grid.crs,
+                resolution=pipeline.output_grid.resolution,
+                anchor=pipeline.output_grid.anchor,
+                chunks=pipeline.output_grid.chunks,
+            )
+            dataset = read_s2_unit(
+                unit, data_dir=source.data_dir, bands=config.bands,
+                resolution_m=round(min(grid.resolution)), years=pipeline.selection.years,
+                speriod=pipeline.selection.start_period, eperiod=pipeline.selection.end_period,
+                mask_classes=config.mask_classes, nodata=config.nodata, grid=grid,
+            )
+            dataset.attrs.update(
+                pipeline=str(pipeline.path), processor=self.type_name,
+                node=context.node.node_id, time_representation="acquisition",
+                recipe_id=deterministic_cache_key({
+                    "processor": self.type_name, "bands": config.bands,
+                    "mask_classes": config.mask_classes, "nodata": config.nodata,
+                    "crs": grid.crs, "transform": tuple(grid.affine[:6]),
+                })[:12],
+            )
+            datasets[(unit.aoi_id, unit.component_id)] = dataset
+        context.logger.info("Building lazy node=%s AOI units=%d", context.node.node_id, len(datasets))
+        from sentinel_py.pipeline.artifacts import RasterArtifact
+        return RasterArtifact(pipeline.aoi_plan, datasets)
+
+    def execute_points(
+        self,
+        config: ProcessorConfig,
+        inputs: Mapping[str, Any],
+        context: ProcessorContext,
+    ) -> Any:
+        """Sample compact point windows and return normalized observation rows.
+
+        This deliberately materializes only one output pixel per source observation;
+        downstream point processors work on the resulting table rather than a raster
+        Dask graph.
+        """
+        if not isinstance(config, S2PreprocessNodeConfig) or inputs:
+            raise TypeError("Invalid s2.preprocess configuration or inputs")
+        from sentinel_py.pipeline.artifacts import PointSampleArtifact
+        from sentinel_py.pipeline.readers.s2 import sample_s2_points
+        from sentinel_py.pipeline.readers.base import (
+            load_point_sample_cache,
+            point_sample_cache_key,
+            point_sample_requests,
+            save_point_sample_cache,
+        )
+
+        pipeline = context.pipeline
+        source = pipeline.sources[config.source]
+        requests = point_sample_requests(
+            pipeline.aoi_plan.units,
+            crs=pipeline.output_grid.crs,
+            resolution=pipeline.output_grid.resolution,
+            anchor=pipeline.output_grid.anchor,
+        )
+        source_state = source.data_dir / ".sentinel-py" / "cdse_downloads.parquet"
+        fingerprint = (
+            (str(source_state), source_state.stat().st_size, source_state.stat().st_mtime_ns)
+            if source_state.exists() else (str(source.data_dir), source.data_dir.stat().st_mtime_ns)
+        )
+        cache_key = point_sample_cache_key(
+            reader_name="s2.l2a.local",
+            source_fingerprint=fingerprint,
+            requests=requests,
+            settings={
+                "bands": config.bands, "mask_classes": config.mask_classes,
+                "nodata": config.nodata, "years": pipeline.selection.years,
+                "start": pipeline.selection.start_period, "end": pipeline.selection.end_period,
+                "crs": pipeline.output_grid.crs, "resolution": pipeline.output_grid.resolution,
+                "anchor": pipeline.output_grid.anchor,
+            },
+        )
+        rows = load_point_sample_cache("s2.l2a.local", cache_key)
+        if rows is not None:
+            context.logger.info("Using cached S2 point samples (%d rows)", len(rows))
+            return PointSampleArtifact(rows, pipeline.aoi_plan)
+
+        reported = -1
+
+        def report(completed: int, total: int) -> None:
+            """Make pre-writer source work visible on the normal console."""
+            nonlocal reported
+            if completed in {0, total} or completed - reported >= 25:
+                reported = completed
+                context.logger.warning(
+                    "Sampling Sentinel-2 point scene/windows: %d/%d", completed, total
+                )
+
+        rows = sample_s2_points(
+            pipeline.aoi_plan.units,
+            data_dir=source.data_dir,
+            bands=config.bands,
+            resolution_m=round(min(pipeline.output_grid.resolution)),
             years=pipeline.selection.years,
             speriod=pipeline.selection.start_period,
             eperiod=pipeline.selection.end_period,
-        )
-        # Ensure that at least one granule was found
-        if not granules:
-            raise RuntimeError(
-                f"Found 0 Sentinel-2 granules in {source.data_dir} for this selection"
-            )
-        # Log the details of the lazy dataset being built
-        context.logger.info(
-            "Building lazy node=%s scenes=%d spatial_chunks=%d",
-            context.node.node_id,
-            len(granules),
-            grid.chunk_grid_shape[0] * grid.chunk_grid_shape[1],
-        )
-        # Build the lazy dataset for the discovered granules
-        dataset = build_lazy_s2_dataset(
-            granules,
-            grid,
-            bands=config.bands,
             mask_classes=config.mask_classes,
             nodata=config.nodata,
+            crs=pipeline.output_grid.crs,
+            resolution=pipeline.output_grid.resolution,
+            anchor=pipeline.output_grid.anchor,
+            workers=pipeline.execution.workers,
+            progress=report,
         )
-        # Update the dataset attributes with pipeline and processing information
-        dataset.attrs.update(
-            pipeline=str(pipeline.path),
-            processor=self.type_name,
-            node=context.node.node_id,
-            recipe_id=deterministic_cache_key(
-                {
-                    "processor": self.type_name,
-                    "bands": config.bands,
-                    "mask_classes": config.mask_classes,
-                    "nodata": config.nodata,
-                    "crs": grid.crs,
-                    "transform": tuple(grid.affine[:6]),
-                    "shape": grid.shape,
-                    "chunks": (grid.chunks.y, grid.chunks.x),
-                }
-            )[:12],
-        )
-        # Return the constructed lazy dataset
-        return dataset
+        save_point_sample_cache("s2.l2a.local", cache_key, rows)
+        return PointSampleArtifact(rows, pipeline.aoi_plan)

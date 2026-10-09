@@ -275,7 +275,10 @@ def _read_scene_chunk_locked(
             nodata=scene.nodata,
         )
         output[index] = np.where(
-            mask | (values == scene.nodata), scene.nodata, values
+            # Sentinel-2 special values use 0 for no-data and 65535 for
+            # saturation.  Sentinel-py represents both as its single output
+            # nodata value so downstream operations have one invariant.
+            mask | (values == 0) | (values == scene.nodata), scene.nodata, values
         ).astype(np.uint16)
     output[-1] = scl
     return output

@@ -61,18 +61,15 @@ def run(
     typer.echo(f"Execution:     {config.execution.method}")
     for source in config.sources.values():
         typer.echo(f"Source:        {source.source_id} ({source.data_dir})")
-    if config.output_grid.grid is None:
+    if config.output_grid.chunks is None:
         typer.echo(f"Output grid:   native, {config.output_grid.resolution} m")
     else:
-        grid = config.output_grid.grid
         typer.echo(
-            f"Output grid:   {grid.crs}, {grid.resolution[0]} × "
-            f"{grid.resolution[1]} units, {grid.width} × {grid.height} pixels"
+            f"Output grid:   {config.output_grid.crs}, {config.output_grid.resolution[0]} × "
+            f"{config.output_grid.resolution[1]} units per AOI component"
         )
-        typer.echo(
-            f"Chunks:        {grid.chunks.x} × {grid.chunks.y} pixels "
-            f"({grid.chunk_grid_shape[1]} × {grid.chunk_grid_shape[0]} chunks)"
-        )
+        if config.aoi_plan is not None:
+            typer.echo(f"AOI units:     {len(config.aoi_plan.units)} ({config.aoi_plan.kind})")
     for node in config.ordered_nodes:
         dependencies = ", ".join(node.inputs.values()) or "none"
         typer.echo(

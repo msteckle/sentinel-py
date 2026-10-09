@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -39,3 +40,4 @@ class S2Granule:
     product_metadata: Path
     band_paths: dict[str, Path]
     scl_path: Path | None
+    footprint: Any | None = None

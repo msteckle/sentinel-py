@@ -1,5 +1,8 @@
 """Central CLI entry point of subcommands"""
 
+from pathlib import Path
+from typing import Annotated
+
 import typer
 
 from .asf import app as asf_app
@@ -28,6 +31,26 @@ app.command(
     "run",
     help="Run a validated processing pipeline from a YAML file.",
 )(run)
+
+
+@app.command("create-aoi", hidden=True)
+def create_aoi(
+    xmin: Annotated[float, typer.Option()],
+    xmax: Annotated[float, typer.Option()],
+    ymin: Annotated[float, typer.Option()],
+    ymax: Annotated[float, typer.Option()],
+    out_file: Annotated[Path, typer.Option(dir_okay=False)],
+) -> None:
+    """Write an AOI bounding box using the historic command spelling."""
+    if xmin >= xmax:
+        typer.echo("xmin must be less than xmax", err=True)
+        raise typer.Exit(code=1)
+    if ymin >= ymax:
+        typer.echo("ymin must be less than ymax", err=True)
+        raise typer.Exit(code=1)
+    from sentinel_py.aoi import bbox_to_geojson
+
+    bbox_to_geojson((xmin, ymin, xmax, ymax), crs="EPSG:4326", output=out_file)
 
 
 if __name__ == "__main__":

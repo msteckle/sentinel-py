@@ -295,10 +295,9 @@ def discover_s2_granules(
             image_dir = granule_dir / "IMG_DATA"
             if not image_dir.is_dir():
                 continue
-            if aoi_geometry is not None:
-                footprint = read_granule_footprint(granule_dir / "MTD_TL.xml")
-                if not footprint.intersects(aoi_geometry):
-                    continue
+            footprint = read_granule_footprint(granule_dir / "MTD_TL.xml")
+            if aoi_geometry is not None and not footprint.intersects(aoi_geometry):
+                continue
             band_paths = {
                 band: selected
                 for band in bands
@@ -322,6 +321,7 @@ def discover_s2_granules(
                     product_metadata=product_metadata,
                     band_paths=band_paths,
                     scl_path=scl_path,
+                    footprint=footprint,
                 )
             )
 

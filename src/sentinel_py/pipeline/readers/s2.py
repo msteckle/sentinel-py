@@ -44,6 +44,7 @@ def _read_scene_point(
         "granule_id": granule.granule_id,
         "time_representation": "acquisition",
         "source_fingerprint": _source_fingerprint(scene),
+        "quantification_value": scene.quantification_value,
     }
     row.update({band: value.item() for band, value in zip(bands, values)})
     return row

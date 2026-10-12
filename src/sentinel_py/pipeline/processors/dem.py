@@ -11,7 +11,11 @@ import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from sentinel_py.cache import deterministic_cache_key
-from sentinel_py.pipeline.processors.base import BaseProcessor, ProcessorConfig, ProcessorContext
+from sentinel_py.pipeline.processors.base import (
+    BaseProcessor,
+    ProcessorConfig,
+    ProcessorContext,
+)
 
 
 class DEMFeature:
@@ -39,14 +43,20 @@ class DEMFeature:
         raise NotImplementedError
 
 
-def _gradients(elevation: np.ndarray, x: float, y: float, algorithm: str) -> tuple[np.ndarray, np.ndarray]:
+def _gradients(
+    elevation: np.ndarray, x: float, y: float, algorithm: str
+) -> tuple[np.ndarray, np.ndarray]:
     """Return GDAL Horn or Zevenbergen-Thorne gradients for a 3x3 window."""
     z = elevation
     if algorithm == "Horn":
-        dx = ((z[:-2, 2:] + 2 * z[1:-1, 2:] + z[2:, 2:]) -
-              (z[:-2, :-2] + 2 * z[1:-1, :-2] + z[2:, :-2])) / (8 * x)
-        dy = ((z[2:, :-2] + 2 * z[2:, 1:-1] + z[2:, 2:]) -
-              (z[:-2, :-2] + 2 * z[:-2, 1:-1] + z[:-2, 2:])) / (8 * y)
+        dx = (
+            (z[:-2, 2:] + 2 * z[1:-1, 2:] + z[2:, 2:])
+            - (z[:-2, :-2] + 2 * z[1:-1, :-2] + z[2:, :-2])
+        ) / (8 * x)
+        dy = (
+            (z[2:, :-2] + 2 * z[2:, 1:-1] + z[2:, 2:])
+            - (z[:-2, :-2] + 2 * z[:-2, 1:-1] + z[:-2, 2:])
+        ) / (8 * y)
     else:
         dx = (z[1:-1, 2:] - z[1:-1, :-2]) / (2 * x)
         dy = (z[2:, 1:-1] - z[:-2, 1:-1]) / (2 * y)
@@ -56,9 +66,19 @@ def _gradients(elevation: np.ndarray, x: float, y: float, algorithm: str) -> tup
 def _valid_derivative_inputs(elevation: np.ndarray) -> np.ndarray:
     """Return validity for complete 3x3 neighborhoods."""
     valid = np.isfinite(elevation)
-    return np.logical_and.reduce([valid[:-2, :-2], valid[:-2, 1:-1], valid[:-2, 2:],
-                                  valid[1:-1, :-2], valid[1:-1, 1:-1], valid[1:-1, 2:],
-                                  valid[2:, :-2], valid[2:, 1:-1], valid[2:, 2:]])
+    return np.logical_and.reduce(
+        [
+            valid[:-2, :-2],
+            valid[:-2, 1:-1],
+            valid[:-2, 2:],
+            valid[1:-1, :-2],
+            valid[1:-1, 1:-1],
+            valid[1:-1, 2:],
+            valid[2:, :-2],
+            valid[2:, 1:-1],
+            valid[2:, 2:],
+        ]
+    )
 
 
 class ElevationFeature(DEMFeature):
@@ -79,7 +99,12 @@ class SlopeFeature(DEMFeature):
 
     @classmethod
     def calculate(cls, elevation: np.ndarray, **kwargs: Any) -> np.ndarray:
-        dx, dy = _gradients(elevation, kwargs["x_resolution"], kwargs["y_resolution"], kwargs["algorithm"])
+        dx, dy = _gradients(
+            elevation,
+            kwargs["x_resolution"],
+            kwargs["y_resolution"],
+            kwargs["algorithm"],
+        )
         result = np.degrees(np.arctan(np.hypot(dx, dy))).astype(np.float32)
         return np.where(_valid_derivative_inputs(elevation), result, np.nan)
 
@@ -91,10 +116,17 @@ class AspectFeature(DEMFeature):
 
     @classmethod
     def calculate(cls, elevation: np.ndarray, **kwargs: Any) -> np.ndarray:
-        dx, dy = _gradients(elevation, kwargs["x_resolution"], kwargs["y_resolution"], kwargs["algorithm"])
+        dx, dy = _gradients(
+            elevation,
+            kwargs["x_resolution"],
+            kwargs["y_resolution"],
+            kwargs["algorithm"],
+        )
         result = np.degrees(np.arctan2(dx, -dy)) % 360.0
         flat = np.isclose(dx, 0.0) & np.isclose(dy, 0.0)
-        return np.where(_valid_derivative_inputs(elevation) & ~flat, result, np.nan).astype(np.float32)
+        return np.where(
+            _valid_derivative_inputs(elevation) & ~flat, result, np.nan
+        ).astype(np.float32)
 
 
 class HillshadeFeature(DEMFeature):
@@ -104,13 +136,20 @@ class HillshadeFeature(DEMFeature):
 
     @classmethod
     def calculate(cls, elevation: np.ndarray, **kwargs: Any) -> np.ndarray:
-        dx, dy = _gradients(elevation, kwargs["x_resolution"], kwargs["y_resolution"], kwargs["algorithm"])
+        dx, dy = _gradients(
+            elevation,
+            kwargs["x_resolution"],
+            kwargs["y_resolution"],
+            kwargs["algorithm"],
+        )
         slope = np.arctan(np.hypot(dx, dy))
         aspect = np.arctan2(dx, -dy)
         altitude = math.radians(kwargs["hillshade_altitude"])
         azimuth = math.radians(kwargs["hillshade_azimuth"])
-        result = 255 * (np.sin(altitude) * np.cos(slope) +
-                        np.cos(altitude) * np.sin(slope) * np.cos(azimuth - aspect))
+        result = 255 * (
+            np.sin(altitude) * np.cos(slope)
+            + np.cos(altitude) * np.sin(slope) * np.cos(azimuth - aspect)
+        )
         result = np.clip(result, 0, 255).astype(np.float32)
         return np.where(_valid_derivative_inputs(elevation), result, np.nan)
 
@@ -149,13 +188,15 @@ class DEMNodeConfig(BaseModel):
         return value
 
 
-def _native_feature_chunk(paths: tuple[Path, ...], grid: Any, window: Any, config: DEMNodeConfig) -> np.ndarray:
+def _native_feature_chunk(
+    paths: tuple[Path, ...], grid: Any, window: Any, config: DEMNodeConfig
+) -> np.ndarray:
     """Read a native DEM halo, calculate one output chunk, and align it."""
     try:
         import rasterio
-        from rasterio.merge import merge
-        from rasterio.warp import transform_bounds, reproject
         from rasterio.enums import Resampling
+        from rasterio.merge import merge
+        from rasterio.warp import reproject, transform_bounds
     except ImportError as error:
         raise RuntimeError("DEM processing requires rasterio") from error
     with rasterio.open(paths[0]) as first:
@@ -210,7 +251,9 @@ def _native_feature_chunk(paths: tuple[Path, ...], grid: Any, window: Any, confi
             left, top = source_transform * (column_start, row_start)
             right, bottom = source_transform * (column_end, row_end)
             bounds = (left, bottom, right, top)
-            source, transform = merge(datasets, bounds=bounds, nodata=datasets[0].nodata, masked=True)
+            source, transform = merge(
+                datasets, bounds=bounds, nodata=datasets[0].nodata, masked=True
+            )
             elevation = source[0].filled(np.nan).astype(np.float32)
         finally:
             for dataset in datasets:
@@ -220,7 +263,8 @@ def _native_feature_chunk(paths: tuple[Path, ...], grid: Any, window: Any, confi
         feature = DEMFeature.registry[feature_name]
         native = feature.calculate(
             elevation,
-            x_resolution=source_res[0], y_resolution=source_res[1],
+            x_resolution=source_res[0],
+            y_resolution=source_res[1],
             algorithm=config.algorithm,
             hillshade_azimuth=config.hillshade_azimuth,
             hillshade_altitude=config.hillshade_altitude,
@@ -228,13 +272,25 @@ def _native_feature_chunk(paths: tuple[Path, ...], grid: Any, window: Any, confi
         destination = np.full((window.height, window.width), np.nan, dtype=np.float32)
         native_transform = transform * rasterio.Affine.translation(1, 1)
         destination_transform = rasterio.Affine(
-            grid.resolution[0], 0, window.bounds[0],
-            0, -grid.resolution[1], window.bounds[3],
+            grid.resolution[0],
+            0,
+            window.bounds[0],
+            0,
+            -grid.resolution[1],
+            window.bounds[3],
         )
-        reproject(native, destination, src_transform=native_transform, src_crs=source_crs,
-                  dst_transform=destination_transform, dst_crs=grid.crs,
-                  src_nodata=np.nan, dst_nodata=np.nan,
-                  resampling=getattr(Resampling, "bilinear"), num_threads=1)
+        reproject(
+            native,
+            destination,
+            src_transform=native_transform,
+            src_crs=source_crs,
+            dst_transform=destination_transform,
+            dst_crs=grid.crs,
+            src_nodata=np.nan,
+            dst_nodata=np.nan,
+            resampling=Resampling.bilinear,
+            num_threads=1,
+        )
         bands.append(destination)
     return np.stack(bands)
 
@@ -249,7 +305,16 @@ class DEMProcessor(BaseProcessor):
     # derivatives produced by earlier versions.
     version = 3
 
-    def validate(self, config: ProcessorConfig, *, node_id: str, inputs: Mapping[str, str], sources: Mapping[str, Any], outputs: tuple[Any, ...], output_grid: Any) -> None:
+    def validate(
+        self,
+        config: ProcessorConfig,
+        *,
+        node_id: str,
+        inputs: Mapping[str, str],
+        sources: Mapping[str, Any],
+        outputs: tuple[Any, ...],
+        output_grid: Any,
+    ) -> None:
         if not isinstance(config, DEMNodeConfig):
             raise TypeError(f"{node_id} has an invalid dem configuration")
         if inputs:
@@ -262,62 +327,109 @@ class DEMProcessor(BaseProcessor):
         if any(output.format not in {"cog", "xarray", "parquet"} for output in outputs):
             raise ValueError("dem requires named COG or xarray outputs")
 
-    def execute_raster(self, config: ProcessorConfig, inputs: Mapping[str, Any], context: ProcessorContext) -> Any:
+    def execute_raster(
+        self,
+        config: ProcessorConfig,
+        inputs: Mapping[str, Any],
+        context: ProcessorContext,
+    ) -> Any:
         if not isinstance(config, DEMNodeConfig) or inputs:
             raise TypeError("Invalid dem configuration or inputs")
         try:
-            import xarray as xr
             import dask.array as da
+            import xarray as xr
             from dask import delayed
         except ImportError as error:
             raise RuntimeError("DEM processing requires xarray and Dask") from error
         from sentinel_py.pipeline.aoi import point_grid
         from sentinel_py.pipeline.readers.arcticdem import select_dem_paths
         from sentinel_py.pipeline.readers.base import apply_polygon_mask
+
         source = context.pipeline.sources[config.source]
         paths = tuple(sorted(source.data_dir.glob(source.pattern)))
         if not paths:
-            raise RuntimeError(f"No DEM GeoTIFFs matched {source.data_dir / source.pattern}")
+            raise RuntimeError(
+                f"No DEM GeoTIFFs matched {source.data_dir / source.pattern}"
+            )
         pipeline = context.pipeline
         if pipeline.output_grid.chunks is None:
             raise ValueError("DEM requires output-grid chunks")
         datasets = {}
         for unit in pipeline.aoi_plan.units:
-            grid = unit.grid or point_grid(unit, crs=pipeline.output_grid.crs, resolution=pipeline.output_grid.resolution, anchor=pipeline.output_grid.anchor, chunks=pipeline.output_grid.chunks)
+            grid = unit.grid or point_grid(
+                unit,
+                crs=pipeline.output_grid.crs,
+                resolution=pipeline.output_grid.resolution,
+                anchor=pipeline.output_grid.anchor,
+                chunks=pipeline.output_grid.chunks,
+            )
             selected_paths = select_dem_paths(paths, unit, grid=grid)
             if not selected_paths:
                 raise RuntimeError(f"No DEM GeoTIFFs intersect AOI {unit.aoi_id}")
             arrays = []
             for window in grid.iter_windows():
-                task = delayed(_native_feature_chunk)(selected_paths, grid, window, config)
-                arrays.append(da.from_delayed(task, shape=(len(config.features), window.height, window.width), dtype=np.float32))
+                task = delayed(_native_feature_chunk)(
+                    selected_paths, grid, window, config
+                )
+                arrays.append(
+                    da.from_delayed(
+                        task,
+                        shape=(len(config.features), window.height, window.width),
+                        dtype=np.float32,
+                    )
+                )
             rows = []
             index = 0
             for row in range(grid.chunk_grid_shape[0]):
-                rows.append(da.concatenate(arrays[index:index + grid.chunk_grid_shape[1]], axis=2))
+                rows.append(
+                    da.concatenate(
+                        arrays[index : index + grid.chunk_grid_shape[1]], axis=2
+                    )
+                )
                 index += grid.chunk_grid_shape[1]
             data = da.concatenate(rows, axis=1)[None, ...]
             dataset = xr.Dataset(
-            {"reflectance": (("time", "band", "y", "x"), data)},
-            coords={"time": np.array(["1970-01-01"], dtype="datetime64[ns]"), "band": list(config.features),
-                    "y": np.arange(grid.height), "x": np.arange(grid.width),
-                    "product_id": ("time", ["dem"]), "granule_id": ("time", ["dem"]),
-                    "source_fingerprint": ("time", [deterministic_cache_key([str(path) for path in paths])])},
-            attrs={"crs": grid.crs, "transform": tuple(grid.affine[:6]), "nodata": -9999.0,
-                   "processor": self.type_name,
-                   "time_representation": "static",
-                   "recipe_id": deterministic_cache_key({"version": self.version, **config.model_dump()})[:12]},
+                {"reflectance": (("time", "band", "y", "x"), data)},
+                coords={
+                    "time": np.array(["1970-01-01"], dtype="datetime64[ns]"),
+                    "band": list(config.features),
+                    "y": np.arange(grid.height),
+                    "x": np.arange(grid.width),
+                    "product_id": ("time", ["dem"]),
+                    "granule_id": ("time", ["dem"]),
+                    "source_fingerprint": (
+                        "time",
+                        [deterministic_cache_key([str(path) for path in paths])],
+                    ),
+                },
+                attrs={
+                    "crs": grid.crs,
+                    "transform": tuple(grid.affine[:6]),
+                    "nodata": -9999.0,
+                    "processor": self.type_name,
+                    "time_representation": "static",
+                    "recipe_id": deterministic_cache_key(
+                        {"version": self.version, **config.model_dump()}
+                    )[:12],
+                },
             )
             dataset["reflectance"].attrs["nodata"] = -9999.0
-            datasets[(unit.aoi_id, unit.component_id)] = apply_polygon_mask(dataset, unit)
+            datasets[(unit.aoi_id, unit.component_id)] = apply_polygon_mask(
+                dataset, unit
+            )
         from sentinel_py.pipeline.artifacts import RasterArtifact
+
         return RasterArtifact(pipeline.aoi_plan, datasets)
 
     def execute_points(
-        self, config: ProcessorConfig, inputs: Mapping[str, Any], context: ProcessorContext
+        self,
+        config: ProcessorConfig,
+        inputs: Mapping[str, Any],
+        context: ProcessorContext,
     ) -> Any:
         """Materialize only terrain-feature point pixels as normalized rows."""
         import pandas as pd
+
         from sentinel_py.pipeline.artifacts import PointSampleArtifact
 
         raster = self.execute_raster(config, inputs, context)
@@ -337,6 +449,13 @@ class DEMProcessor(BaseProcessor):
                 "time_representation": "static",
                 "source_fingerprint": str(dataset.source_fingerprint.values[0]),
             }
-            record.update({feature: value.item() for feature, value in zip(config.features, values)})
+            record.update(
+                {
+                    feature: value.item()
+                    for feature, value in zip(config.features, values)
+                }
+            )
             records.append(record)
-        return PointSampleArtifact(pd.DataFrame.from_records(records), context.pipeline.aoi_plan)
+        return PointSampleArtifact(
+            pd.DataFrame.from_records(records), context.pipeline.aoi_plan
+        )

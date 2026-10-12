@@ -74,9 +74,9 @@ nodes:
 
 ## Spectral indices
 
-The built-in ``s2.index`` processor takes exactly one upstream processing cube and appends named Sentinel-2 spectral index bands to its ``reflectance`` variable. The initial supported indices are ``NDGI`` and ``NDWI1``. Calculations are lazy, operate independently for every time step, and preserve the upstream spatial chunks.
+The built-in ``s2.index`` processor takes exactly one upstream processing cube and appends named Sentinel-2 spectral index bands to its ``reflectance`` variable. Supported indices are ``NDGI``, ``NDWI1``, ``NDWI2``, ``MSAVI``, ``VARI``, ``RVI``, ``OSAVI``, ``TGI``, ``GLI``, ``NGRDI``, ``CIG``, ``GNDVI``, ``CVI``, ``MTVI2``, ``TCARI``, ``TCI``, ``NARI``, ``TCAPB``, ``TCAPG``, and ``TCAPW``. Calculations are lazy, operate independently for every time step, preserve the upstream spatial chunks, and use Sentinel-2 quantification metadata when a formula depends on absolute reflectance values.
 
-Each index is an auto-registered ``SpectralIndex`` subclass defining its uppercase ``name``, required ``bands``, ``formula`` method, and ``denominator`` method. Adding an index only requires adding a subclass; configuration validation and executor dispatch discover it from the shared registry.
+Each index is an auto-registered ``SpectralIndex`` subclass defining its uppercase ``name``, required ``bands``, and ``formula`` method. Formulas that divide must use the module's safe-division helper so zero denominators become missing values consistently for raster and point processing. Adding an index only requires adding a subclass; configuration validation and executor dispatch discover it from the shared registry.
 
 ```yaml
 nodes:

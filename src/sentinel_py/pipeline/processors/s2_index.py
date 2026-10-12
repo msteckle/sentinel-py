@@ -15,10 +15,63 @@ from sentinel_py.pipeline.processors.base import (
     ProcessorContext,
 )
 
+PROCESSOR_VERSION = 2
+
+
+########################################################################################
+# Index calculation helpers
+########################################################################################
+
 
 def _safe_divide(numerator: Any, denominator: Any) -> Any:
-    """Divide while converting zero denominators to NaN before arithmetic."""
+    """Divide array-like values while masking zero denominators.
+
+    Parameters
+    ----------
+    numerator
+        Array-like numerator supporting arithmetic.
+    denominator
+        Array-like denominator supporting ``where``.
+
+    Returns
+    -------
+    Any
+        The quotient, with zero-denominator positions represented as missing.
+    """
     return numerator / denominator.where(denominator != 0)
+
+
+def _raster_reflectance(source: Any, reflectance: Any) -> Any:
+    """Convert Sentinel-2 digital numbers to reflectance when scale is available.
+
+    Parameters
+    ----------
+    source
+        Source xarray dataset, potentially carrying a per-time-step
+        ``quantification_value`` coordinate.
+    reflectance
+        Reflectance data array selected from ``source``.
+
+    Returns
+    -------
+    Any
+        Floating-point reflectance values suitable for spectral formulas.
+    """
+    values = reflectance.astype(np.float32)
+    nodata = reflectance.attrs.get("nodata")
+    if nodata is not None:
+        values = values.where(values != nodata)
+    quantification = source.coords.get("quantification_value")
+    if quantification is not None:
+        return _safe_divide(values, quantification.astype(np.float32))
+    if "reflectance dn" in str(reflectance.attrs.get("long_name", "")).lower():
+        return values / np.float32(10_000)
+    return values
+
+
+########################################################################################
+# Formulas for Sentinel-2 spectral indices
+########################################################################################
 
 
 class SpectralIndex:
@@ -41,17 +94,20 @@ class SpectralIndex:
         if (
             not isinstance(bands, tuple)
             or not bands
-            or any(not isinstance(band, str) or not band for band in bands)
+            or any(not isinstance(band, str) or not band.strip() for band in bands)
         ):
             raise TypeError(
                 f"spectral index {normalized_name} must define non-empty bands"
             )
-        if "formula" not in cls.__dict__ or "denominator" not in cls.__dict__:
-            raise TypeError(
-                f"spectral index {normalized_name} must define formula and denominator"
+        normalized_bands = tuple(band.strip().upper() for band in bands)
+        if len(set(normalized_bands)) != len(normalized_bands):
+            raise ValueError(
+                f"spectral index {normalized_name} must not repeat input bands"
             )
+        if "formula" not in cls.__dict__:
+            raise TypeError(f"spectral index {normalized_name} must define formula")
         cls.name = normalized_name
-        cls.bands = tuple(band.upper() for band in bands)
+        cls.bands = normalized_bands
         SpectralIndex.registry[normalized_name] = cls
 
     @classmethod
@@ -59,49 +115,371 @@ class SpectralIndex:
         """Calculate the index values from its selected input bands."""
         raise NotImplementedError
 
-    @classmethod
-    def denominator(cls, values: Any) -> Any:
-        """Return the denominator used to identify invalid index pixels."""
-        raise NotImplementedError
-
 
 class NDGI(SpectralIndex):
-    """Normalized difference greenness index."""
+    """
+    Normalized Difference Greenness Index.
+    https://doi-org.ornl.idm.oclc.org/10.1016/j.rse.2019.03.028
+    """
 
     name = "NDGI"
     bands = ("B03", "B04", "B08")
 
     @classmethod
     def formula(cls, values: Any) -> Any:
-        """Calculate NDGI from Sentinel-2 bands B03, B04, and B08."""
-        green = 0.62 * values.sel(band="B03") + 0.38 * values.sel(band="B08")
-        return _safe_divide(green - values.sel(band="B04"), cls.denominator(values))
-
-    @classmethod
-    def denominator(cls, values: Any) -> Any:
-        """Return the NDGI normalization denominator."""
-        green = 0.62 * values.sel(band="B03") + 0.38 * values.sel(band="B08")
-        return green + values.sel(band="B04")
+        red = values.sel(band="B04")
+        green = values.sel(band="B03")
+        nir = values.sel(band="B08")
+        return _safe_divide(
+            0.62 * green + 0.38 * nir - red, 0.62 * green + 0.38 * nir + red
+        )
 
 
 class NDWI1(SpectralIndex):
-    """Normalized difference water index variant using B08, B11, and B12."""
+    """
+    Normalized Difference Water Index variant using SWIR1.
+    https://docs.geopera.com/spectral-indices/ndwi_gao
+    """
 
     name = "NDWI1"
-    bands = ("B08", "B11", "B12")
+    bands = ("B08", "B11")
 
     @classmethod
     def formula(cls, values: Any) -> Any:
-        """Calculate NDWI1 from Sentinel-2 bands B08, B11, and B12."""
-        return _safe_divide(
-            values.sel(band="B08") - values.sel(band="B11"),
-            cls.denominator(values),
-        )
+        nir = values.sel(band="B08")
+        swir1 = values.sel(band="B11")
+        return _safe_divide(nir - swir1, nir + swir1)
+
+
+class NDWI2(SpectralIndex):
+    """
+    Normalized Difference Water Index variant using SWIR2.
+    https://docs.geopera.com/spectral-indices/ndwi_gao
+    """
+
+    name = "NDWI2"
+    bands = ("B08", "B12")
 
     @classmethod
-    def denominator(cls, values: Any) -> Any:
-        """Return the NDWI1 normalization denominator."""
-        return values.sel(band="B08") - values.sel(band="B12")
+    def formula(cls, values: Any) -> Any:
+        nir = values.sel(band="B08")
+        swir2 = values.sel(band="B12")
+        return _safe_divide(nir - swir2, nir + swir2)
+
+
+class MSAVI(SpectralIndex):
+    """
+    Modified Soil Adjusted Vegetation Index.
+    https://docs.geopera.com/spectral-indices/msavi?sensor=sentinel-2
+    """
+
+    name = "MSAVI"
+    bands = ("B04", "B08")
+
+    @classmethod
+    def formula(cls, values: Any) -> Any:
+        nir = values.sel(band="B08")
+        red = values.sel(band="B04")
+        discriminant = (2 * nir + 1) ** 2 - 8 * (nir - red)
+        root = np.sqrt(discriminant.where(discriminant >= 0))
+        return 0.5 * (2 * nir + 1 - root)
+
+
+class VARI(SpectralIndex):
+    """
+    Visible Atmospherically Resistant Index.
+    https://docs.geopera.com/spectral-indices/vari_visible?sensor=sentinel-2
+    """
+
+    name = "VARI"
+    bands = ("B04", "B03", "B02")
+
+    @classmethod
+    def formula(cls, values: Any) -> Any:
+        red = values.sel(band="B04")
+        green = values.sel(band="B03")
+        blue = values.sel(band="B02")
+        return _safe_divide(green - red, green + red - blue)
+
+
+class RVI(SpectralIndex):
+    """
+    Ratio Vegetation Index.
+    https://docs.geopera.com/spectral-indices/rvi
+    """
+
+    name = "RVI"
+    bands = ("B08", "B04")
+
+    @classmethod
+    def formula(cls, values: Any) -> Any:
+        nir = values.sel(band="B08")
+        red = values.sel(band="B04")
+        return _safe_divide(nir, red)
+
+
+class OSAVI(SpectralIndex):
+    """
+    Optimized Soil Adjusted Vegetation Index.
+    """
+
+    name = "OSAVI"
+    bands = ("B08", "B04")
+
+    @classmethod
+    def formula(cls, values: Any) -> Any:
+        nir = values.sel(band="B08")
+        red = values.sel(band="B04")
+        return _safe_divide(1.16 * (nir - red), nir + red + 0.16)
+
+
+class TGI(SpectralIndex):
+    """
+    Triangular Greenness Index.
+    https://docs.geopera.com/spectral-indices/tgi
+    """
+
+    name = "TGI"
+    bands = ("B04", "B03", "B02")
+
+    @classmethod
+    def formula(cls, values: Any) -> Any:
+        red = values.sel(band="B04")
+        green = values.sel(band="B03")
+        blue = values.sel(band="B02")
+        return -0.5 * (190 * (red - green) - 120 * (red - blue))
+
+
+class GLI(SpectralIndex):
+    """
+    Green Leaf Index.
+    """
+
+    name = "GLI"
+    bands = ("B04", "B03", "B02")
+
+    @classmethod
+    def formula(cls, values: Any) -> Any:
+        red = values.sel(band="B04")
+        green = values.sel(band="B03")
+        blue = values.sel(band="B02")
+        return _safe_divide(2 * green - red - blue, 2 * green + red + blue)
+
+
+class NGRDI(SpectralIndex):
+    """
+    Normalized Green-Red Difference Index.
+    """
+
+    name = "NGRDI"
+    bands = ("B03", "B04")
+
+    @classmethod
+    def formula(cls, values: Any) -> Any:
+        red = values.sel(band="B04")
+        green = values.sel(band="B03")
+        return _safe_divide(green - red, green + red)
+
+
+class CIG(SpectralIndex):
+    """
+    Chlorophyll Index (Green).
+    """
+
+    name = "CIG"
+    bands = ("B08", "B03")
+
+    @classmethod
+    def formula(cls, values: Any) -> Any:
+        nir = values.sel(band="B08")
+        green = values.sel(band="B03")
+        return _safe_divide(nir, green) - 1
+
+
+class GNDVI(SpectralIndex):
+    """
+    Green Normalized Difference Vegetation Index.
+    """
+
+    name = "GNDVI"
+    bands = ("B08", "B03")
+
+    @classmethod
+    def formula(cls, values: Any) -> Any:
+        nir = values.sel(band="B08")
+        green = values.sel(band="B03")
+        return _safe_divide(nir - green, nir + green)
+
+
+class CVI(SpectralIndex):
+    """
+    Chlorophyll Vegetation Index.
+    """
+
+    name = "CVI"
+    bands = ("B08", "B04", "B03")
+
+    @classmethod
+    def formula(cls, values: Any) -> Any:
+        nir = values.sel(band="B08")
+        red = values.sel(band="B04")
+        green = values.sel(band="B03")
+        return _safe_divide(nir * red, green**2)
+
+
+class MTVI2(SpectralIndex):
+    """
+    Modified Triangular Vegetation Index 2.
+    """
+
+    name = "MTVI2"
+    bands = ("B08", "B04", "B03")
+
+    @classmethod
+    def formula(cls, values: Any) -> Any:
+        nir = values.sel(band="B08")
+        red = values.sel(band="B04")
+        green = values.sel(band="B03")
+        red_root = np.sqrt(red.where(red >= 0))
+        discriminant = (2 * nir + 1) ** 2 - (6 * nir - 5 * red_root) - 0.5
+        denominator = np.sqrt(discriminant.where(discriminant > 0))
+        return _safe_divide(
+            1.5 * (1.2 * (nir - green) - 2.5 * (red - green)),
+            denominator,
+        )
+
+
+class TCARI(SpectralIndex):
+    """
+    Transformed Chlorophyll Absorption in Reflectance Index.
+    """
+
+    name = "TCARI"
+    bands = ("B05", "B04", "B03")
+
+    @classmethod
+    def formula(cls, values: Any) -> Any:
+        re1 = values.sel(band="B05")
+        red = values.sel(band="B04")
+        green = values.sel(band="B03")
+        correction = _safe_divide((re1 - green) * re1, red)
+        return 3 * ((re1 - red) - 0.2 * correction)
+
+
+class TCI(SpectralIndex):
+    """
+    Triangular Chlorophyll Index.
+    """
+
+    name = "TCI"
+    bands = ("B05", "B04", "B03")
+
+    @classmethod
+    def formula(cls, values: Any) -> Any:
+        re1 = values.sel(band="B05")
+        red = values.sel(band="B04")
+        green = values.sel(band="B03")
+        ratio = _safe_divide(re1, red)
+        ratio_root = np.sqrt(ratio.where(ratio >= 0))
+        return 1.2 * (re1 - green) - 1.5 * (red - green) * ratio_root
+
+
+class NARI(SpectralIndex):
+    """
+    Normalized Anthocyanin Reflectance Index.
+    """
+
+    name = "NARI"
+    bands = ("B05", "B03")
+
+    @classmethod
+    def formula(cls, values: Any) -> Any:
+        re1 = values.sel(band="B05")
+        green = values.sel(band="B03")
+        return _safe_divide(re1 - green, re1 + green)
+
+
+class TCAPB(SpectralIndex):
+    """
+    Tasseled Cap Brightness Index.
+    """
+
+    name = "TCAPB"
+    bands = ("B02", "B03", "B04", "B08", "B11", "B12")
+
+    @classmethod
+    def formula(cls, values: Any) -> Any:
+        blue = values.sel(band="B02")
+        green = values.sel(band="B03")
+        red = values.sel(band="B04")
+        nir = values.sel(band="B08")
+        swir1 = values.sel(band="B11")
+        swir2 = values.sel(band="B12")
+        return (
+            0.3037 * blue
+            + 0.2793 * green
+            + 0.4743 * red
+            + 0.5585 * nir
+            + 0.5082 * swir1
+            + 0.1863 * swir2
+        )
+
+
+class TCAPG(SpectralIndex):
+    """
+    Tasseled Cap Greenness Index.
+    """
+
+    name = "TCAPG"
+    bands = ("B02", "B03", "B04", "B08", "B11", "B12")
+
+    @classmethod
+    def formula(cls, values: Any) -> Any:
+        blue = values.sel(band="B02")
+        green = values.sel(band="B03")
+        red = values.sel(band="B04")
+        nir = values.sel(band="B08")
+        swir1 = values.sel(band="B11")
+        swir2 = values.sel(band="B12")
+        return (
+            -0.2848 * blue
+            - 0.2435 * green
+            - 0.5436 * red
+            + 0.7243 * nir
+            + 0.0840 * swir1
+            - 0.1800 * swir2
+        )
+
+
+class TCAPW(SpectralIndex):
+    """
+    Tasseled Cap Wetness Index.
+    """
+
+    name = "TCAPW"
+    bands = ("B02", "B03", "B04", "B08", "B11", "B12")
+
+    @classmethod
+    def formula(cls, values: Any) -> Any:
+        blue = values.sel(band="B02")
+        green = values.sel(band="B03")
+        red = values.sel(band="B04")
+        nir = values.sel(band="B08")
+        swir1 = values.sel(band="B11")
+        swir2 = values.sel(band="B12")
+        return (
+            0.1509 * blue
+            + 0.1973 * green
+            + 0.3279 * red
+            + 0.3406 * nir
+            - 0.7112 * swir1
+            - 0.4572 * swir2
+        )
+
+
+########################################################################################
+# Processor class for calculating Sentinel-2 spectral indices
+########################################################################################
 
 
 class S2IndexNodeConfig(BaseModel):
@@ -117,7 +495,7 @@ class S2IndexNodeConfig(BaseModel):
         """Normalize index names and reject unsupported or repeated names."""
         if not isinstance(value, (list, tuple)):
             raise TypeError("indices must be a list")
-        names = tuple(item.upper() for item in value if isinstance(item, str))
+        names = tuple(item.strip().upper() for item in value if isinstance(item, str))
         if len(names) != len(value) or any(not name for name in names):
             raise ValueError("indices must contain non-empty strings")
         if len(set(names)) != len(names):
@@ -131,36 +509,69 @@ class S2IndexNodeConfig(BaseModel):
 def _append_indices(source: Any, config: S2IndexNodeConfig) -> Any:
     """Append configured indices to one lazy xarray dataset."""
     import xarray as xr
+
     if not isinstance(source, xr.Dataset) or "reflectance" not in source:
         raise TypeError("s2.index input must be an xarray Dataset with reflectance")
     reflectance = source["reflectance"]
+    if "band" not in reflectance.dims:
+        raise ValueError("s2.index input reflectance must have a band dimension")
     available = {str(value) for value in reflectance.band.values}
-    required = tuple(dict.fromkeys(
-        band for index_name in config.indices for band in SpectralIndex.registry[index_name].bands
-    ))
+    required = tuple(
+        dict.fromkeys(
+            band
+            for index_name in config.indices
+            for band in SpectralIndex.registry[index_name].bands
+        )
+    )
     missing = tuple(band for band in required if band not in available)
     if missing:
         raise ValueError("s2.index input is missing bands: " + ", ".join(missing))
-    values = reflectance.sel(band=list(required)).astype(np.float32)
+    values = _raster_reflectance(source, reflectance.sel(band=list(required)))
     nodata = reflectance.attrs.get("nodata")
-    if nodata is not None:
-        values = values.where(values != nodata)
     arrays = []
     for index_name in config.indices:
         index_class = SpectralIndex.registry[index_name]
         selected = values.sel(band=list(index_class.bands))
-        result = index_class.formula(selected).where(index_class.denominator(selected) != 0).astype(np.float32)
-        result.attrs.update(long_name=f"Sentinel-2 {index_name} spectral index", index_name=index_name, nodata=nodata)
+        result = index_class.formula(selected).astype(np.float32)
+        result.name = "reflectance"
+        result.attrs.update(
+            long_name=f"Sentinel-2 {index_name} spectral index",
+            index_name=index_name,
+            nodata=nodata,
+        )
         arrays.append(result.expand_dims(band=[index_name]))
     combined = xr.concat([reflectance.astype(np.float32), *arrays], dim="band")
     combined.attrs.update(reflectance.attrs)
     combined.attrs["nodata"] = nodata
     result = source.drop_vars("reflectance").assign_coords(band=combined.band)
     result["reflectance"] = combined
-    recipe_id = deterministic_cache_key({"processor": "s2.index", "version": 1, "indices": config.indices, "source_recipe": source.attrs.get("recipe_id")})[:12]
+    recipe_id = deterministic_cache_key(
+        {
+            "processor": "s2.index",
+            "version": PROCESSOR_VERSION,
+            "indices": config.indices,
+            "source_recipe": source.attrs.get("recipe_id"),
+        }
+    )[:12]
     if "source_fingerprint" in source.coords:
-        result = result.assign_coords(source_fingerprint=("time", [deterministic_cache_key({"source": str(value), "indices": config.indices, "recipe_id": recipe_id}) for value in source.source_fingerprint.values]))
-    result.attrs.update(source.attrs, processor="s2.index", indices=config.indices, recipe_id=recipe_id)
+        result = result.assign_coords(
+            source_fingerprint=(
+                "time",
+                [
+                    deterministic_cache_key(
+                        {
+                            "source": str(value),
+                            "indices": config.indices,
+                            "recipe_id": recipe_id,
+                        }
+                    )
+                    for value in source.source_fingerprint.values
+                ],
+            )
+        )
+    result.attrs.update(
+        source.attrs, processor="s2.index", indices=config.indices, recipe_id=recipe_id
+    )
     return result
 
 
@@ -170,7 +581,7 @@ class S2IndexProcessor(BaseProcessor):
     type_name = "s2.index"
     config_model = S2IndexNodeConfig
     input_kind = None
-    version = 1
+    version = PROCESSOR_VERSION
 
     def validate(
         self,
@@ -189,7 +600,7 @@ class S2IndexProcessor(BaseProcessor):
         if len(inputs) != 1:
             raise ValueError("s2.index requires exactly one upstream input")
         if any(output.format not in {"cog", "xarray", "parquet"} for output in outputs):
-            raise ValueError("s2.index requires named COG or xarray outputs")
+            raise ValueError("s2.index requires COG, xarray, or Parquet outputs")
 
     def execute_raster(
         self,
@@ -210,83 +621,19 @@ class S2IndexProcessor(BaseProcessor):
 
         source = next(iter(inputs.values()))
         from sentinel_py.pipeline.artifacts import RasterArtifact
+
         if isinstance(source, RasterArtifact):
-            result = source.map_datasets(lambda dataset, unit: _append_indices(dataset, config))
-            context.logger.info("Built index node=%s indices=%s AOI units=%d", context.node.node_id, ",".join(config.indices), len(result.datasets))
+            result = source.map_datasets(
+                lambda dataset, unit: _append_indices(dataset, config)
+            )
+            context.logger.info(
+                "Built index node=%s indices=%s AOI units=%d",
+                context.node.node_id,
+                ",".join(config.indices),
+                len(result.datasets),
+            )
             return result
-        if not isinstance(source, xr.Dataset) or "reflectance" not in source:
-            raise TypeError("s2.index input must be an xarray Dataset with reflectance")
-        reflectance = source["reflectance"]
-        if "band" not in reflectance.dims:
-            raise ValueError("s2.index input reflectance must have a band dimension")
-
-        available = {str(value) for value in reflectance.band.values}
-        required = tuple(
-            dict.fromkeys(
-                band
-                for index_name in config.indices
-                for band in SpectralIndex.registry[index_name].bands
-            )
-        )
-        missing = tuple(band for band in required if band not in available)
-        if missing:
-            raise ValueError("s2.index input is missing bands: " + ", ".join(missing))
-
-        values = reflectance.sel(band=list(required)).astype(np.float32)
-        nodata = reflectance.attrs.get("nodata")
-        if nodata is not None:
-            values = values.where(values != nodata)
-
-        index_arrays = []
-        for index_name in config.indices:
-            index_class = SpectralIndex.registry[index_name]
-            selected = values.sel(band=list(index_class.bands))
-            result = index_class.formula(selected)
-            denominator = index_class.denominator(selected)
-            result = result.where(denominator != 0).astype(np.float32)
-            result.name = "reflectance"
-            result.attrs.update(
-                long_name=f"Sentinel-2 {index_name} spectral index",
-                index_name=index_name,
-                nodata=nodata,
-            )
-            index_arrays.append(result.expand_dims(band=[index_name]))
-
-        combined = xr.concat(
-            [reflectance.astype(np.float32), *index_arrays], dim="band"
-        )
-        combined.attrs.update(reflectance.attrs)
-        combined.attrs["nodata"] = nodata
-
-        result = source.drop_vars("reflectance").assign_coords(band=combined.band)
-        result["reflectance"] = combined
-        source_recipe = source.attrs.get("recipe_id")
-        recipe_id = deterministic_cache_key(
-            {
-                "processor": self.type_name,
-                "version": self.version,
-                "indices": config.indices,
-                "source_recipe": source_recipe,
-            }
-        )[:12]
-        if "source_fingerprint" in source.coords:
-            fingerprints = [
-                deterministic_cache_key(
-                    {
-                        "source": str(value),
-                        "indices": config.indices,
-                        "recipe_id": recipe_id,
-                    }
-                )
-                for value in source.source_fingerprint.values
-            ]
-            result = result.assign_coords(source_fingerprint=("time", fingerprints))
-        result.attrs.update(
-            source.attrs,
-            processor=self.type_name,
-            indices=config.indices,
-            recipe_id=recipe_id,
-        )
+        result = _append_indices(source, config)
         context.logger.info(
             "Built index node=%s indices=%s timesteps=%d",
             context.node.node_id,
@@ -314,14 +661,26 @@ class S2IndexProcessor(BaseProcessor):
             index = SpectralIndex.registry[index_name]
             missing = [band for band in index.bands if band not in rows]
             if missing:
-                raise ValueError("s2.index input is missing bands: " + ", ".join(missing))
-            values = {band: rows[band].astype(np.float32) for band in index.bands}
+                raise ValueError(
+                    "s2.index input is missing bands: " + ", ".join(missing)
+                )
+            values = {
+                band: rows[band].astype(np.float32).where(rows[band] != 65535)
+                for band in index.bands
+            }
+            if "quantification_value" in rows:
+                scale = rows["quantification_value"].astype(np.float32)
+                values = {
+                    band: _safe_divide(values[band], scale) for band in index.bands
+                }
 
             class _Values:
+                """Minimal band selector shared by point index formulas."""
+
                 def sel(self, *, band: str) -> Any:
+                    """Return one point-observation band by name."""
                     return values[band]
 
             selected = _Values()
-            denominator = index.denominator(selected)
-            rows[index_name] = index.formula(selected).where(denominator != 0).astype(np.float32)
+            rows[index_name] = index.formula(selected).astype(np.float32)
         return PointSampleArtifact(rows, source.plan)

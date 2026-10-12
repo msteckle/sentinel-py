@@ -12,6 +12,7 @@ from shapely.geometry import box
 
 from sentinel_py.pipeline import PipelineConfig
 from sentinel_py.pipeline.run import run_pipeline
+from sentinel_py.s2.lazy import _correct_dn_values
 
 
 def _write_raster(path: Path, values: np.ndarray, resolution: int) -> None:
@@ -28,6 +29,18 @@ def _write_raster(path: Path, values: np.ndarray, resolution: int) -> None:
         transform=from_origin(500000, 1000000, resolution, resolution),
     ) as dataset:
         dataset.write(values, 1)
+
+
+def test_dn_correction_masks_special_codes_but_preserves_valid_zero() -> None:
+    """A valid offset-corrected zero must not be confused with raw nodata."""
+    corrected = _correct_dn_values(
+        np.array([0, 1000, 65535], dtype=np.uint16),
+        offset=-1000,
+        nodata=65535,
+        invalid_values=(0, 65535),
+    )
+
+    np.testing.assert_array_equal(corrected, [65535, 0, 65535])
 
 
 def _synthetic_pipeline(tmp_path: Path) -> tuple[Path, Path]:
@@ -154,7 +167,7 @@ def test_lazy_s2_processor_defers_reads_and_preserves_grid_masks_and_dtypes(
     np.testing.assert_array_equal(
         computed.reflectance.values,
         np.array(
-                [[[[300, 1300], [2200, 65535]], [[65535, 100], [65535, 65535]]]],
+                [[[[300, 1300], [2200, 65535]], [[0, 100], [65535, 65535]]]],
             dtype=np.uint16,
         ),
     )

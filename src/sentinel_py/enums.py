@@ -1,3 +1,10 @@
+"""Controlled vocabularies shared by the CLI, download, and pipeline layers.
+
+Every fixed set of string choices in sentinel-py is defined here, not in the module
+that first needs it. Pipeline enums are ``StrEnum`` so members format as their value
+in f-strings, logs, and cache keys; older CLI vocabularies are ``(str, Enum)``.
+"""
+
 from enum import Enum, StrEnum
 
 
@@ -212,6 +219,7 @@ class S1Bands(str, Enum):
 
     @classmethod
     def default_bands(cls) -> list["S1Bands"]:
+        """Return the default Sentinel-1 polarizations to download."""
         return [cls.vv, cls.vh]
 
 
@@ -435,6 +443,7 @@ def validate_sensor_mode(collection: CDSECollections, sensor_mode: str) -> str:
 
 
 def default_bands(collection: CDSECollections) -> list[str]:
+    """Return the default band names for a CDSE collection (empty if unknown)."""
     return COLLECTION_DEFAULTS.get(collection, [])
 
 

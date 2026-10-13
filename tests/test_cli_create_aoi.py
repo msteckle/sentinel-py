@@ -1,7 +1,6 @@
 """Hidden ``create-aoi`` command in the CLI entry point."""
 
 from pathlib import Path
-import json
 
 
 from helpers import runner

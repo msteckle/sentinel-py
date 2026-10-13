@@ -1,3 +1,5 @@
+"""Persistent file logging plus Rich console output for CLI commands."""
+
 import datetime as dt
 import logging
 from pathlib import Path
@@ -15,6 +17,24 @@ def get_logger(
     logpath: Optional[Path] = None,
     verbose: bool = False,
 ) -> logging.Logger:
+    """Create a named logger that writes a timestamped file and a Rich console feed.
+
+    Parameters
+    ----------
+    name : str
+        Logger name; use a unique name per command because handlers are reset.
+    logpath : pathlib.Path, optional
+        Log file prefix, or an existing directory to place the log file in. Defaults
+        to ``DEFAULT_LOG_DIR``.
+    verbose : bool, default False
+        Show INFO and DEBUG records on the console and in the file; otherwise the
+        console shows warnings and the file records INFO and above.
+
+    Returns
+    -------
+    logging.Logger
+        Configured logger with console and file handlers.
+    """
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # if no logpath provided, use default log dir/logfile

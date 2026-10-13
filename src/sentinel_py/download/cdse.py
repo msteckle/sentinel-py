@@ -1743,7 +1743,6 @@ def resolve_and_download(
     cached_images = asset_store.read(
         key_filters={"safedir": scenes["Name"].astype(str).tolist()}
     )
-    downloads_file = REGISTRY["cdse_downloads"].path(output_dir)
     downloads_store = REGISTRY["cdse_downloads"].store(output_dir)
     logger.info(f"Looking for images cache at: {images_file}")
     cached_by_scene: dict[str, pd.DataFrame] = {}

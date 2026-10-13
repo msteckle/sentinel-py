@@ -293,7 +293,6 @@ class S2CompositeProcessor(BaseProcessor):
         context: ProcessorContext,
     ) -> Any:
         """Aggregate normalized point observations without constructing raster tasks."""
-        import pandas as pd
         from sentinel_py.pipeline.artifacts import PointSampleArtifact
 
         if not isinstance(config, S2CompositeNodeConfig) or len(inputs) != 1:

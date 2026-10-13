@@ -503,6 +503,17 @@ class TCAPW(SpectralIndex):
 ########################################################################################
 
 
+class _PointBands:
+    """Minimal ``sel(band=...)`` adapter so index formulas run on point columns."""
+
+    def __init__(self, values: dict[str, Any]) -> None:
+        self._values = values
+
+    def sel(self, *, band: str) -> Any:
+        """Return one point-observation band by name."""
+        return self._values[band]
+
+
 class S2IndexNodeConfig(BaseModel):
     """Validated parameters belonging specifically to the ``s2.index`` node."""
 
@@ -647,7 +658,7 @@ class S2IndexProcessor(BaseProcessor):
             raise TypeError("Invalid s2.index configuration")
 
         try:
-            import xarray as xr
+            import xarray as xr  # noqa: F401  (availability guard)
         except ImportError as error:
             raise RuntimeError("Index processing requires xarray") from error
 
@@ -706,13 +717,5 @@ class S2IndexProcessor(BaseProcessor):
                     band: _safe_divide(values[band], scale) for band in index.bands
                 }
 
-            class _Values:
-                """Minimal band selector shared by point index formulas."""
-
-                def sel(self, *, band: str) -> Any:
-                    """Return one point-observation band by name."""
-                    return values[band]
-
-            selected = _Values()
-            rows[index_name] = index.formula(selected).astype(np.float32)
+            rows[index_name] = index.formula(_PointBands(values)).astype(np.float32)
         return PointSampleArtifact(rows, source.plan)

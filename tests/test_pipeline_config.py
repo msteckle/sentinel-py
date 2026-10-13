@@ -5,7 +5,6 @@ from typing import Any
 import geopandas as gpd
 import pytest
 from pydantic import BaseModel, ConfigDict
-from shapely.geometry import box
 
 from helpers import write_s2_pipeline_yaml
 from sentinel_py.pipeline import PipelineConfig, PipelineConfigError

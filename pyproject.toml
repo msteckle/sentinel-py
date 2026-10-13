@@ -52,5 +52,17 @@ build-backend = "hatchling.build"
 dev = [
     "ipykernel>=7.2.0",
     "pytest>=9.1.1",
+    "ruff>=0.17.0",
     "uv>=0.11.7",
 ]
+
+[tool.ruff]
+line-length = 88
+extend-exclude = ["docs"]
+
+[tool.ruff.lint]
+# F: pyflakes (unused imports/variables, undefined names, redefinitions).
+# E4/E7/E9: import, statement, and syntax errors. B: likely bugs (bugbear).
+select = ["E4", "E7", "E9", "F", "B"]
+# B905 (zip strict=) is deliberately off: existing zips rely on truncation semantics.
+ignore = ["B905"]

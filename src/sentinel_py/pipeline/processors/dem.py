@@ -413,7 +413,7 @@ class DEMProcessor(BaseProcessor):
                 )
             rows = []
             index = 0
-            for row in range(grid.chunk_grid_shape[0]):
+            for _ in range(grid.chunk_grid_shape[0]):
                 rows.append(
                     da.concatenate(
                         arrays[index : index + grid.chunk_grid_shape[1]], axis=2

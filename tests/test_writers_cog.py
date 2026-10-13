@@ -208,7 +208,6 @@ def test_cog_checkpoint_routes_batches_to_subplans(tmp_path: Path):
 
 def test_cog_tile_replaces_nonfinite_float_values(tmp_path) -> None:
     rasterio = pytest.importorskip("rasterio")
-    from sentinel_py.pipeline.writers.cog import _write_cog_tile
 
     output_path = tmp_path / "index.tif"
     result = _write_cog_tile(

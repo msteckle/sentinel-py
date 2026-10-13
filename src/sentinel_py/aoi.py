@@ -1,3 +1,5 @@
+"""AOI geometry helpers: parsing, batching, GeoJSON conversion, and lat/lon grids."""
+
 from __future__ import annotations
 
 import itertools

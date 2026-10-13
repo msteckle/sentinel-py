@@ -12,6 +12,7 @@ from sentinel_py.cache import deterministic_cache_key
 from sentinel_py.enums import S2_NODATA
 from sentinel_py.pipeline.processors.base import (
     BaseProcessor,
+    mask_nodata,
     ProcessorConfig,
     ProcessorContext,
 )
@@ -59,9 +60,7 @@ def _raster_reflectance(source: Any, reflectance: Any) -> Any:
         Floating-point reflectance values suitable for spectral formulas.
     """
     values = reflectance.astype(np.float32)
-    nodata = reflectance.attrs.get("nodata")
-    if nodata is not None:
-        values = values.where(values != nodata)
+    values = mask_nodata(values, reflectance.attrs.get("nodata"))
     quantification = source.coords.get("quantification_value")
     if quantification is not None:
         return _safe_divide(values, quantification.astype(np.float32))

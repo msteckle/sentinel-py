@@ -14,6 +14,7 @@ from sentinel_py.cache import deterministic_cache_key
 from sentinel_py.enums import S2_NODATA
 from sentinel_py.pipeline.processors.base import (
     BaseProcessor,
+    mask_nodata,
     ProcessorConfig,
     ProcessorContext,
 )
@@ -184,11 +185,11 @@ class S2CompositeProcessor(BaseProcessor):
         source = self.single_input(inputs)
         from sentinel_py.pipeline.artifacts import RasterArtifact
         if isinstance(source, RasterArtifact):
-            datasets = {
-                key: self.execute(config, {"data": dataset}, context)
-                for key, dataset in source.datasets.items()
-            }
-            return RasterArtifact(source.plan, datasets)
+            return source.map_datasets(
+                lambda dataset, unit: self.execute_raster(
+                    config, {"data": dataset}, context
+                )
+            )
         if not isinstance(source, xr.Dataset) or "reflectance" not in source:
             raise TypeError(
                 "composite input must be an xarray Dataset with reflectance"
@@ -208,9 +209,7 @@ class S2CompositeProcessor(BaseProcessor):
         composite_name = _composite_name(source, selection, config.aggregation)
 
         nodata = source.reflectance.attrs.get("nodata")
-        values = source.reflectance
-        if nodata is not None:
-            values = values.where(values != nodata)
+        values = mask_nodata(source.reflectance, nodata)
         reductions = []
         bin_labels = []
         source_fingerprints = []

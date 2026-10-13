@@ -22,7 +22,6 @@ import numpy as np
 import pandas as pd
 from affine import Affine
 from lxml import etree
-from pydantic import BaseModel
 from shapely.geometry import box
 from shapely.geometry.base import BaseGeometry
 
@@ -815,15 +814,10 @@ def sample_s2_points(
 ########################################################################################
 
 
-class _S2ReaderConfig(BaseModel):
-    """Marker model for the built-in local Sentinel-2 reader."""
-
-
 class S2Reader(BaseReader):
     """Reader adapter for downloaded Sentinel-2 L2A SAFE products."""
 
     source_type = SourceType.s2_l2a_local
-    config_model = _S2ReaderConfig
 
     def parse_config(self, source_id: str, raw: dict[str, Any], base_dir: Any) -> Any:
         """Parse the source configuration without coupling YAML parsing to readers."""

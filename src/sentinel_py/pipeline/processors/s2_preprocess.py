@@ -10,7 +10,7 @@ from pyproj import CRS
 
 from sentinel_py.cache import REGISTRY, deterministic_cache_key
 from sentinel_py.enums import S2_NODATA, S2Bands, SourceType
-from sentinel_py.pipeline.grid import point_grid
+from sentinel_py.pipeline.grid import grid_for_unit
 from sentinel_py.pipeline.processors.base import (
     BaseProcessor,
     ProcessorConfig,
@@ -153,12 +153,7 @@ class S2PreprocessProcessor(BaseProcessor):
         source = pipeline.sources[config.source]
         datasets = {}
         for unit in pipeline.aoi_plan.units:
-            grid = unit.grid or point_grid(
-                unit, crs=pipeline.output_grid.crs,
-                resolution=pipeline.output_grid.resolution,
-                anchor=pipeline.output_grid.anchor,
-                chunks=pipeline.output_grid.chunks,
-            )
+            grid = grid_for_unit(unit, pipeline.output_grid)
             dataset = read_s2_unit(
                 unit, data_dir=source.data_dir, bands=config.bands,
                 resolution_m=round(min(grid.resolution)), years=pipeline.selection.years,

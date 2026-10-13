@@ -10,7 +10,6 @@ from typing import Any, ClassVar, Protocol, runtime_checkable
 import numpy as np
 import pandas as pd
 from affine import Affine
-from pydantic import BaseModel
 
 from sentinel_py.cache import (
     DEFAULT_PIPELINE_CACHE_DIR,
@@ -21,6 +20,11 @@ from sentinel_py.cache import (
 from sentinel_py.enums import AOIKind
 from sentinel_py.pipeline.base import Registry
 from sentinel_py.pipeline.grid import AOIUnit, point_pixel
+
+
+########################################################################################
+# Polygon masking
+########################################################################################
 
 
 def _mask_block(
@@ -72,6 +76,11 @@ def apply_polygon_mask(dataset: Any, unit: AOIUnit) -> Any:
     return result
 
 
+########################################################################################
+# Reader contract and registry
+########################################################################################
+
+
 POINT_SAMPLE_CACHE_VERSION = 1
 
 
@@ -79,7 +88,6 @@ class BaseReader(ABC):
     """Formulaic source adapter for raster and point pipeline access."""
 
     source_type: ClassVar[str]
-    config_model: ClassVar[type[BaseModel]]
 
     @abstractmethod
     def parse_config(self, source_id: str, raw: dict[str, Any], base_dir: Path) -> Any:
@@ -127,6 +135,11 @@ def get_default_reader_registry() -> ReaderRegistry:
         registry.register(ArcticDEMReader())
         _DEFAULT_READERS = registry
     return _DEFAULT_READERS
+
+
+########################################################################################
+# Point sampling requests, rows, and cache
+########################################################################################
 
 
 @dataclass(frozen=True)

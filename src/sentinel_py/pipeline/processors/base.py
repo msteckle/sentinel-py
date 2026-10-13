@@ -62,6 +62,24 @@ class Processor(Protocol):
         """Execute the node and return its artifact for downstream nodes."""
 
 
+def mask_nodata(values: Any, nodata: Any) -> Any:
+    """Return ``values`` with the nodata sentinel replaced by NaN.
+
+    Parameters
+    ----------
+    values : xarray.DataArray
+        Array carrying the raw sentinel.
+    nodata : Any
+        Nodata sentinel from the array attributes; ``None`` leaves values untouched.
+
+    Returns
+    -------
+    xarray.DataArray
+        Masked array (lazy for Dask-backed input).
+    """
+    return values if nodata is None else values.where(values != nodata)
+
+
 class BaseProcessor(ABC):
     """Formulaic processor base for raster and point artifact implementations.
 

@@ -12,7 +12,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from sentinel_py.cache import deterministic_cache_key
 from sentinel_py.enums import SourceType
-from sentinel_py.pipeline.grid import point_grid, warp_to_window
+import sentinel_py.pipeline.grid as pipeline_grid
+from sentinel_py.pipeline.grid import grid_for_unit, warp_to_window
 from sentinel_py.pipeline.processors.base import (
     BaseProcessor,
     ProcessorConfig,
@@ -220,7 +221,19 @@ class DEMNodeConfig(BaseModel):
 def _native_feature_chunk(
     paths: tuple[Path, ...], grid: Any, window: Any, config: DEMNodeConfig
 ) -> np.ndarray:
-    """Read a native DEM halo, calculate one output chunk, and align it."""
+    """Read a native DEM halo, calculate one output chunk, and align it.
+
+    Native GDAL reads, merges, and reprojection are serialized per process through
+    ``RASTERIO_LOCK``, exactly like the Sentinel-2 reader and COG writer.
+    """
+    with pipeline_grid.RASTERIO_LOCK:  # module access keeps the lock unpickled
+        return _native_feature_chunk_locked(paths, grid, window, config)
+
+
+def _native_feature_chunk_locked(
+    paths: tuple[Path, ...], grid: Any, window: Any, config: DEMNodeConfig
+) -> np.ndarray:
+    """Run one DEM chunk calculation while holding the raster lock."""
     try:
         import rasterio
         from rasterio.merge import merge
@@ -380,13 +393,7 @@ class DEMProcessor(BaseProcessor):
             raise ValueError("DEM requires output-grid chunks")
         datasets = {}
         for unit in pipeline.aoi_plan.units:
-            grid = unit.grid or point_grid(
-                unit,
-                crs=pipeline.output_grid.crs,
-                resolution=pipeline.output_grid.resolution,
-                anchor=pipeline.output_grid.anchor,
-                chunks=pipeline.output_grid.chunks,
-            )
+            grid = grid_for_unit(unit, pipeline.output_grid)
             selected_paths = select_dem_paths(paths, unit, grid=grid)
             if not selected_paths:
                 raise RuntimeError(f"No DEM GeoTIFFs intersect AOI {unit.aoi_id}")

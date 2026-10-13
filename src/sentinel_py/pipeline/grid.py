@@ -328,6 +328,31 @@ def point_pixel(unit: AOIUnit, *, crs: str, resolution: tuple[float, float], anc
     )
 
 
+def grid_for_unit(unit: AOIUnit, output_grid: Any) -> GridSpec:
+    """Return the canonical grid used to process one AOI unit.
+
+    Parameters
+    ----------
+    unit : AOIUnit
+        Planned AOI unit.
+    output_grid : OutputGridConfig
+        Pipeline output-grid request supplying ``crs``, ``resolution``, ``anchor``,
+        and ``chunks`` (kept untyped here to avoid importing the config module).
+
+    Returns
+    -------
+    GridSpec
+        The unit's planned polygon grid, or the one-pixel grid of a point unit.
+    """
+    return unit.grid or point_grid(
+        unit,
+        crs=output_grid.crs,
+        resolution=output_grid.resolution,
+        anchor=output_grid.anchor,
+        chunks=output_grid.chunks,
+    )
+
+
 def point_grid(unit: AOIUnit, *, crs: str, resolution: tuple[float, float], anchor: tuple[float, float], chunks: ChunkShape) -> GridSpec:
     """Build the one-pixel canonical grid used to sample a point AOI."""
     centre_x, centre_y = point_pixel(unit, crs=crs, resolution=resolution, anchor=anchor)

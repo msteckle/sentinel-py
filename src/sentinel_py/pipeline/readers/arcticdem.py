@@ -5,22 +5,21 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel
 
 from sentinel_py.enums import SourceType
 from sentinel_py.pipeline.grid import AOIUnit
 from sentinel_py.pipeline.readers.base import BaseReader
 
 
-class _ArcticDEMReaderConfig(BaseModel):
-    """Marker model for the built-in local ArcticDEM reader."""
+########################################################################################
+# Pipeline reader adapter
+########################################################################################
 
 
 class ArcticDEMReader(BaseReader):
     """Reader adapter for a local ArcticDEM GeoTIFF collection."""
 
     source_type = SourceType.dem_local
-    config_model = _ArcticDEMReaderConfig
 
     def parse_config(self, source_id: str, raw: dict[str, Any], base_dir: Any) -> Any:
         """Parse a local GeoTIFF source mapping."""
@@ -52,6 +51,11 @@ class ArcticDEMReader(BaseReader):
     def sample_points(self, *args: Any, **kwargs: Any) -> Any:
         """DEM point execution is owned by the terrain processor."""
         raise NotImplementedError("DEM point reads require terrain feature settings")
+
+
+########################################################################################
+# DEM tile selection
+########################################################################################
 
 
 def select_dem_paths(paths: tuple[Path, ...], unit: AOIUnit, *, grid: Any | None = None) -> tuple[Path, ...]:

@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from pydantic import BaseModel
 from shapely.geometry import Polygon
 
 from sentinel_py.cache import REGISTRY, write_parquet_atomic
@@ -294,10 +293,6 @@ def select_scenes(
 ########################################################################################
 
 
-class _S1ReaderConfig(BaseModel):
-    """Marker model for the built-in local Sentinel-1 GRD reader."""
-
-
 class S1Reader(BaseReader):
     """Reader adapter for ASF-downloaded Sentinel-1 GRD ZIP archives.
 
@@ -307,7 +302,6 @@ class S1Reader(BaseReader):
     """
 
     source_type = SourceType.s1_grd_local
-    config_model = _S1ReaderConfig
 
     def parse_config(self, source_id: str, raw: dict[str, Any], base_dir: Any) -> Any:
         """Parse and validate one ``s1.grd.local`` source mapping."""

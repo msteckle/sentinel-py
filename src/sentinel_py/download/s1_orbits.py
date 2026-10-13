@@ -12,7 +12,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -21,16 +20,9 @@ from typing import Any
 
 import pandas as pd
 import requests
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeElapsedColumn,
-)
 
 from sentinel_py.cache import REGISTRY, RowStore
+from sentinel_py.download.base import make_progress, part_path, retry_call
 from sentinel_py.enums import S1OrbitPolicy
 
 # ASF mirrors the ESA/Copernicus POD orbit archive over plain HTTP without
@@ -115,6 +107,7 @@ class OrbitStagingSummary:
 
 
 def _utc(value: str) -> datetime:
+    """Parse an orbit-listing timestamp as a UTC datetime."""
     return datetime.strptime(value, _TIME_FORMAT).replace(tzinfo=timezone.utc)
 
 
@@ -175,6 +168,7 @@ def select_orbit(
 
 
 def _kinds_for_policy(policy: S1OrbitPolicy) -> tuple[str, ...]:
+    """Return the orbit kinds to stage for a policy, in preference order."""
     return {
         S1OrbitPolicy.precise: ("POEORB",),
         S1OrbitPolicy.restituted: ("RESORB",),
@@ -194,6 +188,7 @@ def list_remote_orbits(
 
 
 def _relative_orbit_path(orbit: OrbitFile) -> Path:
+    """Return an orbit file's path relative to the output directory."""
     return Path(ORBIT_DIRNAME) / orbit.kind / orbit.platform / orbit.name
 
 
@@ -209,38 +204,49 @@ def _download_orbit(
     """Download one orbit file to a ``.part`` sibling and atomically rename it."""
     target = out_dir / _relative_orbit_path(orbit)
     target.parent.mkdir(parents=True, exist_ok=True)
-    partial = target.with_name(f".{target.name}.part")
-    for attempt in range(retries + 1):
-        try:
-            response = session.get(orbit.url, timeout=120, stream=True)
-            response.raise_for_status()
-            with partial.open("wb") as stream:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    stream.write(chunk)
-            # Orbit files are small XML documents; reject empty or HTML error bodies.
-            with partial.open("rb") as stream:
-                head = stream.read(5)
-            if partial.stat().st_size == 0 or head != b"<?xml":
-                raise OSError(f"invalid orbit file content for {orbit.name}")
-            os.replace(partial, target)
-            return target
-        except (requests.RequestException, OSError) as error:
-            partial.unlink(missing_ok=True)
-            status = getattr(getattr(error, "response", None), "status_code", None)
-            retryable = status is None or status == 429 or status >= 500
-            if attempt >= retries or not retryable:
-                raise
-            delay = retry_backoff * (2**attempt)
-            logger.warning(
-                "Retrying orbit %s after attempt %d/%d failed: %s; waiting %.1fs",
-                orbit.name,
-                attempt + 1,
-                retries + 1,
-                error,
-                delay,
-            )
-            time.sleep(delay)
-    raise AssertionError("unreachable")  # pragma: no cover
+    partial = part_path(target.parent, target.name)
+
+    def fetch() -> Path:
+        """Stream one orbit file and verify it is a non-empty XML document."""
+        response = session.get(orbit.url, timeout=120, stream=True)
+        response.raise_for_status()
+        with partial.open("wb") as stream:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                stream.write(chunk)
+        # Orbit files are small XML documents; reject empty or HTML error bodies.
+        with partial.open("rb") as stream:
+            head = stream.read(5)
+        if partial.stat().st_size == 0 or head != b"<?xml":
+            raise OSError(f"invalid orbit file content for {orbit.name}")
+        os.replace(partial, target)
+        return target
+
+    def is_retryable(error: Exception) -> bool:
+        """Retry network/IO errors unless the server reported a client error."""
+        if not isinstance(error, (requests.RequestException, OSError)):
+            return False
+        status = getattr(getattr(error, "response", None), "status_code", None)
+        return status is None or status == 429 or status >= 500
+
+    def log_retry(error: Exception, attempt: int, delay: float) -> None:
+        """Log a retryable orbit download failure."""
+        logger.warning(
+            "Retrying orbit %s after attempt %d/%d failed: %s; waiting %.1fs",
+            orbit.name,
+            attempt + 1,
+            retries + 1,
+            error,
+            delay,
+        )
+
+    return retry_call(
+        fetch,
+        retries=retries,
+        backoff=retry_backoff,
+        is_retryable=is_retryable,
+        on_retry=log_retry,
+        cleanup=lambda: partial.unlink(missing_ok=True),
+    )
 
 
 def _product_scene_names(products: pd.DataFrame) -> list[str]:
@@ -460,6 +466,7 @@ def stage_orbits(
     with state_store.writer(batch_rows=500, flush_seconds=30.0) as state_writer:
 
         def _record(scenes_to_record: list[SceneTimes]) -> None:
+            """Add staged-orbit result rows to the shared state."""
             for scene in scenes_to_record:
                 row = _scene_row(scene)
                 rows.append(row)
@@ -467,14 +474,10 @@ def stage_orbits(
 
         _record(immediate)
         if needed:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[bold blue]Downloading Sentinel-1 orbit files"),
-                BarColumn(),
-                MofNCompleteColumn(),
-                TimeElapsedColumn(),
-            ) as progress:
-                task = progress.add_task("orbits", total=len(needed))
+            with make_progress(eta=False) as progress:
+                task = progress.add_task(
+                    "Downloading Sentinel-1 orbit files", total=len(needed)
+                )
                 with ThreadPoolExecutor(max_workers=max(1, processes)) as pool:
                     futures = {
                         pool.submit(

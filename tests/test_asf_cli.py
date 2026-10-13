@@ -12,9 +12,9 @@ from typer.testing import CliRunner
 
 import sentinel_py.download.asf as asf_download_module
 from sentinel_py.cli.main import app
+from sentinel_py.download.base import DownloadSummary
 from sentinel_py.download.asf import (
     ASF_MANIFEST_COLUMNS,
-    ASFDownloadSummary,
     download_asf,
     get_predominant_flightdir,
     query_asf,
@@ -649,7 +649,7 @@ def test_asf_download_cli_reads_cached_query_and_config(tmp_path: Path, monkeypa
 
     def fake_download_asf(**kwargs):
         calls.update(kwargs)
-        return ASFDownloadSummary(
+        return DownloadSummary(
             1,
             0,
             0,
@@ -737,7 +737,7 @@ def test_asf_download_cli_uses_latest_cached_query(tmp_path: Path, monkeypatch):
 
     def fake_download_asf(**kwargs):
         calls.update(kwargs)
-        return ASFDownloadSummary(1, 0, 0, ["download complete"])
+        return DownloadSummary(1, 0, 0, ["download complete"])
 
     monkeypatch.setattr(
         "sentinel_py.cli.asf.download.download_asf",
@@ -784,7 +784,7 @@ def test_asf_download_cli_uses_explicit_query_manifest(
 
     def fake_download_asf(**kwargs):
         calls.update(kwargs)
-        return ASFDownloadSummary(1, 0, 0, ["download complete"])
+        return DownloadSummary(1, 0, 0, ["download complete"])
 
     monkeypatch.setattr(
         "sentinel_py.cli.asf.download.download_asf",
@@ -825,7 +825,7 @@ def test_asf_download_cli_exits_nonzero_when_a_product_fails(
     _write_earthdata_config(config)
     monkeypatch.setattr(
         "sentinel_py.cli.asf.download.download_asf",
-        lambda **kwargs: ASFDownloadSummary(
+        lambda **kwargs: DownloadSummary(
             0,
             0,
             1,

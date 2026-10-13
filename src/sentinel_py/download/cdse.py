@@ -1,3 +1,5 @@
+"""Sentinel-1/2 query and download from CDSE with cached asset discovery."""
+
 import calendar
 import logging
 import os
@@ -13,20 +15,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import phidown.search as _phidown_search
 from phidown.s5cmd_utils import run_s5cmd_with_config
 from phidown.search import CopernicusDataSearcher
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
 
 from sentinel_py.cache import (
     REGISTRY,
@@ -40,6 +34,7 @@ from sentinel_py.cache import (
     write_json_atomic,
     write_parquet_atomic,
 )
+from sentinel_py.download.base import make_progress, part_path, retry_call
 from sentinel_py.download.preflight import (
     DownloadStorageSummary,
     extrapolate_total,
@@ -91,6 +86,33 @@ SCENE_CACHE_COLUMNS = [
 ]
 S2_METADATA_ASSETS = {"MTD_MSIL2A", "MTD_MSIL1C", "MTD_TL"}
 CDSE_LEGACY_ASSET_CACHE_NAME = "all_downloaded_images.parquet"
+DEFAULT_S5CMD_CONFIG = ".s5cfg"
+CDSE_ENDPOINT_URL = "https://eodata.dataspace.copernicus.eu"
+
+
+def s2_metadata_name(scene_name: str) -> str:
+    """Return the product-level metadata asset name for a Sentinel-2 scene.
+
+    Parameters
+    ----------
+    scene_name : str
+        SAFE scene name.
+
+    Returns
+    -------
+    str
+        ``"MTD_MSIL1C"`` for Level-1C scenes, otherwise ``"MTD_MSIL2A"``.
+    """
+    return "MTD_MSIL1C" if "MSIL1C" in scene_name.upper() else "MTD_MSIL2A"
+
+
+def _s5cmd_unavailable(config_file: str | Path) -> RuntimeError:
+    """Build the error for a missing s5cmd configuration file or executable."""
+    if not Path(config_file).is_file():
+        return RuntimeError(f"s5cmd configuration file not found: {config_file}")
+    return RuntimeError(
+        "s5cmd executable not found: ensure s5cmd is installed and in PATH"
+    )
 
 ########################################################################################
 # Variable helpers
@@ -388,6 +410,7 @@ def query_cdse(
     def _run_query(
         start_iso: str, end_iso: str, batch_idx: int, batch_geom
     ) -> pd.DataFrame:
+        """Run one windowed CDSE catalogue query, retrying transient failures."""
         query_attributes = dict(attrs or {})
         if not burst_mode:
             if rel_orbit_num is not None:
@@ -462,14 +485,7 @@ def query_cdse(
     max_workers = min(len(tasks), 8)
 
     # Run queries in parallel with a progress bar, and collect results
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[bold blue]{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-    ) as progress:
+    with make_progress() as progress:
         task_id = progress.add_task("Querying CDSE", total=len(tasks))
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(_run_query, *task): task for task in tasks}
@@ -873,13 +889,7 @@ def _list_s2_product_assets(
                 )
         return _s2_asset_rows(scene_name, s3_path, listed, is_l1c=is_l1c)
     except FileNotFoundError as e:
-        if not Path(config_file).is_file():
-            raise RuntimeError(
-                f"s5cmd configuration file not found: {config_file}"
-            ) from e
-        raise RuntimeError(
-            "s5cmd executable not found: ensure s5cmd is installed and in PATH"
-        ) from e
+        raise _s5cmd_unavailable(config_file) from e
 
 
 def _select_s2_assets(
@@ -940,13 +950,7 @@ def _find_s1_scene_images(
         try:
             output = run_s5cmd_with_config(cmd, config_file=config_file)
         except FileNotFoundError as e:
-            if not Path(config_file).is_file():
-                raise RuntimeError(
-                    f"s5cmd configuration file not found: {config_file}"
-                ) from e
-            raise RuntimeError(
-                "s5cmd executable not found: ensure s5cmd is installed and in PATH"
-            ) from e
+            raise _s5cmd_unavailable(config_file) from e
         except Exception:
             logger.warning(
                 f"  ERR {pol}: not found in {scene_name}",
@@ -990,56 +994,60 @@ def download_s3_file(
     s3_uri: str,
     local_path: Path,
     logger: logging.Logger,
-    config_file: str = ".s5cfg",
-    endpoint_url: str = "https://eodata.dataspace.copernicus.eu",
+    config_file: str = DEFAULT_S5CMD_CONFIG,
+    endpoint_url: str = CDSE_ENDPOINT_URL,
     expected_size: int | None = None,
     attempts: int = 3,
 ) -> bool:
     """Download one object to a temporary sibling, verify it, and atomically publish."""
     local_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = local_path.with_name(f".{local_path.name}.part")
+    temporary = part_path(local_path.parent, local_path.name)
 
-    # Try downloading the file with retries and exponential backoff
-    for attempt in range(1, attempts + 1):
+    def fetch() -> None:
+        """Copy the object to the ``.part`` file, verify it, and publish it."""
         temporary.unlink(missing_ok=True)
-        cmd = f'cp "{s3_uri}" "{temporary}"'
         try:
             run_s5cmd_with_config(
-                cmd,
+                f'cp "{s3_uri}" "{temporary}"',
                 config_file=config_file,
                 endpoint_url=endpoint_url,
             )
-            actual_size = temporary.stat().st_size
-            if expected_size and actual_size != expected_size:
-                raise RuntimeError(
-                    f"downloaded size {actual_size} does not match expected "
-                    f"size {expected_size}"
-                )
-            if actual_size <= 0:
-                raise RuntimeError("downloaded file is empty")
-            os.replace(temporary, local_path)
-            return True
-        # If the download fails, clean up and retry with exponential backoff
-        except Exception as e:
-            temporary.unlink(missing_ok=True)
-            if isinstance(e, subprocess.CalledProcessError) and e.returncode in {
-                -signal.SIGINT,
-                -signal.SIGTERM,
-            }:
-                raise KeyboardInterrupt from e
-            if attempt == attempts:
-                logger.error(
-                    f"Download failed after {attempts} attempt(s): "
-                    f"{s3_uri} -> {local_path}: {e}"
-                )
-                return False
-            delay = 2 ** (attempt - 1)
-            logger.warning(
-                f"Download attempt {attempt}/{attempts} failed: {s3_uri} -> "
-                f"{local_path}: {e}; retrying in {delay}s"
+        except subprocess.CalledProcessError as error:
+            if error.returncode in {-signal.SIGINT, -signal.SIGTERM}:
+                raise KeyboardInterrupt from error
+            raise
+        actual_size = temporary.stat().st_size
+        if expected_size and actual_size != expected_size:
+            raise RuntimeError(
+                f"downloaded size {actual_size} does not match expected "
+                f"size {expected_size}"
             )
-            time.sleep(delay)
-    return False
+        if actual_size <= 0:
+            raise RuntimeError("downloaded file is empty")
+        os.replace(temporary, local_path)
+
+    def log_retry(error: Exception, attempt: int, delay: float) -> None:
+        """Log a retryable S3 download failure."""
+        logger.warning(
+            f"Download attempt {attempt + 1}/{attempts} failed: {s3_uri} -> "
+            f"{local_path}: {error}; retrying in {delay:g}s"
+        )
+
+    try:
+        retry_call(
+            fetch,
+            retries=attempts - 1,
+            backoff=1.0,
+            on_retry=log_retry,
+            cleanup=lambda: temporary.unlink(missing_ok=True),
+        )
+    except Exception as error:
+        logger.error(
+            f"Download failed after {attempts} attempt(s): "
+            f"{s3_uri} -> {local_path}: {error}"
+        )
+        return False
+    return True
 
 
 # --------------------------------------------------------------------------------------
@@ -1063,10 +1071,12 @@ class DownloadResult:
 
     @property
     def total(self) -> int:
+        """Return the number of images attempted for the scene."""
         return len(self.succeeded) + len(self.failed) + len(self.skipped)
 
     @property
     def ok(self) -> bool:
+        """Return whether no image failed."""
         return len(self.failed) == 0
 
 
@@ -1091,6 +1101,7 @@ class StorageEstimator:
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def add_scene(self, footprint: int, additional: int) -> StorageProjection:
+        """Record one resolved scene's total footprint and additional bytes."""
         with self._lock:
             self.resolved_scenes += 1
             self.resolved_footprint += footprint
@@ -1098,12 +1109,14 @@ class StorageEstimator:
             return self._projection_unlocked()
 
     def projection(self) -> StorageProjection | None:
+        """Return the current storage projection, or ``None`` if nothing resolved yet."""
         with self._lock:
             if self.resolved_scenes == 0:
                 return None
             return self._projection_unlocked()
 
     def _projection_unlocked(self) -> StorageProjection:
+        """Compute the projection; the caller must hold the lock."""
         remaining = max(0, self.total_scenes - self.resolved_scenes)
         average_footprint = self.resolved_footprint / self.resolved_scenes
         average_additional = self.resolved_additional / self.resolved_scenes
@@ -1299,6 +1312,7 @@ def _download_scene_from_images(
     def _dload(
         task: tuple[str, str, Path, dict],
     ) -> tuple[str, bool, Path, dict]:
+        """Download or verify one image and return its label, status, path, and row."""
         label, uri, local, image = task
         logger.debug(f"  DWNLD {scene_name} / {label} starting...")
         ok = download_s3_file(
@@ -1368,7 +1382,7 @@ def prepare_cdse_download(
     bands: list[str],
     resolution: int,
     output_dir: Path,
-    config_file: str = ".s5cfg",
+    config_file: str = DEFAULT_S5CMD_CONFIG,
     parallel_scenes: int = 2,
     logger: logging.Logger | None = None,
     cache_dir: Path | None = None,
@@ -1552,13 +1566,7 @@ def prepare_cdse_download(
     if rows_to_resolve:
         with (
             asset_store.writer(batch_rows=2000, flush_seconds=60.0) as writer,
-            Progress(
-                SpinnerColumn(),
-                TextColumn("[bold blue]{task.description}"),
-                BarColumn(),
-                MofNCompleteColumn(),
-                TimeElapsedColumn(),
-            ) as progress,
+            make_progress(eta=False) as progress,
         ):
             task_id = progress.add_task(
                 "Resolving assets for storage estimate",
@@ -1631,7 +1639,7 @@ def resolve_and_download(
     bands: list[str],
     resolution: int,
     output_dir: Path,
-    config_file: str = ".s5cfg",
+    config_file: str = DEFAULT_S5CMD_CONFIG,
     parallel_scenes: int = 2,
     parallel_bands: int = 2,
     logger: logging.Logger | None = None,
@@ -1752,7 +1760,7 @@ def resolve_and_download(
                 return False
         # Require metadata assets for S2 scenes, otherwise the scene is not fully cached
         if mission.upper() == "S2":
-            metadata_name = "MTD_MSIL1C" if "MSIL1C" in name.upper() else "MTD_MSIL2A"
+            metadata_name = s2_metadata_name(name)
             scene_asset_names = scene_asset_names_by_scene.get(name, set())
             if (
                 metadata_name not in scene_asset_names
@@ -1786,6 +1794,7 @@ def resolve_and_download(
     initial_free_bytes = _free_disk_bytes(output_dir)
 
     def _progress_status() -> str:
+        """Format the live download counters for the progress bar."""
         return (
             f"downloaded {progress_counts['downloaded']} · "
             f"skipped {progress_counts['skipped']} · "
@@ -1794,6 +1803,7 @@ def resolve_and_download(
         )
 
     def _record_progress_result(result: DownloadResult) -> None:
+        """Add one scene's results to the live counters."""
         progress_counts["downloaded"] += len(result.succeeded)
         progress_counts["skipped"] += len(result.skipped)
         progress_counts["failed"] += len(result.failed)
@@ -1827,6 +1837,7 @@ def resolve_and_download(
     def _resolve_and_dl(row: pd.Series) -> DownloadResult:
 
         # If fatal error, skip all this and return empty result
+        """List remote assets for a new scene, then download the requested images."""
         if cancel.is_set():
             return DownloadResult(scene_name=row["Name"])
 
@@ -1886,7 +1897,7 @@ def resolve_and_download(
         ]
         # For S2, also check for required metadata assets
         if mission.upper() == "S2":
-            metadata_name = "MTD_MSIL1C" if "MSIL1C" in name.upper() else "MTD_MSIL2A"
+            metadata_name = s2_metadata_name(name)
             if not any(image["band_name"] == metadata_name for image in images):
                 missing_labels.append(metadata_name)
             if not any(image["band_name"] == "MTD_TL" for image in images):
@@ -1914,58 +1925,58 @@ def resolve_and_download(
         result.failed.extend(f"MISSING:{label}" for label in missing_labels)
         return result
 
+    def _run_scene_pool(
+        items: list[Any],
+        worker: Callable[[Any], DownloadResult],
+        name_of: Callable[[Any], str],
+        description: str,
+    ) -> None:
+        """Run scene workers in a cancel-on-error pool with shared progress and state.
+
+        A ``RuntimeError`` from any worker is treated as fatal: remaining scenes are
+        cancelled and the error is re-raised. Other worker errors become a failed
+        ``SCENE_ERROR`` result for that scene only.
+        """
+        with make_progress(status=True) as progress:
+            task_id = progress.add_task(
+                description, total=len(items), status=_progress_status()
+            )
+            with _CancelOnErrorPool(max_workers=parallel_scenes) as pool:
+                futures = {pool.submit(worker, item): name_of(item) for item in items}
+                fatal_error = None
+                for future in as_completed(futures):
+                    name = futures[future]
+                    try:
+                        result = future.result()
+                    except RuntimeError as exc:
+                        cancel.set()
+                        fatal_error = exc
+                        for f in futures:
+                            f.cancel()
+                        break
+                    except Exception as exc:
+                        logger.error(f"Scene {name} failed: {exc}")
+                        result = DownloadResult(
+                            scene_name=str(name), failed=["SCENE_ERROR"]
+                        )
+                    _record_progress_result(result)
+                    all_results.append(result)
+                    _flush_images(force=False)
+                    progress.update(task_id, advance=1, status=_progress_status())
+                if fatal_error:
+                    raise fatal_error
+
     try:
         # Process uncached rows
         if not uncached_df.empty:
             uncached_rows = [row for _, row in uncached_df.iterrows()]
 
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[bold blue]{task.description}"),
-                BarColumn(),
-                MofNCompleteColumn(),
-                TimeElapsedColumn(),
-                TimeRemainingColumn(),
-                TextColumn("[cyan]{task.fields[status]}"),
-            ) as progress:
-                task_id = progress.add_task(
-                    "Resolving & downloading new scenes",
-                    total=len(uncached_rows),
-                    status=_progress_status(),
-                )
-
-                with _CancelOnErrorPool(max_workers=parallel_scenes) as pool:
-                    futures = {
-                        pool.submit(_resolve_and_dl, r): r["Name"] for r in uncached_rows
-                    }
-                    fatal_error = None
-                    for future in as_completed(futures):
-                        name = futures[future]
-                        try:
-                            result = future.result()
-                        except RuntimeError as exc:
-                            cancel.set()
-                            fatal_error = exc
-                            for f in futures:
-                                f.cancel()
-                            break
-                        except Exception as exc:
-                            logger.error(f"Scene {name} failed: {exc}")
-                            result = DownloadResult(
-                                scene_name=str(name), failed=["SCENE_ERROR"]
-                            )
-
-                        _record_progress_result(result)
-                        all_results.append(result)
-                        _flush_images(force=False)
-                        progress.update(
-                            task_id,
-                            advance=1,
-                            status=_progress_status(),
-                        )
-
-                    if fatal_error:
-                        raise fatal_error
+            _run_scene_pool(
+                uncached_rows,
+                _resolve_and_dl,
+                lambda row: row["Name"],
+                "Resolving & downloading new scenes",
+            )
 
         # final flush for any remaining images from the uncached pass
         _flush_images(force=True)
@@ -2016,6 +2027,7 @@ def resolve_and_download(
             if grouped:
 
                 def _dl_cached(name_images: tuple[str, list[dict]]) -> DownloadResult:
+                    """Verify and restore a scene whose assets were already resolved."""
                     if cancel.is_set():
                         return DownloadResult(scene_name=name_images[0])
                     name, images = name_images
@@ -2034,53 +2046,12 @@ def resolve_and_download(
                             pending_image_rows.extend(result.updated_images)
                     return result
 
-                with Progress(
-                    SpinnerColumn(),
-                    TextColumn("[bold blue]{task.description}"),
-                    BarColumn(),
-                    MofNCompleteColumn(),
-                    TimeElapsedColumn(),
-                    TimeRemainingColumn(),
-                    TextColumn("[cyan]{task.fields[status]}"),
-                ) as progress:
-                    task_id = progress.add_task(
-                        "Checking cached scenes & restoring files",
-                        total=len(grouped),
-                        status=_progress_status(),
-                    )
-
-                    with _CancelOnErrorPool(max_workers=parallel_scenes) as pool:
-                        futures = {
-                            pool.submit(_dl_cached, (str(ng[0]), ng[1])): str(ng[0])
-                            for ng in grouped
-                        }
-                        fatal_error = None
-                        for future in as_completed(futures):
-                            name = futures[future]
-                            try:
-                                result = future.result()
-                            except RuntimeError as exc:
-                                cancel.set()
-                                fatal_error = exc
-                                for f in futures:
-                                    f.cancel()
-                                break
-                            except Exception as exc:
-                                logger.error(f"Scene {name} failed: {exc}")
-                                result = DownloadResult(
-                                    scene_name=str(name), failed=["SCENE_ERROR"]
-                                )
-                            _record_progress_result(result)
-                            all_results.append(result)
-                            _flush_images(force=False)
-                            progress.update(
-                                task_id,
-                                advance=1,
-                                status=_progress_status(),
-                            )
-
-                        if fatal_error:
-                            raise fatal_error
+                _run_scene_pool(
+                    [(str(name), images) for name, images in grouped],
+                    _dl_cached,
+                    lambda item: item[0],
+                    "Checking cached scenes & restoring files",
+                )
 
                 # flush any remaining updates from the cached-scenes pass
                 _flush_images(force=True)

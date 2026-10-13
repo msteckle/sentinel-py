@@ -7,7 +7,7 @@ import requests
 from typer.testing import CliRunner
 
 from sentinel_py.cli.main import app
-from sentinel_py.download.asf import ASFDownloadSummary
+from sentinel_py.download.base import DownloadSummary
 from sentinel_py.download.s1_orbits import (
     ORBIT_BASE_URLS,
     ORBIT_STATE_RELPATH,
@@ -191,7 +191,7 @@ def test_download_cli_stages_orbits_and_honors_none(tmp_path: Path, monkeypatch)
     )
     monkeypatch.setattr(
         "sentinel_py.cli.asf.download.download_asf",
-        lambda **kwargs: ASFDownloadSummary(1, 0, 0, ["Results: 1 downloaded"]),
+        lambda **kwargs: DownloadSummary(1, 0, 0, ["Results: 1 downloaded"]),
     )
     calls = []
 

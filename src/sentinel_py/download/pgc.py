@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -15,20 +13,18 @@ from urllib.parse import urlparse
 
 import pandas as pd
 import requests
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
 from shapely import wkt
 from shapely.geometry import base as shapely_base
 from shapely.geometry import shape
 
 from sentinel_py.cache import REGISTRY, RowStore
+from sentinel_py.download.base import (
+    DownloadSummary,
+    part_path,
+    retry_call,
+    run_download_pool,
+    url_filename,
+)
 
 PGC_CATALOG_URL = "https://stac.pgc.umn.edu/api/v1/"
 PGC_COLLECTION = "arcticdem-mosaics-v4.1-10m"
@@ -61,20 +57,6 @@ PGC_DOWNLOAD_STATE_COLUMNS = [
     "checked_at",
     "error",
 ]
-
-
-@dataclass(frozen=True)
-class PGCDownloadSummary:
-    """Counts and user-facing messages from an ArcticDEM download."""
-
-    downloaded: int
-    skipped: int
-    failed: int
-    messages: list[str]
-
-    def __iter__(self):
-        """Iterate over user-facing summary messages."""
-        return iter(self.messages)
 
 
 def _asset_href(asset: Any) -> str:
@@ -145,6 +127,7 @@ def atomic_aoi_geometries(
     components: list[shapely_base.BaseGeometry] = []
 
     def add(geometry: shapely_base.BaseGeometry) -> None:
+        """Collect non-empty atomic parts of a geometry, recursing into collections."""
         if geometry.is_empty:
             return
         if geometry.geom_type == "GeometryCollection" or geometry.geom_type.startswith(
@@ -220,6 +203,7 @@ def query_arcticdem(
     def search_component(
         component: shapely_base.BaseGeometry,
     ) -> list[dict[str, Any]]:
+        """Search the STAC catalog for one atomic AOI geometry."""
         catalog = pystac_client.Client.open(PGC_CATALOG_URL)
         bbox = tuple(float(value) for value in component.bounds)
         search = catalog.search(
@@ -316,6 +300,7 @@ def select_cached_tiles(
 
 
 def _expected_size(product: dict[str, Any]) -> int | None:
+    """Return the manifest's expected byte size, or ``None``."""
     value = product.get("expected_size")
     return None if value is None or pd.isna(value) else int(value)
 
@@ -348,7 +333,7 @@ def download_arcticdem(
     retry_backoff: float = 2.0,
     state_file: Path | None = None,
     logger: logging.Logger | None = None,
-) -> PGCDownloadSummary:
+) -> DownloadSummary:
     """Download ArcticDEM DEM assets with persistent parallel state."""
     if processes < 1 or retries < 0 or retry_backoff < 0:
         raise ValueError("processes must be positive; retries and backoff non-negative")
@@ -369,13 +354,14 @@ def download_arcticdem(
         products.dropna(subset=["url"]).drop_duplicates("url").reset_index(drop=True)
     )
     if products.empty:
-        return PGCDownloadSummary(0, 0, 0, ["No ArcticDEM URLs to download."])
+        return DownloadSummary(0, 0, 0, ["No ArcticDEM URLs to download."])
 
     def download_one(product: dict[str, Any]) -> dict[str, Any]:
+        """Verify or download one tile and return its state row."""
         url = str(product["url"])
-        filename = str(product.get("filename") or Path(urlparse(url).path).name)
+        filename = url_filename(url, product.get("filename"))
         target = out_dir / filename
-        partial = out_dir / f".{filename}.part"
+        partial = part_path(out_dir, filename)
         expected = _expected_size(product)
         cached = state_by_url.get(url, {})
         try:
@@ -396,26 +382,29 @@ def download_arcticdem(
                         status="complete",
                         last_action="skipped",
                     )
-            for attempt in range(retries + 1):
-                partial.unlink(missing_ok=True)
-                try:
-                    with requests.get(url, stream=True, timeout=(30, 300)) as response:
-                        response.raise_for_status()
-                        with partial.open("wb") as stream:
-                            for chunk in response.iter_content(1024 * 1024):
-                                if chunk:
-                                    stream.write(chunk)
-                    actual = partial.stat().st_size
-                    if expected is not None and actual != expected:
-                        raise OSError(
-                            f"size mismatch: expected {expected}, got {actual}"
-                        )
-                    break
-                except (requests.RequestException, OSError):
-                    partial.unlink(missing_ok=True)
-                    if attempt >= retries:
-                        raise
-                    time.sleep(retry_backoff * (2**attempt))
+
+            def fetch() -> int:
+                """Stream the asset to the ``.part`` file and verify its size."""
+                with requests.get(url, stream=True, timeout=(30, 300)) as response:
+                    response.raise_for_status()
+                    with partial.open("wb") as stream:
+                        for chunk in response.iter_content(1024 * 1024):
+                            if chunk:
+                                stream.write(chunk)
+                size = partial.stat().st_size
+                if expected is not None and size != expected:
+                    raise OSError(f"size mismatch: expected {expected}, got {size}")
+                return size
+
+            actual = retry_call(
+                fetch,
+                retries=retries,
+                backoff=retry_backoff,
+                is_retryable=lambda error: isinstance(
+                    error, (requests.RequestException, OSError)
+                ),
+                cleanup=lambda: partial.unlink(missing_ok=True),
+            )
             os.replace(partial, target)
             stat = target.stat()
             return _state_row(
@@ -437,67 +426,33 @@ def download_arcticdem(
                 error=str(error),
             )
 
-    completed = skipped = failed = 0
     records = products.to_dict("records")
     partial_paths = [
-        out_dir
-        / f".{record.get('filename') or Path(urlparse(str(record['url'])).path).name}.part"
-        for record in records
+        part_path(out_dir, url_filename(str(r["url"]), r.get("filename")))
+        for r in records
     ]
     try:
         # State rows are checkpointed in small batches as downloads complete, so an
         # interrupted run keeps what finished without rewriting the whole state file
         # after every tile. The writer compacts the parts on a clean exit.
-        with (
-            state_store.writer(batch_rows=25, flush_seconds=15.0) as state_writer,
-            Progress(
-                SpinnerColumn(),
-                TextColumn("[bold blue]{task.description}"),
-                BarColumn(),
-                MofNCompleteColumn(),
-                TimeElapsedColumn(),
-                TimeRemainingColumn(),
-                TextColumn("[cyan]{task.fields[status]}"),
-            ) as progress,
-        ):
-            task = progress.add_task(
-                "Checking & downloading ArcticDEM tiles",
-                total=len(records),
-                status="downloaded 0 · skipped 0 · failed 0",
+        with state_store.writer(batch_rows=25, flush_seconds=15.0) as state_writer:
+            completed, skipped, failed = run_download_pool(
+                records,
+                download_one,
+                processes=processes,
+                description="Checking & downloading ArcticDEM tiles",
+                sink=state_writer,
             )
-            with ThreadPoolExecutor(max_workers=processes) as pool:
-                futures = [pool.submit(download_one, record) for record in records]
-                try:
-                    for future in as_completed(futures):
-                        row = future.result()
-                        state_writer.add([row])
-                        if row["last_action"] == "downloaded":
-                            completed += 1
-                        elif row["last_action"] == "skipped":
-                            skipped += 1
-                        else:
-                            failed += 1
-                        progress.update(
-                            task,
-                            advance=1,
-                            status=(
-                                f"downloaded {completed} · skipped {skipped} · "
-                                f"failed {failed}"
-                            ),
-                        )
-                except BaseException:
-                    # Do not start the remaining queued downloads after an interrupt.
-                    pool.shutdown(wait=False, cancel_futures=True)
-                    raise
     finally:
         for partial_path in partial_paths:
             partial_path.unlink(missing_ok=True)
-    return PGCDownloadSummary(
+    return DownloadSummary(
         completed,
         skipped,
         failed,
         [
-            f"Results:          {completed} downloaded, {skipped} skipped, {failed} failed",
+            f"Results:          {completed} downloaded, {skipped} skipped, "
+            f"{failed} failed",
             f"Download status:  {state_file}",
         ],
     )

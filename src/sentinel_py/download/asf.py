@@ -1,47 +1,38 @@
+"""Sentinel-1 query and download from ASF with persistent, size-verified state."""
+
 import hashlib
 import logging
 import netrc
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import unquote, urlparse
 
 import asf_search as asf
 import pandas as pd
 import requests
 from asf_search.download import download_url as asf_download_url
 from asf_search.exceptions import ASFAuthenticationError
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
 from shapely import wkt
 from shapely.geometry.polygon import orient
 
 from sentinel_py.cache import REGISTRY, RowStore
+from sentinel_py.enums import ASFBeamMode, ASFPolarization, ASFProductLevel
+from sentinel_py.download.base import (
+    DownloadSummary,
+    part_path,
+    retry_call,
+    run_download_pool,
+    url_filename,
+)
 
 # Sentinel-1-specific values documented by ASF rather than the full generic
 # asf_search constant catalog, which also includes values for other missions:
-# https://docs.asf.alaska.edu/api/keywords/
-SENTINEL1_DATA_PRODUCT_LEVELS = (
-    "GRD_HD",
-    "GRD_HS",
-    "GRD_MD",
-    "GRD_MS",
-    "GRD_FD",
-    "SLC",
-    "RAW",
-    "OCN",
-)
+# https://docs.asf.alaska.edu/api/keywords/. The data-product, beam-mode, and
+# polarization vocabularies live in ``sentinel_py.enums``; ASF additionally exposes
+# metadata-only product levels.
 SENTINEL1_METADATA_LEVELS = (
     "METADATA_GRD_HD",
     "METADATA_GRD_HS",
@@ -52,20 +43,10 @@ SENTINEL1_METADATA_LEVELS = (
     "METADATA_OCN",
 )
 SENTINEL1_PRODUCT_LEVELS = frozenset(
-    (*SENTINEL1_DATA_PRODUCT_LEVELS, *SENTINEL1_METADATA_LEVELS)
+    (*(level.value for level in ASFProductLevel), *SENTINEL1_METADATA_LEVELS)
 )
-
-# Sentinel-1 acquisition modes are IW, EW, SM, and WV. ASF exposes the six
-# Stripmap beams individually as S1-S6:
-# https://sentiwiki.copernicus.eu/web/s1-mission
-SENTINEL1_BEAM_MODES = frozenset(("IW", "EW", "WV", "S1", "S2", "S3", "S4", "S5", "S6"))
-
-# Standard Sentinel-1 product configurations plus ASF's documented additional
-# catalog labels:
-# https://docs.asf.alaska.edu/api/keywords/
-SENTINEL1_POLARIZATIONS = frozenset(
-    ("VV+VH", "HH+HV", "VV", "HH", "DUAL VV", "DUAL VH", "DUAL HH", "DUAL HV")
-)
+SENTINEL1_BEAM_MODES = frozenset(mode.value for mode in ASFBeamMode)
+SENTINEL1_POLARIZATIONS = frozenset(pol.value for pol in ASFPolarization)
 
 ASF_MANIFEST_COLUMNS = [
     "granule",
@@ -99,24 +80,6 @@ ASF_FINGERPRINT_VERSION = 1
 # comfortably within both the condition limit and the normal request timeout.
 CMR_POINT_BATCH_SIZE = 100
 CMR_POINT_QUERY_WORKERS = 8
-
-
-@dataclass(frozen=True)
-class ASFDownloadSummary:
-    """Counts and user-facing messages from an ASF download invocation."""
-
-    downloaded: int
-    skipped: int
-    failed: int
-    messages: list[str]
-
-    def __iter__(self):
-        """Keep callers that iterate over result messages working."""
-        return iter(self.messages)
-
-    def __getitem__(self, index):
-        """Keep callers that index result messages working."""
-        return self.messages[index]
 
 
 def _is_retryable_download_error(error: Exception) -> bool:
@@ -272,6 +235,7 @@ def query_asf(
     try:
 
         def _search(spatial_options: dict[str, object]):
+            """Run one ASF search for a spatial-option batch."""
             return asf.search(
                 platform=asf.PLATFORM.SENTINEL1,
                 processingLevel=lvls,
@@ -365,6 +329,7 @@ def earthdata_netrc_credentials(config_file: Path) -> tuple[str, str] | None:
 def _build_asf_session(
     config_file: Path,
 ):
+    """Build an authenticated ASF session from an Earthdata config file."""
     credentials = earthdata_netrc_credentials(config_file)
     if credentials is None:
         raise ValueError(
@@ -374,12 +339,14 @@ def _build_asf_session(
 
 
 def _optional_int(value) -> int | None:
+    """Return ``int(value)``, or ``None`` for missing or NaN values."""
     if value is None or pd.isna(value):
         return None
     return int(value)
 
 
 def _expected_product_size(product: dict) -> int | None:
+    """Return the manifest's expected byte size (``expected_size`` or ``sizeMB``)."""
     expected = _optional_int(product.get("expected_size"))
     if expected is not None:
         return expected
@@ -390,6 +357,7 @@ def _expected_product_size(product: dict) -> int | None:
 
 
 def _expected_product_md5(product: dict) -> str | None:
+    """Return the normalized manifest MD5, or ``None`` when absent."""
     checksum = product.get("md5sum")
     if checksum is None or pd.isna(checksum):
         return None
@@ -398,11 +366,9 @@ def _expected_product_md5(product: dict) -> str | None:
 
 
 def _file_md5(path: Path) -> str:
-    digest = hashlib.md5()
+    """Return the hex MD5 digest of a file, streaming in bounded memory."""
     with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+        return hashlib.file_digest(stream, "md5").hexdigest()
 
 
 def _validate_product_file(
@@ -412,6 +378,7 @@ def _validate_product_file(
     expected_size: int | None,
     expected_md5: str | None,
 ) -> int:
+    """Check a downloaded file's size and MD5; return its size or raise ``OSError``."""
     actual_size = path.stat().st_size
     if expected_size is not None and actual_size != expected_size:
         raise OSError(
@@ -427,17 +394,22 @@ def _validate_product_file(
     return actual_size
 
 
-def _product_filename(product: dict) -> str:
-    url = str(product["url"])
-    filename = Path(unquote(urlparse(url).path)).name
-    if not filename:
-        granule = product.get("granule")
-        if granule is None or pd.isna(granule):
-            raise ValueError(f"Could not determine filename for ASF URL: {url}")
-        filename = Path(str(granule)).name
-    if filename in {"", ".", ".."}:
-        raise ValueError(f"Unsafe filename for ASF URL: {url}")
-    return filename
+def product_filename(product: dict) -> str:
+    """Return the safe local file name for a manifest row.
+
+    The URL's final path component is used, falling back to the ``granule`` column
+    when the URL has none.
+
+    Raises
+    ------
+    ValueError
+        If no safe file name can be determined.
+    """
+    granule = product.get("granule")
+    return url_filename(
+        str(product["url"]),
+        None if granule is None or pd.isna(granule) else str(granule),
+    )
 
 
 def _state_row(
@@ -451,6 +423,7 @@ def _state_row(
     last_action: str,
     error: str | None = None,
 ) -> dict:
+    """Build one download-state row for a manifest product."""
     checksum = product.get("md5sum")
     if checksum is not None and pd.isna(checksum):
         checksum = None
@@ -510,7 +483,7 @@ def download_asf(
     retry_backoff: float = 2.0,
     state_file: Path | None = None,
     logger: logging.Logger | None = None,
-) -> ASFDownloadSummary:
+) -> DownloadSummary:
     """
     Download an ASF manifest with persistent, size-verified state.
 
@@ -537,12 +510,7 @@ def download_asf(
     )
     if products.empty:
         logger.info("No ASF URLs to download")
-        return ASFDownloadSummary(
-            downloaded=0,
-            skipped=0,
-            failed=0,
-            messages=["No ASF URLs to download."],
-        )
+        return DownloadSummary(0, 0, 0, ["No ASF URLs to download."])
 
     state_file = state_file or REGISTRY["asf_downloads"].path(out_dir)
     state_store = RowStore(state_file, ["url"])
@@ -571,6 +539,7 @@ def download_asf(
     session_holder = []
 
     def _session():
+        """Lazily create one ASF session shared by all worker threads."""
         with session_lock:
             if not session_holder:
                 session_holder.append(_build_asf_session(config_file))
@@ -587,10 +556,11 @@ def download_asf(
     )
 
     def _download_one(product: dict) -> dict:
+        """Verify or download one product and return its state row."""
         url = str(product["url"])
-        filename = _product_filename(product)
+        filename = product_filename(product)
         target = out_dir / filename
-        partial = out_dir / f".{filename}.part"
+        partial = part_path(out_dir, filename)
         expected = _expected_product_size(product)
         expected_md5 = _expected_product_md5(product)
         cached = state_by_url.get(url, {})
@@ -642,37 +612,43 @@ def download_asf(
                         last_action="skipped",
                     )
 
-            for attempt in range(retries + 1):
+
+            def fetch() -> int:
+                """Download to the ``.part`` file and verify size and checksum."""
                 partial.unlink(missing_ok=True)
-                try:
-                    asf_download_url(
-                        url=url,
-                        path=str(out_dir),
-                        filename=partial.name,
-                        session=_session(),
-                    )
-                    actual = _validate_product_file(
-                        partial,
-                        filename=filename,
-                        expected_size=expected,
-                        expected_md5=expected_md5,
-                    )
-                    break
-                except Exception as error:
-                    partial.unlink(missing_ok=True)
-                    if attempt >= retries or not _is_retryable_download_error(error):
-                        raise
-                    delay = retry_backoff * (2**attempt)
-                    logger.warning(
-                        "Retrying ASF product %s after attempt %d/%d failed: %s; "
-                        "waiting %.1f seconds",
-                        filename,
-                        attempt + 1,
-                        retries + 1,
-                        error,
-                        delay,
-                    )
-                    time.sleep(delay)
+                asf_download_url(
+                    url=url,
+                    path=str(out_dir),
+                    filename=partial.name,
+                    session=_session(),
+                )
+                return _validate_product_file(
+                    partial,
+                    filename=filename,
+                    expected_size=expected,
+                    expected_md5=expected_md5,
+                )
+
+            def log_retry(error: Exception, attempt: int, delay: float) -> None:
+                """Log a retryable ASF download failure."""
+                logger.warning(
+                    "Retrying ASF product %s after attempt %d/%d failed: %s; "
+                    "waiting %.1f seconds",
+                    filename,
+                    attempt + 1,
+                    retries + 1,
+                    error,
+                    delay,
+                )
+
+            actual = retry_call(
+                fetch,
+                retries=retries,
+                backoff=retry_backoff,
+                is_retryable=_is_retryable_download_error,
+                on_retry=log_retry,
+                cleanup=lambda: partial.unlink(missing_ok=True),
+            )
             os.replace(partial, target)
             local_mtime_ns = target.stat().st_mtime_ns
             logger.debug("DOWNLOADED %s", filename)
@@ -699,84 +675,32 @@ def download_asf(
                 error=str(error),
             )
 
-    completed = 0
-    skipped = 0
-    failed = 0
-    cache_updated = 0
     product_records = products.to_dict("records")
     partial_paths = [
-        out_dir / f".{_product_filename(product)}.part" for product in product_records
+        part_path(out_dir, product_filename(product)) for product in product_records
     ]
-    pending_state_rows: list[dict] = []
-
-    def _flush_state() -> None:
-        """Append buffered rows to the state store as one immutable part."""
-        if not pending_state_rows:
-            return
-        state_store.append(pending_state_rows)
-        pending_state_rows.clear()
 
     try:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            TextColumn("[cyan]{task.fields[status]}"),
-        ) as progress:
-            task_id = progress.add_task(
-                "Checking & downloading ASF products",
-                total=len(products),
-                status=("downloaded 0 · skipped 0 · failed 0 · cache updated 0"),
+        # Rows are checkpointed in batches as downloads finish; the writer compacts
+        # the parts into the state file after a clean run.
+        with state_store.writer(batch_rows=100, flush_seconds=15.0) as state_writer:
+            completed, skipped, failed = run_download_pool(
+                product_records,
+                _download_one,
+                processes=processes,
+                description="Checking & downloading ASF products",
+                sink=state_writer,
+                show_cache_updated=True,
             )
-
-            with ThreadPoolExecutor(max_workers=processes) as pool:
-                futures = {
-                    pool.submit(_download_one, product): str(product["url"])
-                    for product in product_records
-                }
-                try:
-                    for future in as_completed(futures):
-                        row = future.result()
-                        cache_updated += 1
-                        if row["last_action"] == "downloaded":
-                            completed += 1
-                        elif row["last_action"] == "skipped":
-                            skipped += 1
-                        else:
-                            failed += 1
-                        pending_state_rows.append(row)
-                        if len(pending_state_rows) >= 100:
-                            _flush_state()
-                        progress.update(
-                            task_id,
-                            advance=1,
-                            status=(
-                                f"downloaded {completed} · skipped {skipped} · "
-                                f"failed {failed} · cache updated {cache_updated}"
-                            ),
-                        )
-                except BaseException:
-                    # Do not start the remaining queued downloads after an interrupt.
-                    pool.shutdown(wait=False, cancel_futures=True)
-                    raise
     finally:
-        try:
-            _flush_state()
-        finally:
-            # Partial archives are never resumable: the next attempt starts from zero.
-            # Remove only the temporary files belonging to this invocation, including
-            # when KeyboardInterrupt unwinds the concurrent download loop.
-            for partial_path in partial_paths:
-                try:
-                    partial_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-
-    # Reached only after a clean run: fold this run's parts into the state file.
-    state_store.compact()
+        # Partial archives are never resumable: the next attempt starts from zero.
+        # Remove only this invocation's temporary files, including when
+        # KeyboardInterrupt unwinds the concurrent download loop.
+        for partial_path in partial_paths:
+            try:
+                partial_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     end = time.time()
     end_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end))
@@ -793,7 +717,7 @@ def download_asf(
         state_file,
     )
 
-    return ASFDownloadSummary(
+    return DownloadSummary(
         downloaded=completed,
         skipped=skipped,
         failed=failed,

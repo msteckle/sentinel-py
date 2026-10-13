@@ -355,6 +355,7 @@ class RowWriter:
             return self._flush_locked()
 
     def _flush_locked(self) -> int:
+        """Write the buffered rows as one part; the caller must hold the lock."""
         buffered, self._buffer = self._buffer, []
         self._last_flush = time.monotonic()
         if not buffered:

@@ -99,7 +99,24 @@ def mark_cache_used(path: Path) -> None:
 
 
 def _temporary_sibling(path: Path) -> Path:
+    """Return a unique hidden temporary path next to ``path``."""
     return path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+
+
+@contextmanager
+def _atomic_target(path: Path) -> Iterator[Path]:
+    """Yield a temporary sibling that atomically replaces ``path`` on success.
+
+    The parent directory is created first, and the temporary file is removed if the
+    block raises, so interruption never leaves a partial file at ``path``.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = _temporary_sibling(path)
+    try:
+        yield temporary
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 @contextmanager
@@ -117,13 +134,8 @@ def _cache_file_lock(path: Path) -> Iterator[BinaryIO]:
 
 def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
     """Atomically replace a JSON file so interruption cannot leave partial JSON."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = _temporary_sibling(path)
-    try:
+    with _atomic_target(path) as temporary:
         temporary.write_text(json.dumps(value, indent=2, default=str) + "\n")
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def write_parquet_atomic(
@@ -134,15 +146,10 @@ def write_parquet_atomic(
     read_only: bool = False,
 ) -> None:
     """Atomically replace a Parquet file, optionally marking it read-only."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = _temporary_sibling(path)
-    try:
+    with _atomic_target(path) as temporary:
         dataframe.to_parquet(temporary, index=index)
-        os.replace(temporary, path)
-        if read_only:
-            path.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
-    finally:
-        temporary.unlink(missing_ok=True)
+    if read_only:
+        path.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
 
 
 def merge_state_rows(

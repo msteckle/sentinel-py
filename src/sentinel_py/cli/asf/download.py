@@ -6,7 +6,7 @@ import typer
 
 from sentinel_py.cache import DEFAULT_ASF_CACHE_DIR, find_latest_cache_file
 from sentinel_py.download.asf import (
-    _product_filename,
+    product_filename,
     download_asf,
     earthdata_netrc_credentials,
 )
@@ -62,7 +62,7 @@ def _storage_summary(products: pd.DataFrame, outdir: Path) -> DownloadStorageSum
             continue
 
         known_total += expected
-        local_path = outdir / _product_filename(product)
+        local_path = outdir / product_filename(product)
         try:
             already_complete = (
                 local_path.is_file() and local_path.stat().st_size == expected

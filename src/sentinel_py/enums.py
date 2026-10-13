@@ -65,6 +65,40 @@ class SourceType(StrEnum):
     dem_local = "dem.local"
 
 
+# Download and write-result CVs -------------------------------------------------------
+class Mission(StrEnum):
+    """Sentinel mission codes accepted by the CDSE download layer."""
+
+    s1 = "S1"
+    s2 = "S2"
+
+
+class DownloadStatus(StrEnum):
+    """Persisted per-file download state values (``status`` column)."""
+
+    complete = "complete"
+    failed = "failed"
+    staged = "staged"
+    missing = "missing"
+    partial = "partial"
+
+
+class DownloadAction(StrEnum):
+    """What a download run did for one file (``last_action`` column)."""
+
+    downloaded = "downloaded"
+    skipped = "skipped"
+    failed = "failed"
+
+
+class WriteStatus(StrEnum):
+    """Result status of one pipeline output write task."""
+
+    written = "written"
+    skipped = "skipped"
+    failed = "failed"
+
+
 # Sentinel-1 CVs -----------------------------------------------------------------------
 class ASFOrbitDirection(str, Enum):
     """ASF orbit-direction selections exposed by the Sentinel-1 query CLI."""

@@ -21,9 +21,9 @@ from typing import Any
 import pandas as pd
 import requests
 
-from sentinel_py.cache import REGISTRY, RowStore
+from sentinel_py.cache import REGISTRY
 from sentinel_py.download.base import make_progress, part_path, retry_call
-from sentinel_py.enums import S1OrbitPolicy
+from sentinel_py.enums import DownloadStatus, S1OrbitPolicy
 
 # ASF mirrors the ESA/Copernicus POD orbit archive over plain HTTP without
 # credentials. Directory listings are nginx autoindex pages.
@@ -318,8 +318,8 @@ def stage_orbits(
             else ["Orbit staging disabled."]
         )
 
-    state_path = out_dir / ORBIT_STATE_RELPATH
-    state_store = RowStore(state_path, ["scene"])
+    state_store = REGISTRY["s1_orbits"].store(out_dir)
+    state_path = state_store.path
     state = state_store.read()
     if state.empty:
         state = pd.DataFrame(columns=ORBIT_STATE_COLUMNS)
@@ -339,7 +339,7 @@ def stage_orbits(
         row = previous.get(scene)
         usable = (
             row is not None
-            and row.get("status") == "staged"
+            and row.get("status") == DownloadStatus.staged
             and row.get("orbit_type") in kinds
             and (out_dir / str(row.get("orbit_path"))).is_file()
         )
@@ -390,7 +390,7 @@ def stage_orbits(
         if (
             scene.scene not in assignments
             and row is not None
-            and row.get("status") == "staged"
+            and row.get("status") == DownloadStatus.staged
             and (out_dir / str(row.get("orbit_path"))).is_file()
             and row.get("orbit_type") in kinds
         ):
@@ -427,7 +427,7 @@ def stage_orbits(
                 "orbit_path": _relative_orbit_path(orbit).as_posix(),
                 "valid_start": orbit.valid_start.isoformat(),
                 "valid_stop": orbit.valid_stop.isoformat(),
-                "status": "staged",
+                "status": DownloadStatus.staged,
                 "error": None,
             }
         error = errors.get(scene.scene) or (
@@ -444,7 +444,9 @@ def stage_orbits(
             "orbit_path": None,
             "valid_start": None,
             "valid_stop": None,
-            "status": "failed" if error is not None else "missing",
+            "status": (
+                DownloadStatus.failed if error is not None else DownloadStatus.missing
+            ),
             "error": error,
         }
 
@@ -506,7 +508,7 @@ def stage_orbits(
                         pool.shutdown(wait=False, cancel_futures=True)
                         raise
 
-    staged_now = sum(1 for row in rows if row["status"] == "staged")
+    staged_now = sum(1 for row in rows if row["status"] == DownloadStatus.staged)
     messages = [
         f"Orbit staging: {staged_now} scene(s) resolved, {len(reused)} reused, "
         f"{len(needed) - len(failed_files)} file(s) downloaded, "

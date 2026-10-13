@@ -59,11 +59,36 @@ class CacheNamespace:
     def store(
         self, root: Path | None = None, *, read_only: bool = False
     ) -> RowStore:
-        """Open this keyed-row namespace as a :class:`RowStore`."""
+        """Open this keyed-row namespace as a :class:`RowStore` under ``root``."""
+        return self.store_at(self.path(root), read_only=read_only)
+
+    def store_at(self, path: Path, *, read_only: bool = False) -> RowStore:
+        """Open this keyed-row namespace at an explicit file path.
+
+        Use this when a caller overrides the default location (for example a
+        ``state_file`` argument) but must keep the namespace's key and version.
+
+        Parameters
+        ----------
+        path : pathlib.Path
+            Base Parquet file of the store.
+        read_only : bool, default False
+            Open without write access.
+
+        Returns
+        -------
+        RowStore
+            Store keyed by this namespace's ``key_columns``.
+
+        Raises
+        ------
+        ValueError
+            If the namespace is not a keyed-row table.
+        """
         if not self.key_columns:
             raise ValueError(f"Cache namespace {self.name!r} is not a keyed-row table")
         return RowStore(
-            self.path(root),
+            Path(path),
             list(self.key_columns),
             version=self.version,
             read_only=read_only,

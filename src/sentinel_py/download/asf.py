@@ -18,8 +18,14 @@ from asf_search.exceptions import ASFAuthenticationError
 from shapely import wkt
 from shapely.geometry.polygon import orient
 
-from sentinel_py.cache import REGISTRY, RowStore
-from sentinel_py.enums import ASFBeamMode, ASFPolarization, ASFProductLevel
+from sentinel_py.cache import REGISTRY
+from sentinel_py.enums import (
+    ASFBeamMode,
+    ASFPolarization,
+    ASFProductLevel,
+    DownloadAction,
+    DownloadStatus,
+)
 from sentinel_py.download.base import (
     DownloadSummary,
     part_path,
@@ -466,7 +472,7 @@ def _verified_fingerprint_matches(
             cached_mtime_ns is not None and abs(cached_mtime_ns - local_mtime_ns) <= 256
         )
     return (
-        cached.get("status") == "complete"
+        cached.get("status") == DownloadStatus.complete
         and str(cached.get("filename")) == filename
         and _optional_int(cached.get("local_actual_size")) == actual_size
         and mtime_matches
@@ -513,7 +519,7 @@ def download_asf(
         return DownloadSummary(0, 0, 0, ["No ASF URLs to download."])
 
     state_file = state_file or REGISTRY["asf_downloads"].path(out_dir)
-    state_store = RowStore(state_file, ["url"])
+    state_store = REGISTRY["asf_downloads"].store_at(state_file)
     state = state_store.read()
     if state.empty:
         state = pd.DataFrame(columns=ASF_DOWNLOAD_STATE_COLUMNS)
@@ -592,7 +598,7 @@ def download_asf(
                 cached_matches = (
                     expected is None
                     and expected_md5 is None
-                    and cached.get("status") == "complete"
+                    and cached.get("status") == DownloadStatus.complete
                     and _optional_int(cached.get("local_actual_size")) == actual
                 )
                 checksum_only_matches = expected is None and expected_md5 is not None
@@ -608,8 +614,8 @@ def download_asf(
                         expected_size=expected,
                         actual_size=actual,
                         local_mtime_ns=local_mtime_ns,
-                        status="complete",
-                        last_action="skipped",
+                        status=DownloadStatus.complete,
+                        last_action=DownloadAction.skipped,
                     )
 
 
@@ -658,8 +664,8 @@ def download_asf(
                 expected_size=expected,
                 actual_size=actual,
                 local_mtime_ns=local_mtime_ns,
-                status="complete",
-                last_action="downloaded",
+                status=DownloadStatus.complete,
+                last_action=DownloadAction.downloaded,
             )
         except Exception as error:
             actual = partial.stat().st_size if partial.exists() else None
@@ -670,8 +676,8 @@ def download_asf(
                 expected_size=expected,
                 actual_size=actual,
                 local_mtime_ns=None,
-                status="failed",
-                last_action="failed",
+                status=DownloadStatus.failed,
+                last_action=DownloadAction.failed,
                 error=str(error),
             )
 

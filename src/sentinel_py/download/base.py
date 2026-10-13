@@ -25,6 +25,8 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 
+from sentinel_py.enums import DownloadAction
+
 T = TypeVar("T")
 
 
@@ -255,9 +257,9 @@ def run_download_pool(
                     row = future.result()
                     sink.add([row])
                     action = row["last_action"]
-                    if action == "downloaded":
+                    if action == DownloadAction.downloaded:
                         downloaded += 1
-                    elif action == "skipped":
+                    elif action == DownloadAction.skipped:
                         skipped += 1
                     else:
                         failed += 1

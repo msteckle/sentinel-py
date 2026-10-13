@@ -18,7 +18,8 @@ from shapely.geometry import base as shapely_base
 from shapely.geometry import shape
 
 from sentinel_py.aoi import atomic_aoi_geometries
-from sentinel_py.cache import REGISTRY, RowStore
+from sentinel_py.cache import REGISTRY
+from sentinel_py.enums import DownloadAction, DownloadStatus
 from sentinel_py.download.base import (
     DownloadSummary,
     part_path,
@@ -228,7 +229,7 @@ def select_cached_tiles(
     selected = selected.drop(columns=["_geometry"])
     if state_file is not None:
         # Includes checkpoint parts left by an interrupted download.
-        state = RowStore(Path(state_file), ["url"]).read()
+        state = REGISTRY["pgc_downloads"].store_at(state_file).read()
         if not state.empty and "url" in state.columns:
             state = state.drop_duplicates("url", keep="last")
             selected = selected.merge(
@@ -309,7 +310,7 @@ def download_arcticdem(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     state_file = state_file or REGISTRY["pgc_downloads"].path(out_dir)
-    state_store = RowStore(state_file, ["url"])
+    state_store = REGISTRY["pgc_downloads"].store_at(state_file)
     state = state_store.read()
     if state.empty:
         state = pd.DataFrame(columns=PGC_DOWNLOAD_STATE_COLUMNS)
@@ -336,7 +337,7 @@ def download_arcticdem(
             if target.is_file():
                 actual = target.stat().st_size
                 cached_complete = (
-                    cached.get("status") == "complete"
+                    cached.get("status") == DownloadStatus.complete
                     and cached.get("local_actual_size") == actual
                 )
                 if (expected is not None and actual == expected) or (
@@ -347,8 +348,8 @@ def download_arcticdem(
                         path=str(target),
                         local_actual_size=actual,
                         local_mtime_ns=target.stat().st_mtime_ns,
-                        status="complete",
-                        last_action="skipped",
+                        status=DownloadStatus.complete,
+                        last_action=DownloadAction.skipped,
                     )
 
             def fetch() -> int:
@@ -380,8 +381,8 @@ def download_arcticdem(
                 path=str(target),
                 local_actual_size=actual,
                 local_mtime_ns=stat.st_mtime_ns,
-                status="complete",
-                last_action="downloaded",
+                status=DownloadStatus.complete,
+                last_action=DownloadAction.downloaded,
             )
         except Exception as error:
             partial.unlink(missing_ok=True)
@@ -389,8 +390,8 @@ def download_arcticdem(
             return _state_row(
                 product,
                 path=str(target),
-                status="failed",
-                last_action="failed",
+                status=DownloadStatus.failed,
+                last_action=DownloadAction.failed,
                 error=str(error),
             )
 

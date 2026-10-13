@@ -1,9 +1,12 @@
 """Storage information shared by provider download implementations."""
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
+import pandas as pd
 import typer
 
 # Two-sided 95% normal quantile used for estimate error bars.
@@ -41,6 +44,54 @@ class DownloadStorageSummary:
     total_scenes: int = 0
     total_ci95_bytes: int = 0
     additional_ci95_bytes: int = 0
+
+
+def manifest_storage_summary(
+    products: pd.DataFrame,
+    outdir: Path,
+    *,
+    filename_of: Callable[[dict[str, Any]], str],
+    expected_size_of: Callable[[dict[str, Any]], int | None],
+) -> DownloadStorageSummary:
+    """Summarize known final and additional bytes for a download manifest.
+
+    Parameters
+    ----------
+    products : pandas.DataFrame
+        Manifest rows, one per file.
+    outdir : pathlib.Path
+        Directory the files will be downloaded into.
+    filename_of : Callable[[dict], str]
+        Maps a manifest row to its local file name.
+    expected_size_of : Callable[[dict], int | None]
+        Maps a manifest row to its expected size in bytes, or ``None`` if unknown.
+
+    Returns
+    -------
+    DownloadStorageSummary
+        Totals; files already present at their expected size need no additional
+        space, and rows without a positive expected size count as unknown.
+    """
+    known_total = known_additional = unknown = 0
+    for product in products.to_dict("records"):
+        expected = expected_size_of(product)
+        if expected is None or expected <= 0:
+            unknown += 1
+            continue
+        known_total += expected
+        target = outdir / filename_of(product)
+        try:
+            complete = target.is_file() and target.stat().st_size == expected
+        except OSError:
+            complete = False
+        if not complete:
+            known_additional += expected
+    return DownloadStorageSummary(
+        asset_count=len(products),
+        known_total_bytes=known_total,
+        known_additional_bytes=known_additional,
+        unknown_size_assets=unknown,
+    )
 
 
 def extrapolate_total(values: Sequence[float], population: int) -> tuple[float, float]:

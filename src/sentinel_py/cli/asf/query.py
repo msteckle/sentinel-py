@@ -1,10 +1,11 @@
+"""CLI command for querying ASF Sentinel-1 products and caching a manifest."""
+
 import calendar
 import datetime as dt
 import json
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated
 
-import geopandas as gpd
 import pandas as pd
 import typer
 from shapely.geometry import MultiPoint
@@ -18,18 +19,30 @@ from sentinel_py.cache import (
     write_json_atomic,
     write_parquet_atomic,
 )
+from sentinel_py.cli.options import (
+    PANEL_QUERY,
+    PANEL_REQUIRED,
+    EPeriodOpt,
+    LogOpt,
+    SPeriodOpt,
+    VerboseOpt,
+    YearsOpt,
+    cache_dir_option,
+    load_aoi_geometries,
+    parse_years,
+    validate_season,
+)
 from sentinel_py.download.asf import (
     get_predominant_flightdir,
     query_asf,
 )
-from sentinel_py.download.pgc import atomic_aoi_geometries
 from sentinel_py.enums import (
     ASFBeamMode,
     ASFOrbitDirection,
     ASFPolarization,
     ASFProductLevel,
 )
-from sentinel_py.log import DEFAULT_LOG_DIR, get_logger
+from sentinel_py.log import get_logger
 
 app = typer.Typer()
 
@@ -55,32 +68,12 @@ def query(
             help="The AOI file used to filter the query (GeoJSON, shapefile, etc.).",
             exists=True,
             dir_okay=False,
-            rich_help_panel="Required Arguments",
+            rich_help_panel=PANEL_REQUIRED,
         ),
     ],
-    years: Annotated[
-        str,
-        typer.Option(
-            help="Space- or comma-separated list of years.",
-            rich_help_panel="Required Arguments",
-        ),
-    ],
-    speriod: Annotated[
-        dt.datetime,
-        typer.Option(
-            help="Start month and day of seasonal query window.",
-            formats=["%m-%d", "%m/%d", "%m %d", "%b-%d", "%b %d", "%B-%d", "%B %d"],
-            rich_help_panel="Optional Query Configurations",
-        ),
-    ] = dt.datetime(2000, 1, 1),
-    eperiod: Annotated[
-        dt.datetime,
-        typer.Option(
-            help="End month and day of seasonal query window.",
-            formats=["%m-%d", "%m/%d", "%m %d", "%b-%d", "%b %d", "%B-%d", "%B %d"],
-            rich_help_panel="Optional Query Configurations",
-        ),
-    ] = dt.datetime(2000, 12, 31),
+    years: YearsOpt,
+    speriod: SPeriodOpt = dt.datetime(2000, 1, 1),
+    eperiod: EPeriodOpt = dt.datetime(2000, 12, 31),
     product_levels: Annotated[
         ASFProductLevel,
         typer.Option(
@@ -90,7 +83,7 @@ def query(
                 "and archive history. Source: ASF Search API keyword reference."
             ),
             case_sensitive=False,
-            rich_help_panel="Optional Query Configurations",
+            rich_help_panel=PANEL_QUERY,
         ),
     ] = ASFProductLevel.grd_hd,
     beam_mode: Annotated[
@@ -102,7 +95,7 @@ def query(
                 "Source: ESA Sentinel-1 Mission."
             ),
             case_sensitive=False,
-            rich_help_panel="Optional Query Configurations",
+            rich_help_panel=PANEL_QUERY,
         ),
     ] = ASFBeamMode.iw,
     flight_direction: Annotated[
@@ -113,7 +106,7 @@ def query(
                 "The default retains both directions."
             ),
             case_sensitive=False,
-            rich_help_panel="Optional Query Configurations",
+            rich_help_panel=PANEL_QUERY,
         ),
     ] = ASFOrbitDirection.both,
     polarization: Annotated[
@@ -126,34 +119,27 @@ def query(
                 "Sentinel-1 Mission."
             ),
             case_sensitive=False,
-            rich_help_panel="Optional Query Configurations",
+            rich_help_panel=PANEL_QUERY,
         ),
     ] = ASFPolarization.vv_vh,
     relative_orbit: Annotated[
-        Optional[int],
+        int | None,
         typer.Option(
             help="Optionally restrict Sentinel-1 relative orbit.",
             min=1,
             max=175,
-            rich_help_panel="Optional Query Configurations",
+            rich_help_panel=PANEL_QUERY,
         ),
     ] = None,
     max_results: Annotated[
-        Optional[int],
+        int | None,
         typer.Option(
             help="Optionally set the maximum result count for the complete query.",
             min=1,
-            rich_help_panel="Optional Query Configurations",
+            rich_help_panel=PANEL_QUERY,
         ),
     ] = None,
-    cache_dir: Annotated[
-        Path,
-        typer.Option(
-            help=(f"ASF query cache root. Defaults to {DEFAULT_ASF_CACHE_DIR}."),
-            file_okay=False,
-            rich_help_panel="Utils",
-        ),
-    ] = DEFAULT_ASF_CACHE_DIR,
+    cache_dir: cache_dir_option("ASF", DEFAULT_ASF_CACHE_DIR) = DEFAULT_ASF_CACHE_DIR,
     crs: Annotated[
         str,
         typer.Option(
@@ -161,39 +147,15 @@ def query(
             rich_help_panel="Utils",
         ),
     ] = "EPSG:4326",
-    log: Annotated[
-        Optional[Path],
-        typer.Option(
-            help=(
-                "Log file path for query execution logs. If omitted, logs are saved to "
-                f"{DEFAULT_LOG_DIR}."
-            ),
-            rich_help_panel="Utils",
-        ),
-    ] = None,
-    verbose: Annotated[
-        bool,
-        typer.Option(
-            help="Enable verbose logging to the console and log file.",
-            rich_help_panel="Utils",
-        ),
-    ] = False,
-):
+    log: LogOpt = None,
+    verbose: VerboseOpt = False,
+) -> None:
+    """Query ASF for Sentinel-1 products and cache a download manifest."""
     logger = get_logger(name="asf_query_logger", logpath=log, verbose=verbose)
 
     # Validate inputs
-    try:
-        parsed_years = sorted({int(year) for year in years.replace(",", " ").split()})
-    except ValueError as error:
-        raise typer.BadParameter(f"Could not parse years: {error}") from error
-    if not parsed_years:
-        raise typer.BadParameter("--years must contain at least one year")
-    if any(year < 1 or year > 9999 for year in parsed_years):
-        raise typer.BadParameter("--years values must be between 1 and 9999")
-    if (eperiod.month, eperiod.day) < (speriod.month, speriod.day):
-        raise typer.BadParameter(
-            "--eperiod must be on or after --speriod within each year"
-        )
+    parsed_years = parse_years(years)
+    validate_season(speriod, eperiod)
 
     query_windows = [
         (
@@ -205,14 +167,7 @@ def query(
     query_range = (query_windows[0][0], query_windows[-1][1])
     season = [_season_day(speriod), _season_day(eperiod)]
 
-    aoi_gdf = gpd.read_file(aoi)
-    if aoi_gdf.empty:
-        raise typer.BadParameter(f"AOI contains no features: {aoi}")
-    if aoi_gdf.crs is None:
-        aoi_gdf = aoi_gdf.set_crs(crs)
-    aoi_components = atomic_aoi_geometries(aoi_gdf.to_crs("EPSG:4326").geometry)
-    if not aoi_components:
-        raise typer.BadParameter(f"AOI contains no usable geometries: {aoi}")
+    aoi_components = load_aoi_geometries(aoi, crs)
     if all(geometry.geom_type == "Point" for geometry in aoi_components):
         # ASF's point OR query is compact and avoids creating an enormous
         # polygon envelope around widely separated sample points.

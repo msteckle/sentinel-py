@@ -1,3 +1,5 @@
+"""CLI command for downloading Sentinel-2 assets from CDSE S3 storage."""
+
 import configparser
 import time
 from pathlib import Path
@@ -7,9 +9,18 @@ import pandas as pd
 import typer
 
 from sentinel_py.cache import DEFAULT_CDSE_CACHE_DIR, REGISTRY
+from sentinel_py.cli.options import (
+    PANEL_DOWNLOAD,
+    PANEL_REQUIRED,
+    LogOpt,
+    VerboseOpt,
+    YesOpt,
+    cache_dir_option,
+    echo_summary,
+)
 from sentinel_py.download.preflight import confirm_download, echo_storage_summary
 from sentinel_py.enums import S2DownloadAssets, S2Res
-from sentinel_py.log import DEFAULT_LOG_DIR, get_logger
+from sentinel_py.log import get_logger
 
 app = typer.Typer()
 
@@ -30,6 +41,7 @@ REQUIRED_S5_CONFIG_KEYS = (
 
 
 def _s5_config_error(config: Path, reason: str) -> typer.BadParameter:
+    """Build the S3 credential setup guidance shown for an invalid s5cmd file."""
     return typer.BadParameter(
         f"Invalid CDSE S3 configuration: {reason}\n\n"
         "CDSE catalogue login credentials are not S3 credentials. Generate an "
@@ -77,7 +89,7 @@ def download(
         typer.Option(
             help="Mission name. Currently only Sentinel-2 (S2) is fully supported and "
             "tested.",
-            rich_help_panel="Required Arguments",
+            rich_help_panel=PANEL_REQUIRED,
         ),
     ],
     bands: Annotated[
@@ -87,7 +99,7 @@ def download(
                 "Space- or comma-separated Sentinel-2 assets: B01-B12, B8A, SCL, "
                 "TCI, AOT, or WVP."
             ),
-            rich_help_panel="Required Arguments",
+            rich_help_panel=PANEL_REQUIRED,
         ),
     ],
     outdir: Annotated[
@@ -95,7 +107,7 @@ def download(
         typer.Option(
             help=("Output directory for downloaded files. Must exist and be writable."),
             file_okay=False,
-            rich_help_panel="Required Arguments",
+            rich_help_panel=PANEL_REQUIRED,
         ),
     ],
     res: Annotated[
@@ -105,7 +117,7 @@ def download(
                 "Target resolution in meters for the bands to download. Only used "
                 "for Sentinel-2. Options: 10, 20, or 60."
             ),
-            rich_help_panel="Required Arguments",
+            rich_help_panel=PANEL_REQUIRED,
         ),
     ],
     config: Annotated[
@@ -115,7 +127,7 @@ def download(
                 "Path to an INI file containing CDSE S3 credentials. If the file is "
                 "missing or malformed, setup instructions are displayed."
             ),
-            rich_help_panel="Required Arguments",
+            rich_help_panel=PANEL_REQUIRED,
         ),
     ],
     query: Annotated[
@@ -124,7 +136,7 @@ def download(
             help=("Path to a cache of CDSE query results stored as a parquet."),
             exists=True,
             dir_okay=False,
-            rich_help_panel="Optional Download Configurations",
+            rich_help_panel=PANEL_DOWNLOAD,
         ),
     ] = None,
     parallel_scenes: Annotated[
@@ -132,7 +144,7 @@ def download(
         typer.Option(
             help="Number of scenes to download in parallel.",
             min=1,
-            rich_help_panel="Optional Download Configurations",
+            rich_help_panel=PANEL_DOWNLOAD,
         ),
     ] = 2,
     parallel_bands: Annotated[
@@ -140,7 +152,7 @@ def download(
         typer.Option(
             help="Number of bands to download in parallel within each scene.",
             min=1,
-            rich_help_panel="Optional Download Configurations",
+            rich_help_panel=PANEL_DOWNLOAD,
         ),
     ] = 4,
     estimate_sample_size: Annotated[
@@ -152,7 +164,7 @@ def download(
                 "larger than the sample are resolved exactly."
             ),
             min=1,
-            rich_help_panel="Optional Download Configurations",
+            rich_help_panel=PANEL_DOWNLOAD,
         ),
     ] = 200,
     skip_storage_estimate: Annotated[
@@ -164,48 +176,15 @@ def download(
                 "resolves each scene as it runs, and still asks for confirmation "
                 "unless --yes is given."
             ),
-            rich_help_panel="Optional Download Configurations",
+            rich_help_panel=PANEL_DOWNLOAD,
         ),
     ] = False,
-    yes: Annotated[
-        bool,
-        typer.Option(
-            "--yes",
-            "-y",
-            help="Skip the interactive download confirmation.",
-            rich_help_panel="Optional Download Configurations",
-        ),
-    ] = False,
-    cache_dir: Annotated[
-        Path,
-        typer.Option(
-            help=(
-                "CDSE query and remote-asset cache root. Defaults to "
-                f"{DEFAULT_CDSE_CACHE_DIR}."
-            ),
-            file_okay=False,
-            rich_help_panel="Utils",
-        ),
-    ] = DEFAULT_CDSE_CACHE_DIR,
-    log: Annotated[
-        Path | None,
-        typer.Option(
-            help=(
-                "Log file path for download execution logs. If omitted, logs are saved "
-                f"to {DEFAULT_LOG_DIR}."
-            ),
-            rich_help_panel="Utils",
-        ),
-    ] = None,
-    verbose: Annotated[
-        bool,
-        typer.Option(
-            help="Enable verbose logging to the console and log file.",
-            rich_help_panel="Utils",
-        ),
-    ] = False,
-):
-
+    yes: YesOpt = False,
+    cache_dir: cache_dir_option("CDSE", DEFAULT_CDSE_CACHE_DIR) = DEFAULT_CDSE_CACHE_DIR,
+    log: LogOpt = None,
+    verbose: VerboseOpt = False,
+) -> None:
+    """Download selected Sentinel-2 assets for a cached CDSE query manifest."""
     from sentinel_py.download.cdse import (
         find_latest_scenes_cache,
         prepare_cdse_download,
@@ -234,7 +213,7 @@ def download(
     resolution_value = int(res.value)
 
     # Set up logging
-    logger = get_logger(name="download_logger", logpath=log, verbose=verbose)
+    logger = get_logger(name="cdse_download_logger", logpath=log, verbose=verbose)
 
     # Validate inputs
     if query is None:
@@ -306,15 +285,16 @@ def download(
     failed = sum(len(result.failed) for result in (results or []))
     status_file = REGISTRY["cdse_downloads"].path(outdir)
 
-    typer.echo("Summary:")
-    typer.echo(f"  Download started: {started_text}")
-    typer.echo(f"  Download ended:   {ended_text}")
-    typer.echo(f"  Elapsed time:     {elapsed:.1f} seconds for {scene_count} scenes")
-    typer.echo(
-        f"  Results:          {downloaded} downloaded, {skipped} skipped, "
-        f"{failed} failed"
+    echo_summary(
+        [
+            f"Download started: {started_text}",
+            f"Download ended:   {ended_text}",
+            f"Elapsed time:     {elapsed:.1f} seconds for {scene_count} scenes",
+            f"Results:          {downloaded} downloaded, {skipped} skipped, "
+            f"{failed} failed",
+            f"Download status:  {status_file}",
+        ]
     )
-    typer.echo(f"  Download status:  {status_file}")
 
     # Report any failed downloads
     failures = [

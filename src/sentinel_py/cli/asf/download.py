@@ -1,23 +1,35 @@
+"""CLI command for downloading ASF Sentinel-1 products and staging orbit files."""
+
 from pathlib import Path
 from typing import Annotated
 
-import pandas as pd
 import typer
 
-from sentinel_py.cache import DEFAULT_ASF_CACHE_DIR, find_latest_cache_file
+from sentinel_py.cache import DEFAULT_ASF_CACHE_DIR
+from sentinel_py.cli.options import (
+    PANEL_DOWNLOAD,
+    PANEL_REQUIRED,
+    LogOpt,
+    VerboseOpt,
+    YesOpt,
+    cache_dir_option,
+    echo_summary,
+    load_manifest,
+)
 from sentinel_py.download.asf import (
-    product_filename,
     download_asf,
     earthdata_netrc_credentials,
+    expected_product_size,
+    product_filename,
 )
-from sentinel_py.download.s1_orbits import stage_orbits
 from sentinel_py.download.preflight import (
-    DownloadStorageSummary,
     confirm_download,
     echo_storage_summary,
+    manifest_storage_summary,
 )
+from sentinel_py.download.s1_orbits import stage_orbits
 from sentinel_py.enums import S1OrbitPolicy
-from sentinel_py.log import DEFAULT_LOG_DIR, get_logger
+from sentinel_py.log import get_logger
 
 app = typer.Typer()
 
@@ -27,6 +39,7 @@ EARTHDATA_CONFIG_EXAMPLE = """machine urs.earthdata.nasa.gov
 
 
 def _earthdata_config_error(config: Path) -> typer.BadParameter:
+    """Build the setup guidance shown for a missing or invalid Earthdata file."""
     return typer.BadParameter(
         f"Invalid Earthdata credentials file: {config}\n\n"
         "Create a netrc-format file with:\n\n"
@@ -37,47 +50,9 @@ def _earthdata_config_error(config: Path) -> typer.BadParameter:
 
 
 def _validate_earthdata_config(config: Path) -> None:
+    """Raise ``BadParameter`` unless the netrc file holds Earthdata credentials."""
     if earthdata_netrc_credentials(config) is None:
         raise _earthdata_config_error(config)
-
-
-def _storage_summary(products: pd.DataFrame, outdir: Path) -> DownloadStorageSummary:
-    """Calculate known final and additional bytes for an ASF manifest."""
-    known_total = 0
-    known_additional = 0
-    unknown = 0
-
-    for product in products.to_dict("records"):
-        expected = product.get("expected_size")
-        if expected is None or pd.isna(expected):
-            size_mb = product.get("sizeMB")
-            expected = (
-                round(float(size_mb) * 1024 * 1024)
-                if size_mb is not None and not pd.isna(size_mb)
-                else None
-            )
-        expected = int(expected) if expected is not None else None
-        if expected is None or expected <= 0:
-            unknown += 1
-            continue
-
-        known_total += expected
-        local_path = outdir / product_filename(product)
-        try:
-            already_complete = (
-                local_path.is_file() and local_path.stat().st_size == expected
-            )
-        except OSError:
-            already_complete = False
-        if not already_complete:
-            known_additional += expected
-
-    return DownloadStorageSummary(
-        asset_count=len(products),
-        known_total_bytes=known_total,
-        known_additional_bytes=known_additional,
-        unknown_size_assets=unknown,
-    )
 
 
 @app.command(help="Download products from an explicit or cached ASF query manifest.")
@@ -86,7 +61,7 @@ def download(
         Path,
         typer.Option(
             help="Directory in which downloaded products will be stored.",
-            rich_help_panel="Required Arguments",
+            rich_help_panel=PANEL_REQUIRED,
         ),
     ],
     config: Annotated[
@@ -97,7 +72,7 @@ def download(
             ),
             exists=True,
             dir_okay=False,
-            rich_help_panel="Required Arguments",
+            rich_help_panel=PANEL_REQUIRED,
         ),
     ],
     query: Annotated[
@@ -106,7 +81,7 @@ def download(
             help="Explicit ASF manifest.parquet instead of the latest cached query.",
             exists=True,
             dir_okay=False,
-            rich_help_panel="Optional Download Configurations",
+            rich_help_panel=PANEL_DOWNLOAD,
         ),
     ] = None,
     processes: Annotated[
@@ -115,7 +90,7 @@ def download(
             help="Number of parallel ASF downloads.",
             min=1,
             max=8,
-            rich_help_panel="Optional Download Configurations",
+            rich_help_panel=PANEL_DOWNLOAD,
         ),
     ] = 4,
     retries: Annotated[
@@ -123,7 +98,7 @@ def download(
         typer.Option(
             help="Retry attempts per product after a transient download failure.",
             min=0,
-            rich_help_panel="Optional Download Configurations",
+            rich_help_panel=PANEL_DOWNLOAD,
         ),
     ] = 3,
     orbits: Annotated[
@@ -137,70 +112,28 @@ def download(
                 "or none."
             ),
             case_sensitive=False,
-            rich_help_panel="Optional Download Configurations",
+            rich_help_panel=PANEL_DOWNLOAD,
         ),
     ] = S1OrbitPolicy.precise_or_restituted,
-    yes: Annotated[
-        bool,
-        typer.Option(
-            "--yes",
-            "-y",
-            help="Skip the interactive download confirmation.",
-            rich_help_panel="Optional Download Configurations",
-        ),
-    ] = False,
-    cache_dir: Annotated[
-        Path,
-        typer.Option(
-            help=(f"ASF query cache root. Defaults to {DEFAULT_ASF_CACHE_DIR}."),
-            file_okay=False,
-            rich_help_panel="Utils",
-        ),
-    ] = DEFAULT_ASF_CACHE_DIR,
-    log: Annotated[
-        Path | None,
-        typer.Option(
-            help=(
-                "Log file path for download execution logs. If omitted, logs are saved "
-                f"to {DEFAULT_LOG_DIR}."
-            ),
-            rich_help_panel="Utils",
-        ),
-    ] = None,
-    verbose: Annotated[
-        bool,
-        typer.Option(
-            help="Enable verbose logging to the console and log file.",
-            rich_help_panel="Utils",
-        ),
-    ] = False,
-):
+    yes: YesOpt = False,
+    cache_dir: cache_dir_option("ASF", DEFAULT_ASF_CACHE_DIR) = DEFAULT_ASF_CACHE_DIR,
+    log: LogOpt = None,
+    verbose: VerboseOpt = False,
+) -> None:
+    """Download an ASF manifest, then stage Sentinel-1 orbit files for SNAP."""
     # Validate inputs
     _validate_earthdata_config(config)
     logger = get_logger(name="asf_download_logger", logpath=log, verbose=verbose)
 
-    manifest = query
-    if manifest is None:
-        manifest = find_latest_cache_file(cache_dir, "manifest.parquet")
-        if manifest is None:
-            raise typer.BadParameter(
-                f"No cached ASF query manifest found in {cache_dir}. "
-                "Run 'sentinel-py asf query' before downloading."
-            )
-        logger.info("Using most recent cached ASF query: %s", manifest)
-    else:
-        logger.info("Using explicit ASF query manifest: %s", manifest)
-    typer.echo(f"Cached query: {manifest}")
-    products = pd.read_parquet(manifest)
-    if "url" not in products.columns:
-        raise typer.BadParameter(
-            f"ASF query manifest is missing the required 'url' column: {manifest}"
-        )
-    products = (
-        products.dropna(subset=["url"])
-        .drop_duplicates(subset=["url"])
-        .reset_index(drop=True)
+    manifest, products = load_manifest(
+        query, cache_dir, provider="ASF", query_command="sentinel-py asf query"
     )
+    logger.info(
+        "Using %s ASF query manifest: %s",
+        "explicit" if query is not None else "most recent cached",
+        manifest,
+    )
+    typer.echo(f"Cached query: {manifest}")
     if products.empty:
         logger.info("Manifest contains no ASF URLs; nothing to download: %s", manifest)
         typer.echo("Found 0 scenes: 0 ZIP files")
@@ -208,7 +141,12 @@ def download(
 
     zip_label = "ZIP file" if len(products) == 1 else "ZIP files"
     typer.echo(f"Found {len(products)} scenes: {len(products)} {zip_label}")
-    storage = _storage_summary(products, outdir)
+    storage = manifest_storage_summary(
+        products,
+        outdir,
+        filename_of=product_filename,
+        expected_size_of=expected_product_size,
+    )
     echo_storage_summary(storage)
     logger.info(
         "ASF download preflight: manifest=%s assets=%d known_total_bytes=%d "
@@ -238,9 +176,7 @@ def download(
         retries=retries,
         logger=logger,
     )
-    typer.echo("Summary:")
-    for message in summary:
-        typer.echo(f"  {message}")
+    echo_summary(summary)
 
     # Orbit files are tiny and public, so stage them in the networked download
     # stage; compute nodes can then run SNAP without network access.

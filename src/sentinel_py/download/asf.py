@@ -345,7 +345,7 @@ def _optional_int(value) -> int | None:
     return int(value)
 
 
-def _expected_product_size(product: dict) -> int | None:
+def expected_product_size(product: dict) -> int | None:
     """Return the manifest's expected byte size (``expected_size`` or ``sizeMB``)."""
     expected = _optional_int(product.get("expected_size"))
     if expected is not None:
@@ -561,7 +561,7 @@ def download_asf(
         filename = product_filename(product)
         target = out_dir / filename
         partial = part_path(out_dir, filename)
-        expected = _expected_product_size(product)
+        expected = expected_product_size(product)
         expected_md5 = _expected_product_md5(product)
         cached = state_by_url.get(url, {})
         logger.debug("Checking ASF product %s", filename)

@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 from shapely.geometry import box, mapping
 
+from sentinel_py.aoi import atomic_aoi_geometries
 from sentinel_py.download import pgc
 
 
@@ -79,7 +80,7 @@ def test_query_arcticdem_queries_disjoint_points_independently(monkeypatch):
 
 
 def test_atomic_aoi_geometries_flattens_multipart_and_deduplicates():
-    geometries = pgc.atomic_aoi_geometries(
+    geometries = atomic_aoi_geometries(
         [box(0, 0, 1, 1), box(0, 0, 1, 1), box(5, 5, 6, 6).boundary]
     )
 

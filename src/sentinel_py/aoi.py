@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
@@ -449,3 +450,41 @@ def overlay_latlon_grid(
         grid.to_file(outpath, driver="GeoJSON")
 
     return grid
+
+
+def atomic_aoi_geometries(
+    geometries: Iterable[BaseGeometry],
+) -> list[BaseGeometry]:
+    """Flatten and validate AOI geometries for independent provider searches.
+
+    Multi-part geometries are split into their component geometries so globally
+    separated points or polygons never become one enclosing bounding box.
+
+    Parameters
+    ----------
+    geometries : iterable of shapely geometries
+        AOI feature geometries in WGS84.
+
+    Returns
+    -------
+    list of shapely geometries
+        Non-empty atomic geometries in deterministic WKT order.
+    """
+    components: list[BaseGeometry] = []
+
+    def add(geometry: BaseGeometry) -> None:
+        """Collect non-empty atomic parts of a geometry, recursing into collections."""
+        if geometry.is_empty:
+            return
+        if geometry.geom_type == "GeometryCollection" or geometry.geom_type.startswith(
+            "Multi"
+        ):
+            for part in geometry.geoms:
+                add(part)
+            return
+        components.append(geometry)
+
+    for geometry in geometries:
+        add(geometry)
+    unique = {geometry.wkt: geometry for geometry in components}
+    return [unique[key] for key in sorted(unique)]

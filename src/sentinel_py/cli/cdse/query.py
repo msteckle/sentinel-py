@@ -1,10 +1,24 @@
+"""CLI command for querying Sentinel-2 scenes from CDSE."""
+
 import datetime as dt
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated
 
 import typer
 
 from sentinel_py.cache import DEFAULT_CDSE_CACHE_DIR
+from sentinel_py.cli.options import (
+    PANEL_QUERY,
+    PANEL_REQUIRED,
+    EPeriodOpt,
+    LogOpt,
+    SPeriodOpt,
+    VerboseOpt,
+    YearsOpt,
+    cache_dir_option,
+    parse_years,
+    validate_season,
+)
 from sentinel_py.enums import (
     CDSECollections,
     CDSEOrbitDirs,
@@ -15,7 +29,7 @@ from sentinel_py.enums import (
     validate_sensor_mode,
     validate_serial_id,
 )
-from sentinel_py.log import DEFAULT_LOG_DIR, get_logger
+from sentinel_py.log import get_logger
 
 app = typer.Typer()
 
@@ -34,41 +48,21 @@ def query(
             help="The aoi file used to filter the query (GeoJSON, shapefile, etc.).",
             exists=True,
             dir_okay=False,
-            rich_help_panel="Required Arguments",
+            rich_help_panel=PANEL_REQUIRED,
         ),
     ],
     crs: Annotated[
         str,
         typer.Option(
             help="CRS of the input aoi file.",
-            rich_help_panel="Required Arguments",
+            rich_help_panel=PANEL_REQUIRED,
         ),
     ],
-    years: Annotated[
-        str,
-        typer.Option(
-            help="Space- or comma-separated list of years.",
-            rich_help_panel="Required Arguments",
-        ),
-    ],
-    speriod: Annotated[
-        dt.datetime,
-        typer.Option(
-            help="Start month and day of seasonal query window.",
-            formats=["%m-%d", "%m/%d", "%m %d", "%b-%d", "%b %d", "%B-%d", "%B %d"],
-            rich_help_panel="Optional Query Configurations",
-        ),
-    ] = dt.datetime(2000, 1, 1),
-    eperiod: Annotated[
-        dt.datetime,
-        typer.Option(
-            help="End month and day of seasonal query window.",
-            formats=["%m-%d", "%m/%d", "%m %d", "%b-%d", "%b %d", "%B-%d", "%B %d"],
-            rich_help_panel="Optional Query Configurations",
-        ),
-    ] = dt.datetime(2000, 12, 31),
+    years: YearsOpt,
+    speriod: SPeriodOpt = dt.datetime(2000, 1, 1),
+    eperiod: EPeriodOpt = dt.datetime(2000, 12, 31),
     product: Annotated[
-        Optional[S2Products],
+        S2Products | None,
         typer.Option(
             help=(
                 "Sentinel-2 product type: S2MSI1C (Level-1C top-of-atmosphere "
@@ -77,11 +71,11 @@ def query(
                 "Source: CDSE catalogue and ESA Sentinel-2 User Guides."
             ),
             case_sensitive=False,
-            rich_help_panel="Optional Query Configurations",
+            rich_help_panel=PANEL_QUERY,
         ),
     ] = None,
     orbit: Annotated[
-        Optional[CDSEOrbitDirs],
+        CDSEOrbitDirs | None,
         typer.Option(
             help=(
                 "Orbit direction: ASCENDING or DESCENDING. Sentinel-2 nominal imaging "
@@ -89,11 +83,11 @@ def query(
                 "be set. Source: ESA Sentinel-2 mission documentation."
             ),
             case_sensitive=False,
-            rich_help_panel="Optional Query Configurations",
+            rich_help_panel=PANEL_QUERY,
         ),
     ] = None,
     cloud_thresh: Annotated[
-        Optional[float],
+        float | None,
         typer.Option(
             help=(
                 "Keep products whose scene-level cloudCover metadata is strictly less "
@@ -102,38 +96,38 @@ def query(
             ),
             min=0.0,
             max=100.0,
-            rich_help_panel="Optional Query Configurations",
+            rich_help_panel=PANEL_QUERY,
         ),
     ] = None,
     rel_orbit_num: Annotated[
-        Optional[int],
+        int | None,
         typer.Option(
             help="Sentinel-2 relative orbit number (1-143).",
             min=1,
             max=143,
-            rich_help_panel="Optional Query Configurations",
+            rich_help_panel=PANEL_QUERY,
         ),
     ] = None,
     ops_mode: Annotated[
-        Optional[S2SensorModes],
+        S2SensorModes | None,
         typer.Option(
             help=(
                 "Sentinel-2 operational mode: INS-NOBS (normal observation), "
                 "INS-RAW, or INS-VIC (vicarious calibration). Source: CDSE catalogue."
             ),
             case_sensitive=False,
-            rich_help_panel="Optional Query Configurations",
+            rich_help_panel=PANEL_QUERY,
         ),
     ] = None,
     platform_serial_id: Annotated[
-        Optional[S2SerialIds],
+        S2SerialIds | None,
         typer.Option(
             help=(
                 "Sentinel-2 satellite identifier: A, B, or C. Availability depends on "
                 "date and mission status."
             ),
             case_sensitive=False,
-            rich_help_panel="Optional Query Configurations",
+            rich_help_panel=PANEL_QUERY,
         ),
     ] = None,
     top: Annotated[
@@ -141,61 +135,29 @@ def query(
         typer.Option(
             help=("Number of results to return per page in the OData query."),
             min=1,
-            rich_help_panel="Optional Query Configurations",
+            rich_help_panel=PANEL_QUERY,
         ),
     ] = 1000,
     count: Annotated[
         bool,
         typer.Option(
             help=("Whether to continue the OData query when page top is reached."),
-            rich_help_panel="Optional Query Configurations",
+            rich_help_panel=PANEL_QUERY,
         ),
     ] = True,
-    cache_dir: Annotated[
-        Path,
-        typer.Option(
-            help=(f"CDSE query cache root. Defaults to {DEFAULT_CDSE_CACHE_DIR}."),
-            file_okay=False,
-            rich_help_panel="Utils",
-        ),
-    ] = DEFAULT_CDSE_CACHE_DIR,
-    log: Annotated[
-        Optional[Path],
-        typer.Option(
-            help=(
-                "Log file path for query execution logs. If omitted, logs are saved to "
-                f"{DEFAULT_LOG_DIR} if --verbose is used, otherwise no logs are saved."
-            ),
-            rich_help_panel="Utils",
-        ),
-    ] = None,
-    verbose: Annotated[
-        bool,
-        typer.Option(
-            help="Enable verbose logging to the console and log file.",
-            rich_help_panel="Utils",
-        ),
-    ] = False,
-):
-
+    cache_dir: cache_dir_option("CDSE", DEFAULT_CDSE_CACHE_DIR) = DEFAULT_CDSE_CACHE_DIR,
+    log: LogOpt = None,
+    verbose: VerboseOpt = False,
+) -> None:
+    """Query CDSE for Sentinel-2 scenes and cache the scene manifest."""
     from sentinel_py.download.cdse import query_cdse
 
     # Set up logging
-    logger = get_logger(name="download_logger", logpath=log, verbose=verbose)
+    logger = get_logger(name="cdse_query_logger", logpath=log, verbose=verbose)
 
-    # Parse years
-    try:
-        parsed_years = sorted({int(year) for year in years.replace(",", " ").split()})
-    except ValueError as e:
-        raise typer.BadParameter(f"Could not parse years: {e}") from e
-    if not parsed_years:
-        raise typer.BadParameter("--years must contain at least one year")
-    if any(year < 1 or year > 9999 for year in parsed_years):
-        raise typer.BadParameter("--years values must be between 1 and 9999")
-    if (eperiod.month, eperiod.day) < (speriod.month, speriod.day):
-        raise typer.BadParameter(
-            "--eperiod must be on or after --speriod within each year"
-        )
+    # Parse years and season
+    parsed_years = parse_years(years)
+    validate_season(speriod, eperiod)
     speriod_value = dt.date(2000, speriod.month, speriod.day)
     eperiod_value = dt.date(2000, eperiod.month, eperiod.day)
 

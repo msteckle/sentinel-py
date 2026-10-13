@@ -7,18 +7,11 @@ from typing import Annotated
 
 import typer
 from click import ClickException
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TaskID,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
+from rich.progress import Progress, TaskID
 
-from sentinel_py.log import DEFAULT_LOG_DIR, get_logger
+from sentinel_py.cli.options import LogOpt, VerboseOpt
+from sentinel_py.download.base import make_progress
+from sentinel_py.log import get_logger
 
 
 def run(
@@ -38,14 +31,8 @@ def run(
             help="Validate and resolve the YAML without raster I/O or task execution.",
         ),
     ] = False,
-    log: Annotated[
-        Path | None,
-        typer.Option(help=f"Log file path. Defaults to {DEFAULT_LOG_DIR}."),
-    ] = None,
-    verbose: Annotated[
-        bool,
-        typer.Option(help="Enable verbose console and file logging."),
-    ] = False,
+    log: LogOpt = None,
+    verbose: VerboseOpt = False,
 ) -> None:
     """Run a validated processing pipeline from YAML."""
     from sentinel_py.pipeline import PipelineConfig, PipelineConfigError
@@ -91,16 +78,9 @@ def run(
     progress_counts = {"written": 0, "skipped": 0, "failed": 0}
 
     def start_progress(total: int) -> None:
+        """Start the output progress bar once the total task count is known."""
         nonlocal progress, progress_task_id
-        progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            TextColumn("[cyan]{task.fields[status]}"),
-        )
+        progress = make_progress(status=True)
         progress.start()
         progress_task_id = progress.add_task(
             "Processing outputs",
@@ -109,6 +89,7 @@ def run(
         )
 
     def update_output_progress(result: object) -> None:
+        """Count one finished output result in the written/skipped/failed status."""
         if progress is None or progress_task_id is None:
             return
         status = getattr(result, "status", "complete")
@@ -124,6 +105,7 @@ def run(
         )
 
     def update_task_progress(completed: int, total: int) -> None:
+        """Mirror Dask task completion onto the progress bar."""
         if progress is None or progress_task_id is None:
             return
         progress.update(progress_task_id, total=total, completed=completed)

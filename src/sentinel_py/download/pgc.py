@@ -17,6 +17,7 @@ from shapely import wkt
 from shapely.geometry import base as shapely_base
 from shapely.geometry import shape
 
+from sentinel_py.aoi import atomic_aoi_geometries
 from sentinel_py.cache import REGISTRY, RowStore
 from sentinel_py.download.base import (
     DownloadSummary,
@@ -104,44 +105,6 @@ def _item_row(item: Any) -> dict[str, Any]:
         "asset_key": PGC_ASSET_KEY,
         "asset_type": getattr(asset, "media_type", None),
     }
-
-
-def atomic_aoi_geometries(
-    geometries: Iterable[shapely_base.BaseGeometry],
-) -> list[shapely_base.BaseGeometry]:
-    """Flatten and validate AOI geometries for independent PGC searches.
-
-    Multi-part geometries are split into their component geometries so globally
-    separated points or polygons never become one enclosing bounding box.
-
-    Parameters
-    ----------
-    geometries : iterable of shapely geometries
-        AOI feature geometries in WGS84.
-
-    Returns
-    -------
-    list of shapely geometries
-        Non-empty atomic geometries in deterministic WKT order.
-    """
-    components: list[shapely_base.BaseGeometry] = []
-
-    def add(geometry: shapely_base.BaseGeometry) -> None:
-        """Collect non-empty atomic parts of a geometry, recursing into collections."""
-        if geometry.is_empty:
-            return
-        if geometry.geom_type == "GeometryCollection" or geometry.geom_type.startswith(
-            "Multi"
-        ):
-            for part in geometry.geoms:
-                add(part)
-            return
-        components.append(geometry)
-
-    for geometry in geometries:
-        add(geometry)
-    unique = {geometry.wkt: geometry for geometry in components}
-    return [unique[key] for key in sorted(unique)]
 
 
 def query_arcticdem(
@@ -290,7 +253,7 @@ def select_cached_tiles(
         path = Path(str(path_value))
         if not path.is_file():
             return "missing"
-        expected = _expected_size(row.to_dict())
+        expected = expected_size(row.to_dict())
         if expected is not None and path.stat().st_size != expected:
             return "partial"
         return "downloaded" if status == "complete" else "partial"
@@ -299,10 +262,15 @@ def select_cached_tiles(
     return selected.reset_index(drop=True)
 
 
-def _expected_size(product: dict[str, Any]) -> int | None:
+def expected_size(product: dict[str, Any]) -> int | None:
     """Return the manifest's expected byte size, or ``None``."""
     value = product.get("expected_size")
     return None if value is None or pd.isna(value) else int(value)
+
+
+def product_filename(product: dict[str, Any]) -> str:
+    """Return the safe local file name for a manifest row."""
+    return url_filename(str(product["url"]), product.get("filename"))
 
 
 def _state_row(product: dict[str, Any], **values: Any) -> dict[str, Any]:
@@ -313,7 +281,7 @@ def _state_row(product: dict[str, Any], **values: Any) -> dict[str, Any]:
         "url": str(product["url"]),
         "filename": product.get("filename"),
         "path": values.get("path"),
-        "expected_size": _expected_size(product),
+        "expected_size": expected_size(product),
         "local_actual_size": values.get("local_actual_size"),
         "local_mtime_ns": values.get("local_mtime_ns"),
         "etag": product.get("etag"),
@@ -359,10 +327,10 @@ def download_arcticdem(
     def download_one(product: dict[str, Any]) -> dict[str, Any]:
         """Verify or download one tile and return its state row."""
         url = str(product["url"])
-        filename = url_filename(url, product.get("filename"))
+        filename = product_filename(product)
         target = out_dir / filename
         partial = part_path(out_dir, filename)
-        expected = _expected_size(product)
+        expected = expected_size(product)
         cached = state_by_url.get(url, {})
         try:
             if target.is_file():
@@ -428,8 +396,7 @@ def download_arcticdem(
 
     records = products.to_dict("records")
     partial_paths = [
-        part_path(out_dir, url_filename(str(r["url"]), r.get("filename")))
-        for r in records
+        part_path(out_dir, product_filename(record)) for record in records
     ]
     try:
         # State rows are checkpointed in small batches as downloads complete, so an

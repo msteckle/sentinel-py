@@ -1,3 +1,5 @@
+"""CLI utilities for building AOI files: bounding boxes, CSV points, and grids."""
+
 from pathlib import Path
 from typing import Annotated
 
@@ -28,18 +30,11 @@ def bbox2geojson(
             dir_okay=False,
         ),
     ] = Path("bbox2geojson.geojson"),
-):
+) -> None:
+    """Write a EPSG:4326 bounding-box GeoJSON from ``xmin ymin xmax ymax``."""
     from sentinel_py.aoi import bbox_to_geojson
 
-    # handle inputted bounds argument
-    try:
-        xmin, ymin, xmax, ymax = bounds
-    except Exception as exc:
-        raise typer.BadParameter(
-            f"Expected 4 floats (xmin, ymin, xmax, ymax), got: {bounds=}"
-        ) from exc
-
-    # call core function
+    xmin, ymin, xmax, ymax = bounds
     bbox_to_geojson(
         bbox=(xmin, ymin, xmax, ymax),
         crs="EPSG:4326",
@@ -76,7 +71,8 @@ def csv2geojson(
             dir_okay=False,
         ),
     ] = Path("csv2geojson.geojson"),
-):
+) -> None:
+    """Write a EPSG:4326 point GeoJSON from CSV longitude and latitude columns."""
     from sentinel_py.aoi import csv_to_geojson
 
     # call core function
@@ -138,20 +134,13 @@ def grid(
             help="Output .geojson file.",
         ),
     ] = Path("grid.geojson"),
-):
+) -> None:
+    """Write a EPSG:4326 grid of ``--px`` degree cells overlaying an AOI."""
     from sentinel_py.aoi import overlay_latlon_grid
 
-    # handle cell size input
-    try:
-        if not all(0.0001 <= v <= 180.0 for v in px):
-            raise typer.BadParameter(
-                "Cell size values must be between 0.0001 and 180.0"
-            )
-        dx, dy = px
-    except Exception as exc:
-        raise typer.BadParameter(
-            f"Expected px as float or tuple of (dx, dy), got: {px=}"
-        ) from exc
+    if not all(0.0001 <= value <= 180.0 for value in px):
+        raise typer.BadParameter("Cell size values must be between 0.0001 and 180.0")
+    dx, dy = px
 
     # call core function
     overlay_latlon_grid(

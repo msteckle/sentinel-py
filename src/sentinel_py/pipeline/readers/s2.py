@@ -26,14 +26,17 @@ from pydantic import BaseModel
 from shapely.geometry import box
 from shapely.geometry.base import BaseGeometry
 
-from sentinel_py import raster_io
 from sentinel_py.cache import REGISTRY
 from sentinel_py.aoi import GeometryLike, aoi_as_geom
 from sentinel_py.enums import S2_BAND_IDS, SourceType
-from sentinel_py.pipeline.aoi import AOIUnit, point_grid
-from sentinel_py.pipeline.grid import ChunkShape, GridSpec, GridWindow
-from sentinel_py.pipeline.lazy import (
+import sentinel_py.pipeline.grid as pipeline_grid
+from sentinel_py.pipeline.grid import (
+    AOIUnit,
+    ChunkShape,
+    GridSpec,
+    GridWindow,
     native_pixel_window,
+    point_grid,
     select_resampling,
     warp_to_window,
 )
@@ -475,7 +478,7 @@ def _read_scene_chunk(
     window: GridWindow,
 ) -> np.ndarray:
     """Read every band and SCL for one scene/window task."""
-    with raster_io.RASTERIO_LOCK:
+    with pipeline_grid.RASTERIO_LOCK:  # module access keeps the lock unpickled
         return _read_scene_chunk_locked(scene, grid, window)
 
 
@@ -831,14 +834,14 @@ class S2Reader(BaseReader):
         from sentinel_py.pipeline.config import (
             PipelineConfigError,
             S2SourceConfig,
-            _only_keys,
-            _required,
-            _resolve_path,
+            only_keys,
+            required,
+            resolve_path,
         )
 
-        _only_keys(raw, {"type", "data_dir"}, f"sources.{source_id}")
-        data_dir = _resolve_path(
-            _required(raw, "data_dir", f"sources.{source_id}"),
+        only_keys(raw, {"type", "data_dir"}, f"sources.{source_id}")
+        data_dir = resolve_path(
+            required(raw, "data_dir", f"sources.{source_id}"),
             base_dir,
             f"sources.{source_id}.data_dir",
         )

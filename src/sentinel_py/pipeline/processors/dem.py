@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from sentinel_py.cache import deterministic_cache_key
 from sentinel_py.enums import SourceType
-from sentinel_py.pipeline.lazy import warp_to_window
+from sentinel_py.pipeline.grid import point_grid, warp_to_window
 from sentinel_py.pipeline.processors.base import (
     BaseProcessor,
     ProcessorConfig,
@@ -333,7 +333,6 @@ class DEMProcessor(BaseProcessor):
             from dask import delayed
         except ImportError as error:
             raise RuntimeError("DEM processing requires xarray and Dask") from error
-        from sentinel_py.pipeline.aoi import point_grid
         from sentinel_py.pipeline.readers.arcticdem import select_dem_paths
         from sentinel_py.pipeline.readers.base import apply_polygon_mask
 

@@ -19,7 +19,8 @@ from sentinel_py.cache import (
     write_parquet_atomic,
 )
 from sentinel_py.enums import AOIKind
-from sentinel_py.pipeline.aoi import AOIUnit
+from sentinel_py.pipeline.base import Registry
+from sentinel_py.pipeline.grid import AOIUnit, point_pixel
 
 
 def _mask_block(
@@ -93,32 +94,20 @@ class BaseReader(ABC):
         """Return normalized observation rows for all requested point AOIs."""
 
 
-class ReaderRegistry:
+class ReaderRegistry(Registry[BaseReader]):
     """Explicit mapping from pipeline source types to registered readers."""
 
-    def __init__(self) -> None:
-        self._readers: dict[str, BaseReader] = {}
+    kind = "source reader type"
 
-    def register(self, reader: BaseReader) -> None:
-        """Register one reader and reject duplicate source types."""
-        source_type = reader.source_type.strip()
-        if not source_type:
-            raise ValueError("Reader source types must be non-empty")
-        if source_type in self._readers:
-            raise ValueError(f"Reader source type is already registered: {source_type}")
-        self._readers[source_type] = reader
-
-    def get(self, source_type: str) -> BaseReader:
-        """Return a reader registered for a YAML source type."""
-        try:
-            return self._readers[source_type]
-        except KeyError as error:
-            raise KeyError(f"Unknown source reader type: {source_type}") from error
+    @staticmethod
+    def key_of(item: BaseReader) -> str:
+        """Return the YAML source ``type`` handled by a reader."""
+        return item.source_type
 
     @property
     def source_types(self) -> tuple[str, ...]:
         """Return registered source types in deterministic order."""
-        return tuple(sorted(self._readers))
+        return self.names
 
 
 _DEFAULT_READERS: ReaderRegistry | None = None
@@ -170,7 +159,6 @@ def point_sample_requests(
     anchor: tuple[float, float],
 ) -> tuple[PointSampleRequest, ...]:
     """Convert planned point units into reusable source-reader requests."""
-    from sentinel_py.pipeline.aoi import point_pixel
 
     requests = []
     for unit in units:

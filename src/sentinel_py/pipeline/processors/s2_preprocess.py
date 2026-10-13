@@ -8,6 +8,7 @@ from pyproj import CRS
 
 from sentinel_py.cache import REGISTRY, deterministic_cache_key
 from sentinel_py.enums import OutputFormat, S2Bands, SourceType
+from sentinel_py.pipeline.grid import point_grid
 from sentinel_py.pipeline.processors.base import (
     BaseProcessor,
     ProcessorConfig,
@@ -133,7 +134,6 @@ class S2PreprocessProcessor(BaseProcessor):
         if inputs:
             raise ValueError("s2.preprocess does not accept upstream artifacts yet")
 
-        from sentinel_py.pipeline.aoi import point_grid
         from sentinel_py.pipeline.readers.s2 import read_s2_unit
 
         # Access the pipeline and output grid

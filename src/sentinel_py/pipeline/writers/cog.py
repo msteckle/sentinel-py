@@ -12,10 +12,10 @@ from typing import Any
 
 import numpy as np
 
-from sentinel_py import raster_io
+import sentinel_py.pipeline.grid as pipeline_grid
 from sentinel_py.cache import REGISTRY, RowStore, deterministic_cache_key
-from sentinel_py.pipeline.writers import OutputWritePlan
 from sentinel_py.enums import AOIKind, ArtifactKind, OutputFormat
+from sentinel_py.pipeline.writers.base import OutputWritePlan
 
 COG_WRITER_VERSION = 1
 
@@ -79,7 +79,7 @@ def _write_cog_tile(
         if array.ndim == 2:
             array = array[np.newaxis, ...]
         with (
-            raster_io.RASTERIO_LOCK,
+            pipeline_grid.RASTERIO_LOCK,
             rasterio.open(
                 temporary,
                 "w",

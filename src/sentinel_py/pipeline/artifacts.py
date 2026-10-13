@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 import pandas as pd
 
 from sentinel_py.enums import ArtifactKind
 
+if TYPE_CHECKING:
+    from sentinel_py.pipeline.grid import AOIPlan
+
 @dataclass(frozen=True)
 class RasterArtifact:
     """Per-AOI lazy xarray datasets with their AOI planning metadata."""
 
-    plan: Any
+    plan: AOIPlan
     datasets: Mapping[tuple[str, str], Any]
 
     kind: ArtifactKind = ArtifactKind.raster
@@ -31,6 +34,6 @@ class PointSampleArtifact:
     """Normalized, source-observation point rows and pipeline provenance."""
 
     rows: pd.DataFrame
-    plan: Any
+    plan: AOIPlan
     kind: ArtifactKind = ArtifactKind.point
 

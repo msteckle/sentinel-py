@@ -8,7 +8,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from sentinel_py.enums import SourceType
-from sentinel_py.pipeline.aoi import AOIUnit
+from sentinel_py.pipeline.grid import AOIUnit
 from sentinel_py.pipeline.readers.base import BaseReader
 
 
@@ -27,14 +27,14 @@ class ArcticDEMReader(BaseReader):
         from sentinel_py.pipeline.config import (
             DEMSourceConfig,
             PipelineConfigError,
-            _only_keys,
-            _required,
-            _resolve_path,
+            only_keys,
+            required,
+            resolve_path,
         )
 
-        _only_keys(raw, {"type", "data_dir", "pattern"}, f"sources.{source_id}")
-        data_dir = _resolve_path(
-            _required(raw, "data_dir", f"sources.{source_id}"),
+        only_keys(raw, {"type", "data_dir", "pattern"}, f"sources.{source_id}")
+        data_dir = resolve_path(
+            required(raw, "data_dir", f"sources.{source_id}"),
             base_dir,
             f"sources.{source_id}.data_dir",
         )

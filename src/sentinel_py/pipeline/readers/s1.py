@@ -314,15 +314,15 @@ class S1Reader(BaseReader):
         from sentinel_py.pipeline.config import (
             PipelineConfigError,
             S1SourceConfig,
-            _only_keys,
-            _required,
-            _resolve_path,
+            only_keys,
+            required,
+            resolve_path,
         )
 
         location = f"sources.{source_id}"
-        _only_keys(raw, {"type", "data_dir", "flight_direction", "orbit"}, location)
-        data_dir = _resolve_path(
-            _required(raw, "data_dir", location), base_dir, f"{location}.data_dir"
+        only_keys(raw, {"type", "data_dir", "flight_direction", "orbit"}, location)
+        data_dir = resolve_path(
+            required(raw, "data_dir", location), base_dir, f"{location}.data_dir"
         )
         if not data_dir.is_dir():
             raise PipelineConfigError(f"S1 source directory does not exist: {data_dir}")

@@ -1,7 +1,5 @@
 """Built-in pipeline processors."""
 
-from typing import cast
-
 from sentinel_py.pipeline.processors.base import (
     Processor,
     ProcessorRegistry,
@@ -20,10 +18,10 @@ from sentinel_py.pipeline.processors.dem import DEMProcessor
 
 def register_builtin_processors(registry: ProcessorRegistry) -> None:
     """Register processors shipped with sentinel-py."""
-    registry.register(cast(Processor, S2PreprocessProcessor()))
-    registry.register(cast(Processor, S2CompositeProcessor()))
-    registry.register(cast(Processor, S2IndexProcessor()))
-    registry.register(cast(Processor, DEMProcessor()))
+    registry.register(S2PreprocessProcessor())
+    registry.register(S2CompositeProcessor())
+    registry.register(S2IndexProcessor())
+    registry.register(DEMProcessor())
 
 
 __all__ = [

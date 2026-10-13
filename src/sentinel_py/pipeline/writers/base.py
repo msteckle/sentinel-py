@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 from sentinel_py.enums import ArtifactKind, OutputFormat
+from sentinel_py.pipeline.base import Registry
 
 
 @dataclass(frozen=True)
@@ -73,25 +74,20 @@ class ArtifactOutputWriter:
         return computed
 
 
-class OutputWriterRegistry:
+class OutputWriterRegistry(Registry[OutputWriter]):
     """Explicit mapping from output formats to writer implementations."""
 
-    def __init__(self) -> None:
-        self._writers: dict[str, OutputWriter] = {}
+    kind = "output format"
 
-    def register(self, writer: OutputWriter) -> None:
-        format_name = writer.format_name.strip().lower()
-        if not format_name:
-            raise ValueError("Output writer formats must be non-empty")
-        if format_name in self._writers:
-            raise ValueError(f"Output writer is already registered: {format_name}")
-        self._writers[format_name] = writer
+    @staticmethod
+    def key_of(item: OutputWriter) -> str:
+        """Return the output ``format`` handled by a writer."""
+        return item.format_name
 
-    def get(self, format_name: str) -> OutputWriter:
-        try:
-            return self._writers[format_name.lower()]
-        except KeyError as error:
-            raise KeyError(f"Unknown output format: {format_name}") from error
+    @staticmethod
+    def normalize(name: str) -> str:
+        """Make output-format lookups case-insensitive."""
+        return name.strip().lower()
 
 
 _DEFAULT_WRITERS: OutputWriterRegistry | None = None

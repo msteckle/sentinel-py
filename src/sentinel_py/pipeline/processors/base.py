@@ -6,12 +6,13 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
-from typing import Any, ClassVar, Protocol, cast, runtime_checkable
+from typing import Any, ClassVar, Protocol, runtime_checkable
 
 from pydantic import BaseModel
 
 from sentinel_py.enums import AOIKind, ArtifactKind, OutputFormat
 from sentinel_py.pipeline.artifacts import PointSampleArtifact, RasterArtifact
+from sentinel_py.pipeline.base import Registry
 
 
 @runtime_checkable
@@ -140,39 +141,32 @@ class BaseProcessor(ABC):
         """Build the point-AOI artifact for this processor."""
 
 
-class ProcessorRegistry:
+class ProcessorRegistry(Registry[Processor]):
     """Explicit mapping from YAML node type names to processor implementations."""
 
-    def __init__(self) -> None:
-        self._processors: dict[str, Processor] = {}
+    kind = "processor type"
 
-    def register(self, processor: Processor) -> None:
-        """Register a processor, rejecting accidental type-name replacement."""
-        type_name = processor.type_name.strip()
-        if not type_name:
-            raise ValueError("Processor type names must be non-empty")
-        if type_name in self._processors:
-            raise ValueError(f"Processor type is already registered: {type_name}")
-        self._processors[type_name] = processor
-
-    def get(self, type_name: str) -> Processor:
-        """Return a registered processor or raise a concise lookup error."""
-        try:
-            return self._processors[type_name]
-        except KeyError as error:
-            raise KeyError(f"Unknown processor type: {type_name}") from error
+    @staticmethod
+    def key_of(item: Processor) -> str:
+        """Return the node ``type`` under which a processor is registered."""
+        return item.type_name
 
     @property
     def type_names(self) -> tuple[str, ...]:
         """Return registered type names in deterministic order."""
-        return tuple(sorted(self._processors))
+        return self.names
+
+
+_DEFAULT_REGISTRY: ProcessorRegistry | None = None
 
 
 def get_default_registry() -> ProcessorRegistry:
     """Return the process-wide registry populated with built-in processors."""
-    from sentinel_py.pipeline.processors import register_builtin_processors
+    global _DEFAULT_REGISTRY
+    if _DEFAULT_REGISTRY is None:
+        from sentinel_py.pipeline.processors import register_builtin_processors
 
-    registry = ProcessorRegistry()
-    register_builtin_processors(cast(Any, registry))
-    _DEFAULT_REGISTRY = registry
+        registry = ProcessorRegistry()
+        register_builtin_processors(registry)
+        _DEFAULT_REGISTRY = registry
     return _DEFAULT_REGISTRY

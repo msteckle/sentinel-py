@@ -20,8 +20,7 @@ import yaml
 from pydantic import BaseModel, ValidationError
 
 from sentinel_py.enums import AOIKind, ExecutionMethod, OutputFormat, SourceType
-from sentinel_py.pipeline.grid import ChunkShape, GridSpec
-from sentinel_py.pipeline.aoi import AOIPlan, load_aoi_plan
+from sentinel_py.pipeline.grid import AOIPlan, ChunkShape, GridSpec, load_aoi_plan
 from sentinel_py.pipeline.processors import ProcessorRegistry, get_default_registry
 
 _SEASON_PATTERN = re.compile(r"^(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$")
@@ -54,7 +53,7 @@ def _sequence(value: Any, location: str) -> list[Any]:
     return value
 
 
-def _only_keys(value: dict[str, Any], allowed: set[str], location: str) -> None:
+def only_keys(value: dict[str, Any], allowed: set[str], location: str) -> None:
     """Ensure that the dictionary contains only the allowed keys."""
     unexpected = sorted(set(value) - allowed)
     if unexpected:
@@ -63,7 +62,7 @@ def _only_keys(value: dict[str, Any], allowed: set[str], location: str) -> None:
         )
 
 
-def _required(value: dict[str, Any], key: str, location: str) -> Any:
+def required(value: dict[str, Any], key: str, location: str) -> Any:
     """Ensure that the specified key exists in the dictionary and return its value."""
     if key not in value:
         raise PipelineConfigError(f"Missing required value: {location}.{key}")
@@ -84,7 +83,7 @@ def _positive_int(value: Any, location: str) -> int:
     return value
 
 
-def _resolve_path(value: Any, base_dir: Path, location: str) -> Path:
+def resolve_path(value: Any, base_dir: Path, location: str) -> Path:
     """Ensure the value is a valid path string and return the resolved Path object."""
     if not isinstance(value, str) or not value.strip():
         raise PipelineConfigError(f"{location} must be a non-empty path string")
@@ -225,12 +224,12 @@ class ExecutionConfig:
             "job_script_prologue",
             "interface",
         }
-        _only_keys(value, allowed, "execution")
+        only_keys(value, allowed, "execution")
 
         # Extract and validate the allowed values
         # Ensure the method is one of the allowed values
         try:
-            method = ExecutionMethod(_required(value, "method", "execution"))
+            method = ExecutionMethod(required(value, "method", "execution"))
         except ValueError as error:
             raise PipelineConfigError(
                 "execution.method must be local, dask, or slurm"
@@ -244,7 +243,7 @@ class ExecutionConfig:
 
         # Ensure the local directory is resolved correctly
         local_directory = (
-            _resolve_path(
+            resolve_path(
                 value["local_directory"], base_dir, "execution.local_directory"
             )
             if value.get("local_directory") is not None
@@ -423,11 +422,11 @@ class SelectionConfig:
 
         # Extract the "selection" section from the raw mapping and validate its keys
         value = _mapping(raw, "selection")
-        _only_keys(value, {"aoi", "aoi_id_field", "years", "speriod", "eperiod"}, "selection")
+        only_keys(value, {"aoi", "aoi_id_field", "years", "speriod", "eperiod"}, "selection")
 
         # Resolve the area of interest (AOI) file path and validate its existence
         aoi = (
-            _resolve_path(value["aoi"], base_dir, "selection.aoi")
+            resolve_path(value["aoi"], base_dir, "selection.aoi")
             if value.get("aoi") is not None
             else None
         )
@@ -503,13 +502,13 @@ class OutputGridConfig:
     def _parse_chunks(raw: Any) -> ChunkShape:
         """Parse the ``output_grid.chunks`` mapping."""
         value = _mapping(raw, "output_grid.chunks")
-        _only_keys(value, {"y", "x"}, "output_grid.chunks")
+        only_keys(value, {"y", "x"}, "output_grid.chunks")
         return ChunkShape(
             y=_positive_int(
-                _required(value, "y", "output_grid.chunks"), "output_grid.chunks.y"
+                required(value, "y", "output_grid.chunks"), "output_grid.chunks.y"
             ),
             x=_positive_int(
-                _required(value, "x", "output_grid.chunks"), "output_grid.chunks.x"
+                required(value, "x", "output_grid.chunks"), "output_grid.chunks.x"
             ),
         )
 
@@ -520,11 +519,11 @@ class OutputGridConfig:
         value = _mapping(raw, "output_grid")
 
         # Ensure the CRS is specified and valid
-        crs = _identifier(_required(value, "crs", "output_grid"), "output_grid.crs")
+        crs = _identifier(required(value, "crs", "output_grid"), "output_grid.crs")
         if crs.lower() == "native":
-            _only_keys(value, {"crs", "resolution_m"}, "output_grid")
+            only_keys(value, {"crs", "resolution_m"}, "output_grid")
             resolution_m = _positive_int(
-                _required(value, "resolution_m", "output_grid"),
+                required(value, "resolution_m", "output_grid"),
                 "output_grid.resolution_m",
             )
             resolution = float(resolution_m), float(resolution_m)
@@ -537,7 +536,7 @@ class OutputGridConfig:
             raise PipelineConfigError(f"Invalid output grid CRS: {crs}") from error
 
         # Ensure only the expected keys are present in the output grid configuration
-        _only_keys(
+        only_keys(
             value,
             {"crs", "resolution", "extent", "anchor", "chunks"},
             "output_grid",
@@ -551,7 +550,7 @@ class OutputGridConfig:
 
         # Ensure the resolution is a valid coordinate pair
         resolution = _coordinate_pair(
-            _required(value, "resolution", "output_grid"),
+            required(value, "resolution", "output_grid"),
             "output_grid.resolution",
             positive=True,
             allow_scalar=True,
@@ -570,7 +569,7 @@ class OutputGridConfig:
             allow_scalar=False,
         )
 
-        chunks = cls._parse_chunks(_required(value, "chunks", "output_grid"))
+        chunks = cls._parse_chunks(required(value, "chunks", "output_grid"))
 
         # AOI feature grids are planned after parsing, one component at a time.
         return cls(
@@ -656,7 +655,7 @@ def parse_sources(raw: Any, base_dir: Path) -> dict[str, SourceConfig]:
     for raw_id, raw_source in values.items():
         source_id = _identifier(raw_id, "source identifiers")
         value = _mapping(raw_source, f"sources.{source_id}")
-        source_type = _required(value, "type", f"sources.{source_id}")
+        source_type = required(value, "type", f"sources.{source_id}")
         if not isinstance(source_type, str):
             raise PipelineConfigError(
                 f"sources.{source_id}.type must name a registered reader"
@@ -700,7 +699,7 @@ class OutputConfig:
             output_id = _identifier(raw_id, "output identifiers")
             location = f"outputs.{output_id}"
             value = _mapping(raw_output, location)
-            _only_keys(value, {"from", "node", "path", "format"}, location)
+            only_keys(value, {"from", "node", "path", "format"}, location)
             if "from" in value and "node" in value:
                 raise PipelineConfigError(
                     f"{location} cannot define both 'from' and 'node'"
@@ -716,8 +715,8 @@ class OutputConfig:
             output_format = _identifier(
                 value.get("format", OutputFormat.cog), f"{location}.format"
             )
-            path = _resolve_path(
-                _required(value, "path", location), base_dir, f"{location}.path"
+            path = resolve_path(
+                required(value, "path", location), base_dir, f"{location}.path"
             )
             outputs[output_id] = cls(output_id, node_id, path, output_format.lower())
         return outputs
@@ -774,13 +773,13 @@ class NodeConfig:
         for index, raw_node in enumerate(values):
             location = f"nodes[{index}]"
             value = dict(_mapping(raw_node, location))
-            node_id = _identifier(_required(value, "id", location), f"{location}.id")
+            node_id = _identifier(required(value, "id", location), f"{location}.id")
             if node_id in seen:
                 raise PipelineConfigError(f"Duplicate node id: {node_id}")
             seen.add(node_id)
 
             node_type = _identifier(
-                _required(value, "type", location), f"{location}.type"
+                required(value, "type", location), f"{location}.type"
             )
             try:
                 processor = registry.get(node_type)
@@ -824,7 +823,7 @@ class PipelineConfig:
         Selection criteria for the pipeline.
     output_grid : OutputGridConfig
         Output grid configuration.
-    sources : Mapping[str, S2SourceConfig]
+    sources : Mapping[str, SourceConfig]
         Mapping of source IDs to their configurations.
     nodes : tuple[NodeConfig, ...]
         Tuple of pipeline node configurations.
@@ -844,21 +843,6 @@ class PipelineConfig:
     ordered_nodes: tuple[NodeConfig, ...]
     outputs: Mapping[str, OutputConfig]
     registry: ProcessorRegistry = field(repr=False, compare=False)
-
-    @property
-    def source(self) -> S2SourceConfig:
-        """Return the first source for compatibility with the version-one API."""
-        return next(iter(self.sources.values()))
-
-    @property
-    def node(self) -> BaseModel:
-        """Return the first node's processor configuration for compatibility."""
-        return self.nodes[0].config
-
-    @property
-    def output(self) -> OutputConfig:
-        """Return the first named output for compatibility with the version-one API."""
-        return next(iter(self.outputs.values()))
 
     @classmethod
     def from_file(
@@ -882,7 +866,7 @@ class PipelineConfig:
 
         # Extract the root mapping and ensure it contains only the expected keys
         root = _mapping(loaded, "pipeline")
-        _only_keys(
+        only_keys(
             root,
             {
                 "version",
@@ -904,15 +888,15 @@ class PipelineConfig:
 
         # Execution section
         execution = ExecutionConfig.from_mapping(
-            _required(root, "execution", "pipeline"), base_dir
+            required(root, "execution", "pipeline"), base_dir
         )
         # Selection section
         selection = SelectionConfig.from_mapping(
-            _required(root, "selection", "pipeline"), base_dir
+            required(root, "selection", "pipeline"), base_dir
         )
         # Output section
         output_grid = OutputGridConfig.from_mapping(
-            _required(root, "output_grid", "pipeline"), selection
+            required(root, "output_grid", "pipeline"), selection
         )
         aoi_plan = None
         if selection.aoi is not None:
@@ -931,14 +915,14 @@ class PipelineConfig:
                 raise PipelineConfigError(f"Invalid selection AOI: {error}") from error
         # Sources section
         sources = parse_sources(
-            _required(root, "sources", "pipeline"), base_dir
+            required(root, "sources", "pipeline"), base_dir
         )
         # Nodes section
-        nodes = NodeConfig.parse_many(_required(root, "nodes", "pipeline"), registry)
+        nodes = NodeConfig.parse_many(required(root, "nodes", "pipeline"), registry)
         ordered_nodes = cls._topological_order(nodes)
         # Outputs section
         outputs = OutputConfig.parse_many(
-            _required(root, "outputs", "pipeline"), nodes, base_dir
+            required(root, "outputs", "pipeline"), nodes, base_dir
         )
         invalid_format = (
             OutputFormat.parquet
@@ -1010,7 +994,7 @@ class PipelineConfig:
     @staticmethod
     def _validate_processors(
         nodes: tuple[NodeConfig, ...],
-        sources: Mapping[str, S2SourceConfig],
+        sources: Mapping[str, SourceConfig],
         outputs: Mapping[str, OutputConfig],
         output_grid: OutputGridConfig,
         registry: ProcessorRegistry,

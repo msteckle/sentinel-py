@@ -14,8 +14,8 @@ import numpy as np
 
 import sentinel_py.pipeline.grid as pipeline_grid
 from sentinel_py.cache import REGISTRY, RowStore, deterministic_cache_key
-from sentinel_py.enums import AOIKind, ArtifactKind, OutputFormat
-from sentinel_py.pipeline.writers.base import OutputWritePlan
+from sentinel_py.enums import AOIKind, ArtifactKind, OutputFormat, WriteStatus
+from sentinel_py.pipeline.writers.base import BaseOutputWriter, OutputWritePlan
 
 COG_WRITER_VERSION = 1
 
@@ -111,7 +111,7 @@ def _write_cog_tile(
         os.replace(temporary, output_path)
         return COGWriteResult(
             **identity,
-            status="written",
+            status=WriteStatus.written,
             bytes_written=output_path.stat().st_size,
             error=None,
             completed_at=datetime.now(UTC).isoformat(),
@@ -119,7 +119,7 @@ def _write_cog_tile(
     except Exception as error:
         return COGWriteResult(
             **identity,
-            status="failed",
+            status=WriteStatus.failed,
             bytes_written=0,
             error=f"{type(error).__name__}: {error}",
             completed_at=datetime.now(UTC).isoformat(),
@@ -128,7 +128,7 @@ def _write_cog_tile(
         temporary.unlink(missing_ok=True)
 
 
-class COGOutputWriter:
+class COGOutputWriter(BaseOutputWriter):
     """Build chunk-level COG tasks and maintain output-scoped resume state."""
 
     format_name = OutputFormat.cog
@@ -182,7 +182,7 @@ class COGOutputWriter:
         cached = {
             str(row["task_id"]): row
             for row in state.to_dict("records")
-            if row.get("status") in {"written", "skipped"}
+            if row.get("status") in {WriteStatus.written, WriteStatus.skipped}
         }
         transform = tuple(float(value) for value in artifact.attrs["transform"])
         x_resolution = transform[0]
@@ -264,7 +264,7 @@ class COGOutputWriter:
                                     column_index=column_index,
                                     output_path=output_path,
                                     cache_key=cache_key,
-                                    status="skipped",
+                                    status=WriteStatus.skipped,
                                     bytes_written=output_path.stat().st_size,
                                     error=None,
                                     completed_at=datetime.now(UTC).isoformat(),

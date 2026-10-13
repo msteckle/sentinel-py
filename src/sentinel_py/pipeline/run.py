@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from sentinel_py.enums import WriteStatus
 from sentinel_py.pipeline.config import PipelineConfig
 from sentinel_py.pipeline.execution import compute_dask_tasks
 from sentinel_py.pipeline.processors.base import ProcessorContext
@@ -142,8 +143,9 @@ def run_pipeline(
             task_progress_callback=task_progress_callback,
             initial_completed_tasks=initial_completed + offset,
         ))
-        # Writers that expose ``checkpoint`` persist resume state after every batch
-        # instead of only in finalize(), so an interrupt keeps completed work.
+        # Writers may define ``checkpoint`` (see BaseOutputWriter) to persist resume
+        # state after every batch instead of only in finalize(), so an interrupt
+        # keeps completed work. Plain protocol writers without it are skipped.
         for output_id, (writer, plan) in plans.items():
             checkpoint = getattr(writer, "checkpoint", None)
             start, end = task_ranges[output_id]
@@ -164,7 +166,7 @@ def run_pipeline(
         )
         for result in results:
             status = getattr(result, "status", "complete")
-            log = logger.error if status == "failed" else logger.info
+            log = logger.error if status == WriteStatus.failed else logger.info
             log(
                 "output=%s task=%s status=%s path=%s error=%s",
                 output_id,

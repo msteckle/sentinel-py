@@ -9,9 +9,9 @@ from typing import Any
 import pandas as pd
 
 from sentinel_py.cache import write_parquet_atomic
-from sentinel_py.enums import ArtifactKind, OutputFormat
+from sentinel_py.enums import ArtifactKind, OutputFormat, WriteStatus
 from sentinel_py.pipeline.artifacts import PointSampleArtifact
-from sentinel_py.pipeline.writers.base import OutputWritePlan
+from sentinel_py.pipeline.writers.base import BaseOutputWriter, OutputWritePlan
 
 
 @dataclass(frozen=True)
@@ -28,14 +28,17 @@ def _write_rows(rows: pd.DataFrame, *, output_path: Path) -> ParquetWriteResult:
     """Write normalized, already-sampled point rows atomically."""
     try:
         write_parquet_atomic(rows, output_path)
-        return ParquetWriteResult("points", output_path, "written")
+        return ParquetWriteResult("points", output_path, WriteStatus.written)
     except Exception as error:
         return ParquetWriteResult(
-            "points", output_path, "failed", f"{type(error).__name__}: {error}"
+            "points",
+            output_path,
+            WriteStatus.failed,
+            f"{type(error).__name__}: {error}",
         )
 
 
-class ParquetOutputWriter:
+class ParquetOutputWriter(BaseOutputWriter):
     """Materialize one normalized point artifact as an atomic Parquet table."""
 
     format_name = OutputFormat.parquet

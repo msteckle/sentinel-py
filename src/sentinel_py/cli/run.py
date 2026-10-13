@@ -11,6 +11,7 @@ from rich.progress import Progress, TaskID
 
 from sentinel_py.cli.options import LogOpt, VerboseOpt
 from sentinel_py.download.base import make_progress
+from sentinel_py.enums import WriteStatus
 from sentinel_py.log import get_logger
 
 
@@ -138,9 +139,9 @@ def run(
         for worker_result in output_result.results
     ]
     if worker_results:
-        written = sum(item.status == "written" for item in worker_results)
-        skipped = sum(item.status == "skipped" for item in worker_results)
-        failed = sum(item.status == "failed" for item in worker_results)
+        written = sum(item.status == WriteStatus.written for item in worker_results)
+        skipped = sum(item.status == WriteStatus.skipped for item in worker_results)
+        failed = sum(item.status == WriteStatus.failed for item in worker_results)
         typer.echo(
             f"  COG tiles:   {written} written, {skipped} skipped, {failed} failed"
         )

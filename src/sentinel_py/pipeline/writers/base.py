@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
-from sentinel_py.enums import ArtifactKind, OutputFormat
+from sentinel_py.enums import ArtifactKind, OutputFormat, WriteStatus
 from sentinel_py.pipeline.base import Registry
 
 
@@ -33,13 +33,19 @@ class OutputExecutionResult:
     def failed(self) -> bool:
         """Return whether any task result reports ``status == "failed"``."""
         return any(
-            getattr(result, "status", None) == "failed" for result in self.results
+            getattr(result, "status", None) == WriteStatus.failed
+            for result in self.results
         )
 
 
 @runtime_checkable
 class OutputWriter(Protocol):
-    """Build delayed materialization tasks and finalize their central state."""
+    """Build delayed materialization tasks and finalize their central state.
+
+    Writers may also define ``checkpoint(plan, computed, offset=0)``, which the
+    pipeline calls after every materialization batch so interrupted runs keep their
+    completed work. :class:`BaseOutputWriter` supplies a no-op default.
+    """
 
     format_name: str
     accepted_artifact_kinds: frozenset[ArtifactKind]
@@ -55,7 +61,29 @@ class OutputWriter(Protocol):
         """Persist centralized state and return every structured result."""
 
 
-class ArtifactOutputWriter:
+class BaseOutputWriter:
+    """Optional base class for writers; provides the no-op resume checkpoint hook."""
+
+    def checkpoint(
+        self,
+        plan: OutputWritePlan,
+        computed: tuple[Any, ...],
+        offset: int = 0,
+    ) -> None:
+        """Persist resume state for one computed batch of this output's tasks.
+
+        Parameters
+        ----------
+        plan : OutputWritePlan
+            Plan returned by ``build``.
+        computed : tuple
+            Results of a contiguous run of this output's tasks.
+        offset : int, default 0
+            Position of ``computed[0]`` within the plan's tasks.
+        """
+
+
+class ArtifactOutputWriter(BaseOutputWriter):
     """Expose an artifact without requesting Dask computation or persistence."""
 
     def __init__(self, format_name: str):

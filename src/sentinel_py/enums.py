@@ -35,6 +35,15 @@ class ASFOrbitDirection(str, Enum):
     descending = "DESCENDING"
 
 
+class S1OrbitPolicy(str, Enum):
+    """Sentinel-1 orbit-file types staged for offline SNAP processing."""
+
+    precise = "precise"
+    restituted = "restituted"
+    precise_or_restituted = "precise-or-restituted"
+    none = "none"
+
+
 class ASFProductLevel(str, Enum):
     """ASF Sentinel-1 product levels exposed by the query CLI."""
 

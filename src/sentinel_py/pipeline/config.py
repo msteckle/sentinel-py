@@ -642,7 +642,35 @@ class DEMSourceConfig:
     source_type: str = "dem.local"
 
 
-SourceConfig = S2SourceConfig | DEMSourceConfig
+@dataclass(frozen=True)
+class S1SourceConfig:
+    """
+    Data class representing a local collection of Sentinel-1 GRD ZIP archives.
+
+    Arguments
+    ---------
+    source_id : str
+        Identifier for the source.
+    data_dir : Path
+        Directory containing ASF-downloaded Sentinel-1 ZIPs and, when staged by
+        ``sentinel-py asf download``, the ``orbits`` directory.
+    flight_direction : str
+        ``BOTH``, ``ASCENDING``, ``DESCENDING`` or ``PREDOMINANT``.
+    orbit : str
+        Acceptable orbit-file types: ``precise``, ``restituted`` or
+        ``precise-or-restituted``.
+    source_type : str, optional
+        Type of the source (default is "s1.grd.local").
+    """
+
+    source_id: str
+    data_dir: Path
+    flight_direction: str = "BOTH"
+    orbit: str = "precise-or-restituted"
+    source_type: str = "s1.grd.local"
+
+
+SourceConfig = S2SourceConfig | DEMSourceConfig | S1SourceConfig
 
 
 def parse_sources(raw: Any, base_dir: Path) -> dict[str, SourceConfig]:

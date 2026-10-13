@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from abc import ABC, abstractmethod
 from typing import Any, ClassVar, Protocol, runtime_checkable
-
-from pydantic import BaseModel
 
 import numpy as np
 import pandas as pd
 from affine import Affine
+from pydantic import BaseModel
 
 from sentinel_py.cache import (
     DEFAULT_PIPELINE_CACHE_DIR,
@@ -22,7 +21,9 @@ from sentinel_py.cache import (
 from sentinel_py.pipeline.aoi import AOIUnit
 
 
-def _mask_block(values: np.ndarray, *, unit: AOIUnit, nodata: float | int, block_info: Any = None) -> np.ndarray:
+def _mask_block(
+    values: np.ndarray, *, unit: AOIUnit, nodata: float, block_info: Any = None
+) -> np.ndarray:
     """Apply one polygon's all-touched mask to a canonical-grid array block."""
     import rasterio.features
 
@@ -51,12 +52,20 @@ def apply_polygon_mask(dataset: Any, unit: AOIUnit) -> Any:
 
     result = dataset.copy()
     for name, variable in dataset.data_vars.items():
-        if not {"y", "x"}.issubset(variable.dims) or not hasattr(variable.data, "chunks"):
+        if not {"y", "x"}.issubset(variable.dims) or not hasattr(
+            variable.data, "chunks"
+        ):
             continue
         nodata = variable.attrs.get("nodata", dataset.attrs.get("nodata", np.nan))
-        result[name] = variable.copy(data=da.map_blocks(
-            _mask_block, variable.data, dtype=variable.dtype, unit=unit, nodata=nodata,
-        ))
+        result[name] = variable.copy(
+            data=da.map_blocks(
+                _mask_block,
+                variable.data,
+                dtype=variable.dtype,
+                unit=unit,
+                nodata=nodata,
+            )
+        )
         result[name].attrs.update(variable.attrs)
     return result
 
@@ -119,9 +128,11 @@ def get_default_reader_registry() -> ReaderRegistry:
     global _DEFAULT_READERS
     if _DEFAULT_READERS is None:
         from sentinel_py.pipeline.readers.arcticdem import ArcticDEMReader
+        from sentinel_py.pipeline.readers.s1 import S1Reader
         from sentinel_py.pipeline.readers.s2 import S2Reader
 
         registry = ReaderRegistry()
+        registry.register(S1Reader())
         registry.register(S2Reader())
         registry.register(ArcticDEMReader())
         _DEFAULT_READERS = registry

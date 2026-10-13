@@ -5,11 +5,12 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -23,9 +24,9 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
+from shapely import wkt
 from shapely.geometry import base as shapely_base
 from shapely.geometry import shape
-from shapely import wkt
 
 from sentinel_py.cache import merge_state_rows, write_parquet_atomic
 
@@ -185,13 +186,22 @@ def query_arcticdem(
         west, south, east, north = (float(value) for value in aoi_geometries)
         if west > east or south > north:
             raise ValueError("bbox must be (west, south, east, north)")
-        geometries = [shape({
-            "type": "Polygon",
-            "coordinates": [[
-                [west, south], [east, south], [east, north], [west, north],
-                [west, south],
-            ]],
-        })]
+        geometries = [
+            shape(
+                {
+                    "type": "Polygon",
+                    "coordinates": [
+                        [
+                            [west, south],
+                            [east, south],
+                            [east, north],
+                            [west, north],
+                            [west, south],
+                        ]
+                    ],
+                }
+            )
+        ]
         legacy_bbox_mode = True
     else:
         geometries = atomic_aoi_geometries(aoi_geometries)
@@ -355,7 +365,9 @@ def download_arcticdem(
         if not state.empty and "url" in state.columns
         else {}
     )
-    products = products.dropna(subset=["url"]).drop_duplicates("url").reset_index(drop=True)
+    products = (
+        products.dropna(subset=["url"]).drop_duplicates("url").reset_index(drop=True)
+    )
     if products.empty:
         return PGCDownloadSummary(0, 0, 0, ["No ArcticDEM URLs to download."])
 
@@ -395,9 +407,11 @@ def download_arcticdem(
                                     stream.write(chunk)
                     actual = partial.stat().st_size
                     if expected is not None and actual != expected:
-                        raise IOError(f"size mismatch: expected {expected}, got {actual}")
+                        raise OSError(
+                            f"size mismatch: expected {expected}, got {actual}"
+                        )
                     break
-                except (requests.RequestException, OSError, IOError) as error:
+                except (requests.RequestException, OSError):
                     partial.unlink(missing_ok=True)
                     if attempt >= retries:
                         raise
@@ -426,7 +440,8 @@ def download_arcticdem(
     completed = skipped = failed = 0
     records = products.to_dict("records")
     partial_paths = [
-        out_dir / f".{record.get('filename') or Path(urlparse(str(record['url'])).path).name}.part"
+        out_dir
+        / f".{record.get('filename') or Path(urlparse(str(record['url'])).path).name}.part"
         for record in records
     ]
     try:

@@ -10,11 +10,13 @@ from sentinel_py.download.asf import (
     download_asf,
     earthdata_netrc_credentials,
 )
+from sentinel_py.download.s1_orbits import stage_orbits
 from sentinel_py.download.preflight import (
     DownloadStorageSummary,
     confirm_download,
     echo_storage_summary,
 )
+from sentinel_py.enums import S1OrbitPolicy
 from sentinel_py.log import DEFAULT_LOG_DIR, get_logger
 
 app = typer.Typer()
@@ -124,6 +126,20 @@ def download(
             rich_help_panel="Optional Download Configurations",
         ),
     ] = 3,
+    orbits: Annotated[
+        S1OrbitPolicy,
+        typer.Option(
+            help=(
+                "Stage Sentinel-1 orbit files for GRD/SLC scenes in OUTDIR/orbits so "
+                "SNAP can run offline: precise, restituted, precise-or-restituted "
+                "(precise orbits are published weeks after acquisition, so recent "
+                "scenes fall back to restituted and are upgraded on a later rerun), "
+                "or none."
+            ),
+            case_sensitive=False,
+            rich_help_panel="Optional Download Configurations",
+        ),
+    ] = S1OrbitPolicy.precise_or_restituted,
     yes: Annotated[
         bool,
         typer.Option(
@@ -225,6 +241,39 @@ def download(
     typer.echo("Summary:")
     for message in summary:
         typer.echo(f"  {message}")
+
+    # Orbit files are tiny and public, so stage them in the networked download
+    # stage; compute nodes can then run SNAP without network access.
+    orbit_failed = 0
+    if orbits is not S1OrbitPolicy.none:
+        logger.info("Staging Sentinel-1 orbit files with policy %s", orbits.value)
+        try:
+            orbit_summary = stage_orbits(
+                products,
+                outdir,
+                orbits,
+                processes=processes,
+                retries=retries,
+                logger=logger,
+            )
+        except Exception as error:  # noqa: BLE001 - reported as a command failure
+            logger.exception("Orbit staging failed")
+            typer.echo(f"Orbit staging failed: {error}", err=True)
+            orbit_failed = 1
+        else:
+            for message in orbit_summary.messages:
+                typer.echo(f"  {message}")
+            orbit_failed = orbit_summary.failed
+            if orbit_summary.missing:
+                typer.echo(
+                    f"{len(orbit_summary.missing)} scene(s) have no published "
+                    f"{orbits.value} orbit yet; rerun this command later to stage them.",
+                    err=True,
+                )
+    if orbit_failed:
+        typer.echo("Orbit staging did not complete for some scenes.", err=True)
+    if orbit_failed and not summary.failed:
+        raise typer.Exit(code=1)
     if summary.failed:
         typer.echo(
             f"Download completed with {summary.failed} failed ASF product(s).",

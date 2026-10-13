@@ -15,8 +15,6 @@ import pandas as pd
 import requests
 from asf_search.download import download_url as asf_download_url
 from asf_search.exceptions import ASFAuthenticationError
-from shapely import wkt
-from shapely.geometry.polygon import orient
 from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
@@ -26,6 +24,8 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
+from shapely import wkt
+from shapely.geometry.polygon import orient
 
 from sentinel_py.cache import merge_state_rows, write_parquet_atomic
 
@@ -264,7 +264,9 @@ def query_asf(
             len(spatial_option_batches),
         )
     else:
-        spatial_option_batches = [{"intersectsWith": orient(aoi_geometry, sign=1.0).wkt}]
+        spatial_option_batches = [
+            {"intersectsWith": orient(aoi_geometry, sign=1.0).wkt}
+        ]
 
     # Search ASF for products matching the criteria using the asf_search library
     try:
@@ -412,13 +414,13 @@ def _validate_product_file(
 ) -> int:
     actual_size = path.stat().st_size
     if expected_size is not None and actual_size != expected_size:
-        raise IOError(
+        raise OSError(
             f"size mismatch for {filename}: expected {expected_size}, got {actual_size}"
         )
     if expected_md5 is not None:
         actual_md5 = _file_md5(path)
         if actual_md5 != expected_md5:
-            raise IOError(
+            raise OSError(
                 f"MD5 mismatch for {filename}: expected {expected_md5}, "
                 f"got {actual_md5}"
             )

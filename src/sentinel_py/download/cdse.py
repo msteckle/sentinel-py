@@ -7,11 +7,11 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Callable, Dict, Optional
 
 import pandas as pd
 import phidown.search as _phidown_search
@@ -137,7 +137,7 @@ Sentinel-py (cdse) has 4 metadata layers to avoid redundant queries and download
 def query_cache_key(
     aoi_wkt: str,
     collection_name: str,
-    product_type: Optional[str],
+    product_type: str | None,
     iso_windows: list[tuple[str, str]],
     orbit: str | None = None,
     cloud_thresh: float | None = None,
@@ -146,7 +146,7 @@ def query_cache_key(
     rel_orbit_num: int | None = None,
     ops_mode: str | None = None,
     platform_serial_id: str | None = None,
-    attrs: Dict[str, str | int | float] | None = None,
+    attrs: dict[str, str | int | float] | None = None,
     burst_mode: bool = False,
     abs_burst_id: int | None = None,
     parent_product_name: str | None = None,
@@ -204,7 +204,7 @@ def save_query_as_json(query_dir: Path, **kwargs) -> None:
     write_json_atomic(query_dir / "query_info.json", info)
 
 
-def find_latest_scenes_cache(cache_root: Path) -> Optional[Path]:
+def find_latest_scenes_cache(cache_root: Path) -> Path | None:
     """
     Find the most recently used scenes.parquet across all query cache directories.
     """
@@ -273,7 +273,7 @@ def update_cdse_scene_catalog(
 
 def query_cdse(
     collection: str,
-    product: Optional[str],
+    product: str | None,
     years: list[int],
     speriod: date,
     eperiod: date,
@@ -282,7 +282,7 @@ def query_cdse(
     cache_dir: Path,
     orbit: str | None = None,
     cloud_thresh: float | None = None,
-    attrs: Dict[str, str | int | float] | None = None,
+    attrs: dict[str, str | int | float] | None = None,
     # burst related filters (S1 relevant)
     burst_mode: bool = False,
     burst_id: int | None = None,
@@ -571,7 +571,7 @@ class ResolvedBand:
     band: str
     resolution: int
     fallback_used: bool = False
-    original_resolution: Optional[int] = None
+    original_resolution: int | None = None
 
     @property
     def resolution_dir(self) -> str:
@@ -662,7 +662,7 @@ def _resolve_s2_bands(
 # --------------------------------------------------------------------------------------
 
 
-def _parse_s5cmd_ls_line(line: str) -> Optional[tuple[int, str]]:
+def _parse_s5cmd_ls_line(line: str) -> tuple[int, str] | None:
     """Get size, rel_path, or None from s5cmd `ls` output line."""
     parts = line.strip().split()
     if len(parts) >= 4:
@@ -1039,7 +1039,7 @@ class StorageEstimator:
             self.resolved_additional += additional
             return self._projection_unlocked()
 
-    def projection(self) -> Optional[StorageProjection]:
+    def projection(self) -> StorageProjection | None:
         with self._lock:
             if self.resolved_scenes == 0:
                 return None
@@ -1072,7 +1072,7 @@ def _format_bytes(size: int) -> str:
     return f"{value:.1f} PiB"
 
 
-def _free_disk_bytes(path: Path) -> Optional[int]:
+def _free_disk_bytes(path: Path) -> int | None:
     """Return free bytes for path, falling back to its nearest existing parent."""
     target = path
     while not target.exists() and target != target.parent:
@@ -1115,7 +1115,7 @@ def _scene_storage_bytes(
 
 def _storage_progress_text(
     projection: StorageProjection,
-    free_bytes: Optional[int],
+    free_bytes: int | None,
 ) -> str:
     """Build the compact storage estimate shown alongside download progress."""
     sample_target = min(10, projection.total_scenes)
@@ -1143,8 +1143,8 @@ def _download_scene_from_images(
     config_file: str,
     parallel_bands: int,
     logger: logging.Logger,
-    on_download_plan: Optional[Callable[[int], None]] = None,
-    on_download_result: Optional[Callable[[bool], None]] = None,
+    on_download_plan: Callable[[int], None] | None = None,
+    on_download_result: Callable[[bool], None] | None = None,
 ) -> DownloadResult:
     """
     Download pre-resolved images for a single scene, preserving SAFE structure.
@@ -1299,7 +1299,7 @@ def prepare_cdse_download(
     output_dir: Path,
     config_file: str = ".s5cfg",
     parallel_scenes: int = 2,
-    logger: Optional[logging.Logger] = None,
+    logger: logging.Logger | None = None,
     cache_dir: Path | None = None,
 ) -> DownloadStorageSummary:
     """Build a metadata-only download plan and calculate its storage requirements.
@@ -1506,7 +1506,7 @@ def resolve_and_download(
     config_file: str = ".s5cfg",
     parallel_scenes: int = 2,
     parallel_bands: int = 2,
-    logger: Optional[logging.Logger] = None,
+    logger: logging.Logger | None = None,
     cache_dir: Path | None = None,
 ) -> list[DownloadResult]:
     """

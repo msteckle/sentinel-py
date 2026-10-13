@@ -267,6 +267,15 @@ sentinel-py cdse download ... --yes
 The credentials path is required for every ASF download command, matching CDSE's
 required `--config` workflow.
 
+After the ZIPs are downloaded, `sentinel-py asf download` also stages one Sentinel-1
+orbit file per GRD/SLC scene in `<outdir>/orbits`, so SNAP can later run on compute
+nodes without network access. `--orbits` selects `precise`, `restituted`,
+`precise-or-restituted` (the default), or `none`. Precise orbits are published weeks
+after acquisition, so recent scenes fall back to restituted orbits and are upgraded
+when the command is rerun. Scene-to-orbit assignments are stored in
+`<outdir>/.sentinel-py/s1_orbits.parquet`. Orbit files come from ASF's public mirror
+and need no credentials.
+
 ASF download state is stored at
 `<outdir>/.sentinel-py/asf_downloads.parquet`. Existing files are checked against the
 exact byte size and, when supplied by ASF, the MD5 checksum before they are skipped.

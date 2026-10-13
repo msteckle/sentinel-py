@@ -51,12 +51,44 @@ def test_query_cache_key_includes_result_affecting_filters():
         "iso_windows": [("2024-01-01", "2024-01-31")],
     }
 
-    first = cdse.query_cache_key(**base, cloud_thresh=10)
-    second = cdse.query_cache_key(**base, cloud_thresh=20)
-    third = cdse.query_cache_key(**base, cloud_thresh=10, rel_orbit_num=12)
+    first = cdse.query_cache_key(**base, filters=cdse.CDSEQueryFilters(cloud_thresh=10))
+    second = cdse.query_cache_key(
+        **base, filters=cdse.CDSEQueryFilters(cloud_thresh=20)
+    )
+    third = cdse.query_cache_key(
+        **base, filters=cdse.CDSEQueryFilters(cloud_thresh=10, rel_orbit_num=12)
+    )
 
     assert first != second
     assert first != third
+
+
+def test_query_cache_key_is_stable_across_releases():
+    """Recorded keys keep existing on-disk query caches reachable."""
+    base = {
+        "aoi_wkt": "POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0))",
+        "collection_name": "SENTINEL-2",
+        "product_type": "S2MSI2A",
+        "iso_windows": [("2023-06-01", "2023-08-31")],
+    }
+
+    assert cdse.query_cache_key(**base) == "81d66dec267acbb0eaf846ea63b86b1d"
+    assert (
+        cdse.query_cache_key(
+            **base,
+            filters=cdse.CDSEQueryFilters(
+                orbit="DESCENDING",
+                cloud_thresh=20.0,
+                rel_orbit_num=12,
+                ops_mode="INS-NOBS",
+                platform_serial_id="A",
+                attrs={"a": 1},
+                top=500,
+                count=True,
+            ),
+        )
+        == "efdc2a78125c829795a595d89d8d1694"
+    )
 
 
 def test_successful_empty_query_is_cached(tmp_path: Path, monkeypatch):

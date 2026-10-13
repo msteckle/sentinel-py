@@ -127,6 +127,31 @@ def extrapolate_total(values: Sequence[float], population: int) -> tuple[float, 
     return total, _Z_95 * standard_error
 
 
+def format_bytes_compact(size: int) -> str:
+    """Format a byte count as one compact IEC value for single-line status text.
+
+    Use :func:`format_storage_size` for the dual SI/IEC figures shown in storage
+    preflight summaries.
+
+    Parameters
+    ----------
+    size : int
+        Size in bytes; negative values are treated as zero.
+
+    Returns
+    -------
+    str
+        For example ``"0 B"`` or ``"1.5 KiB"``.
+    """
+    value = float(max(0, size))
+    units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} PiB"
+
+
 def format_storage_size(size: int) -> str:
     """Format bytes in decimal and binary units suitable for storage planning."""
     size = max(0, int(size))

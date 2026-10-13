@@ -19,7 +19,7 @@ from sentinel_py.cli.options import (
     echo_summary,
 )
 from sentinel_py.download.preflight import confirm_download, echo_storage_summary
-from sentinel_py.enums import S2DownloadAssets, S2Res
+from sentinel_py.enums import Mission, S2DownloadAssets, S2Res
 from sentinel_py.log import get_logger
 
 app = typer.Typer()
@@ -194,7 +194,7 @@ def download(
     _validate_s5_config(config)
 
     mission_value = mission.upper()
-    if mission_value != "S2":
+    if mission_value != Mission.s2:
         raise typer.BadParameter(
             "CDSE download currently supports only Sentinel-2; use --mission S2"
         )

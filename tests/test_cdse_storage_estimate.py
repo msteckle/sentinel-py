@@ -3,9 +3,9 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from sentinel_py.download.preflight import format_bytes_compact
 from sentinel_py.download.cdse import (
     StorageEstimator,
-    _format_bytes,
     _scene_storage_bytes,
     _storage_progress_text,
     cdse_scene_catalog_path,
@@ -76,9 +76,9 @@ def test_storage_display_warns_when_estimate_exceeds_free_space():
     assert text.startswith("⚠ ")
 
 
-def test_format_bytes_uses_iec_units():
-    assert _format_bytes(0) == "0 B"
-    assert _format_bytes(1536) == "1.5 KiB"
+def test_format_bytes_compact_uses_iec_units():
+    assert format_bytes_compact(0) == "0 B"
+    assert format_bytes_compact(1536) == "1.5 KiB"
 
 
 def test_cdse_scene_catalog_merges_queries_by_scene_name(tmp_path: Path):

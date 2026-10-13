@@ -35,9 +35,11 @@ from sentinel_py.cache import (
     write_parquet_atomic,
 )
 from sentinel_py.download.base import make_progress, part_path, retry_call
+from sentinel_py.enums import DownloadStatus, Mission
 from sentinel_py.download.preflight import (
     DownloadStorageSummary,
     extrapolate_total,
+    format_bytes_compact,
 )
 
 # fix some phidown limitations
@@ -84,7 +86,6 @@ SCENE_CACHE_COLUMNS = [
     "GeoFootprint",
     "query_id",
 ]
-S2_METADATA_ASSETS = {"MTD_MSIL2A", "MTD_MSIL1C", "MTD_TL"}
 CDSE_LEGACY_ASSET_CACHE_NAME = "all_downloaded_images.parquet"
 DEFAULT_S5CMD_CONFIG = ".s5cfg"
 CDSE_ENDPOINT_URL = "https://eodata.dataspace.copernicus.eu"
@@ -164,55 +165,84 @@ Sentinel-py (cdse) has 4 metadata layers to avoid redundant queries and download
 """
 
 
+@dataclass(frozen=True)
+class CDSEQueryFilters:
+    """Result-affecting OData filters of one CDSE query, apart from AOI and windows.
+
+    Every field participates in the query cache key, so two queries that differ in
+    any of them never share a cache directory.
+    """
+
+    orbit: str | None = None
+    cloud_thresh: float | None = None
+    burst_id: int | None = None
+    swath_id: str | None = None
+    rel_orbit_num: int | None = None
+    ops_mode: str | None = None
+    platform_serial_id: str | None = None
+    attrs: dict[str, str | int | float] | None = None
+    burst_mode: bool = False
+    abs_burst_id: int | None = None
+    parent_product_name: str | None = None
+    parent_product_type: str | None = None
+    parent_product_id: str | None = None
+    datatake_id: int | None = None
+    pol_channels: str | None = None
+    top: int = 1000
+    count: bool = False
+
+
 def query_cache_key(
     aoi_wkt: str,
     collection_name: str,
     product_type: str | None,
     iso_windows: list[tuple[str, str]],
-    orbit: str | None = None,
-    cloud_thresh: float | None = None,
-    burst_id: int | None = None,
-    swath_id: str | None = None,
-    rel_orbit_num: int | None = None,
-    ops_mode: str | None = None,
-    platform_serial_id: str | None = None,
-    attrs: dict[str, str | int | float] | None = None,
-    burst_mode: bool = False,
-    abs_burst_id: int | None = None,
-    parent_product_name: str | None = None,
-    parent_product_type: str | None = None,
-    parent_product_id: str | None = None,
-    datatake_id: int | None = None,
-    pol_channels: str | None = None,
-    top: int = 1000,
-    count: bool = False,
+    filters: CDSEQueryFilters | None = None,
 ) -> str:
+    """Generate the hash key naming a query's cache directory.
+
+    Parameters
+    ----------
+    aoi_wkt : str
+        WKT of the union of the AOI geometries.
+    collection_name : str
+        CDSE collection name.
+    product_type : str, optional
+        Product-type filter.
+    iso_windows : list[tuple[str, str]]
+        ISO start/end timestamps of each query window.
+    filters : CDSEQueryFilters, optional
+        Remaining result-affecting filters; defaults apply when omitted.
+
+    Returns
+    -------
+    str
+        Deterministic key. Adding a field to :class:`CDSEQueryFilters` changes keys
+        for every query, so new filters must default in a way that is excluded here.
     """
-    Generate a hash key from query parameters. This hash key will be used as the name of
-    the cache directory for the query results.
-    """
+    filters = filters or CDSEQueryFilters()
     payload = {
         "collection": collection_name,
         "product": product_type,
         "windows": iso_windows,
         "aoi_wkt": aoi_wkt,
-        "orbit": orbit,
-        "cloud_thresh": cloud_thresh,
-        "burst_id": burst_id,
-        "swath_id": swath_id,
-        "rel_orbit_num": rel_orbit_num,
-        "ops_mode": ops_mode,
-        "platform_serial_id": platform_serial_id,
-        "attrs": attrs,
-        "burst_mode": burst_mode,
-        "abs_burst_id": abs_burst_id,
-        "parent_product_name": parent_product_name,
-        "parent_product_type": parent_product_type,
-        "parent_product_id": parent_product_id,
-        "datatake_id": datatake_id,
-        "pol_channels": pol_channels,
-        "top": top,
-        "count": count,
+        "orbit": filters.orbit,
+        "cloud_thresh": filters.cloud_thresh,
+        "burst_id": filters.burst_id,
+        "swath_id": filters.swath_id,
+        "rel_orbit_num": filters.rel_orbit_num,
+        "ops_mode": filters.ops_mode,
+        "platform_serial_id": filters.platform_serial_id,
+        "attrs": filters.attrs,
+        "burst_mode": filters.burst_mode,
+        "abs_burst_id": filters.abs_burst_id,
+        "parent_product_name": filters.parent_product_name,
+        "parent_product_type": filters.parent_product_type,
+        "parent_product_id": filters.parent_product_id,
+        "datatake_id": filters.datatake_id,
+        "pol_channels": filters.pol_channels,
+        "top": filters.top,
+        "count": filters.count,
     }
     return deterministic_cache_key(payload)
 
@@ -370,23 +400,25 @@ def query_cdse(
         collection,
         product,
         iso_windows,
-        orbit=orbit,
-        cloud_thresh=cloud_thresh,
-        burst_id=burst_id,
-        swath_id=swath_id,
-        rel_orbit_num=rel_orbit_num,
-        ops_mode=ops_mode,
-        platform_serial_id=platform_serial_id,
-        attrs=attrs,
-        burst_mode=burst_mode,
-        abs_burst_id=abs_burst_id,
-        parent_product_name=parent_product_name,
-        parent_product_type=parent_product_type,
-        parent_product_id=parent_product_id,
-        datatake_id=datatake_id,
-        pol_channels=pol_channels,
-        top=top,
-        count=count,
+        CDSEQueryFilters(
+            orbit=orbit,
+            cloud_thresh=cloud_thresh,
+            burst_id=burst_id,
+            swath_id=swath_id,
+            rel_orbit_num=rel_orbit_num,
+            ops_mode=ops_mode,
+            platform_serial_id=platform_serial_id,
+            attrs=attrs,
+            burst_mode=burst_mode,
+            abs_burst_id=abs_burst_id,
+            parent_product_name=parent_product_name,
+            parent_product_type=parent_product_type,
+            parent_product_id=parent_product_id,
+            datatake_id=datatake_id,
+            pol_channels=pol_channels,
+            top=top,
+            count=count,
+        ),
     )
     query_dir = cache_directory(cache_dir, cache_key)
     scenes_cache = query_dir / "scenes.parquet"
@@ -670,6 +702,75 @@ def _resolve_s2_bands(
             )
 
     return resolved
+
+
+@dataclass(frozen=True)
+class AssetSelection:
+    """Decide whether cached asset rows satisfy one scene's download request.
+
+    This is the single definition of "the cache is sufficient for this request",
+    shared by the storage preflight and by the download itself so they cannot
+    disagree.
+
+    Attributes
+    ----------
+    mission : str
+        ``"S1"`` or ``"S2"``.
+    bands : list[str]
+        Requested band or polarization names.
+    resolved_bands : list[ResolvedBand] | None
+        Sentinel-2 bands resolved to existing resolutions; ``None`` for Sentinel-1.
+    """
+
+    mission: str
+    bands: list[str]
+    resolved_bands: list[ResolvedBand] | None = None
+
+    def select(self, scene_name: str, assets: pd.DataFrame | None) -> pd.DataFrame | None:
+        """Return the cached rows of one scene that satisfy the request.
+
+        Parameters
+        ----------
+        scene_name : str
+            SAFE scene name; its product level decides the metadata assets and
+            whether resolutions apply (Level-1C assets are stored at resolution 0).
+        assets : pandas.DataFrame | None
+            Cached asset rows for this scene with ``band_name`` and
+            ``resolution_m`` columns.
+
+        Returns
+        -------
+        pandas.DataFrame | None
+            Only the rows belonging to this request (requested bands plus, for
+            Sentinel-2, the product and tile metadata), or ``None`` when the cache
+            is incomplete and S3 must be listed.
+        """
+        if assets is None or assets.empty:
+            return None
+        names = assets["band_name"].astype(str)
+
+        if self.mission.upper() == Mission.s2 and self.resolved_bands is not None:
+            is_l1c = "MSIL1C" in scene_name.upper()
+            requested = {
+                (band.band, 0 if is_l1c else band.resolution)
+                for band in self.resolved_bands
+            }
+            metadata = {s2_metadata_name(scene_name), "MTD_TL"}
+            keys = list(zip(names, assets["resolution_m"].fillna(0).astype(int)))
+            if not requested.issubset(keys) or not metadata.issubset(set(names)):
+                return None
+            # Other bands resolved by an earlier command do not count toward this
+            # request or its size.
+            keep = [key in requested or key[0] in metadata for key in keys]
+            return assets[keep]
+
+        # Sentinel-1 assets have no resolution pairing or SAFE metadata, so names
+        # alone determine completeness.
+        requested_names = {band.upper() for band in self.bands}
+        upper = names.str.upper()
+        if not requested_names.issubset(set(upper)):
+            return None
+        return assets[upper.isin(requested_names)]
 
 
 # --------------------------------------------------------------------------------------
@@ -1132,17 +1233,6 @@ class StorageEstimator:
         )
 
 
-def _format_bytes(size: int) -> str:
-    """Format a byte count using compact IEC units."""
-    value = float(max(0, size))
-    units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
-    for unit in units:
-        if value < 1024 or unit == units[-1]:
-            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
-        value /= 1024
-    return f"{value:.1f} PiB"
-
-
 def _free_disk_bytes(path: Path) -> int | None:
     """Return free bytes for path, falling back to its nearest existing parent."""
     target = path
@@ -1196,11 +1286,11 @@ def _storage_progress_text(
         else "estimate"
     )
     text = (
-        f"{qualifier}: dataset ~{_format_bytes(projection.projected_footprint)} total, "
-        f"~{_format_bytes(projection.projected_additional)} additional"
+        f"{qualifier}: dataset ~{format_bytes_compact(projection.projected_footprint)} total, "
+        f"~{format_bytes_compact(projection.projected_additional)} additional"
     )
     if free_bytes is not None:
-        text += f"; {_format_bytes(free_bytes)} free at start"
+        text += f"; {format_bytes_compact(free_bytes)} free at start"
         if projection.projected_additional > free_bytes:
             text = "⚠ " + text
     return text
@@ -1263,7 +1353,7 @@ def _download_scene_from_images(
                         **t,
                         "local_actual_size": local_size,
                         "local_path": str(local_path),
-                        "download_status": "complete",
+                        "download_status": DownloadStatus.complete,
                     }
                 )
                 result.skipped.append(label)
@@ -1283,7 +1373,7 @@ def _download_scene_from_images(
                         **t,
                         "local_actual_size": local_size,
                         "local_path": str(local_path),
-                        "download_status": "complete",
+                        "download_status": DownloadStatus.complete,
                     }
                 )
                 result.skipped.append(label)
@@ -1345,7 +1435,7 @@ def _download_scene_from_images(
                         **image,
                         "local_actual_size": actual,
                         "local_path": str(local_path),
-                        "download_status": "complete",
+                        "download_status": DownloadStatus.complete,
                     }
                 )
                 logger.debug(f"  DWNLDED {scene_name} / {label}")
@@ -1465,62 +1555,17 @@ def prepare_cdse_download(
     # 3. Convert the requested Sentinel-2 bands to resolutions that actually exist in
     #    CDSE. For example, a requested resolution may need the repository's documented
     #    fallback resolution. The S1 branch remains available to the lower-level API.
-    if mission.upper() == "S2":
+    if mission.upper() == Mission.s2:
         resolved_bands = _resolve_s2_bands(bands, resolution, logger)
     else:
         resolved_bands = None
 
+    selection = AssetSelection(mission, list(bands), resolved_bands)
+
     def _selected_cached_assets(scene_name: str) -> list[dict] | None:
         """Return a complete cached asset selection, or None if S3 must be listed."""
-        scene_assets = assets_by_scene.get(scene_name)
-        if scene_assets is None or scene_assets.empty:
-            return None
-
-        if mission.upper() == "S2" and resolved_bands is not None:
-            is_l1c = "MSIL1C" in scene_name.upper()
-            requested_keys = {
-                (band.band, 0 if is_l1c else band.resolution) for band in resolved_bands
-            }
-            metadata_names = {
-                "MTD_MSIL1C" if is_l1c else "MTD_MSIL2A",
-                "MTD_TL",
-            }
-
-            # A cached scene is usable only if it contains every requested
-            # band/resolution pair and both required SAFE metadata files.
-            available_keys = set(
-                zip(
-                    scene_assets["band_name"].astype(str),
-                    scene_assets["resolution_m"].fillna(0).astype(int),
-                )
-            )
-            available_names = set(scene_assets["band_name"].astype(str))
-            if not requested_keys.issubset(
-                available_keys
-            ) or not metadata_names.issubset(available_names):
-                return None
-
-            # Ignore other bands that may have been resolved by an earlier command;
-            # only the assets belonging to this request contribute to its size.
-            keep = [
-                key in requested_keys or key[0] in metadata_names
-                for key in zip(
-                    scene_assets["band_name"].astype(str),
-                    scene_assets["resolution_m"].fillna(0).astype(int),
-                )
-            ]
-            selected = scene_assets[keep]
-        else:
-            # Sentinel-1 assets have no band-resolution pairing or SAFE metadata
-            # requirement, so names alone determine whether the cache is complete.
-            requested_names = {band.upper() for band in bands}
-            available_names = set(scene_assets["band_name"].astype(str).str.upper())
-            if not requested_names.issubset(available_names):
-                return None
-            selected = scene_assets[
-                scene_assets["band_name"].astype(str).str.upper().isin(requested_names)
-            ]
-        return selected.to_dict("records")
+        selected = selection.select(scene_name, assets_by_scene.get(scene_name))
+        return None if selected is None else selected.to_dict("records")
 
     # 4. Partition the manifest into scenes whose requested assets are fully described
     #    by the cache and scenes that still require metadata-only S3 listings.
@@ -1538,7 +1583,7 @@ def prepare_cdse_download(
         """List one scene in S3 and return its full listing and requested assets."""
         scene_name = str(row["Name"])
         s3_path = str(row["S3Path"])
-        if mission.upper() == "S2":
+        if mission.upper() == Mission.s2:
             if resolved_bands is None:
                 raise ValueError("Resolved Sentinel-2 bands are unavailable")
             listing = _list_s2_product_assets(
@@ -1546,7 +1591,7 @@ def prepare_cdse_download(
             )
             images = _select_s2_assets(listing, resolved_bands, scene_name, logger)
             return scene_name, listing, images
-        elif mission.upper() == "S1":
+        elif mission.upper() == Mission.s1:
             images = _find_s1_scene_images(
                 scene_name,
                 s3_path,
@@ -1708,66 +1753,44 @@ def resolve_and_download(
     downloads_file = REGISTRY["cdse_downloads"].path(output_dir)
     downloads_store = REGISTRY["cdse_downloads"].store(output_dir)
     logger.info(f"Looking for images cache at: {images_file}")
+    cached_by_scene: dict[str, pd.DataFrame] = {}
     if not cached_images.empty:
         # ensure local_actual_size column exists for back-compat with older caches
         if "local_actual_size" not in cached_images.columns:
             cached_images["local_actual_size"] = None
-        cached_keys = set(
-            zip(
-                cached_images["safedir"],
-                cached_images["band_name"],
-                cached_images["resolution_m"],
-            )
-        )
-        cached_scene_names = set(cached_images["safedir"].unique())
-        # Per-scene asset-name sets, built once, for the metadata completeness check.
-        scene_asset_names_by_scene = {
-            str(name): set(frame.astype(str))
-            for name, frame in cached_images.groupby("safedir", sort=False)["band_name"]
+        cached_by_scene = {
+            str(name): frame
+            for name, frame in cached_images.groupby("safedir", sort=False)
         }
         logger.info(
             "Found %d scenes (%d rows) in %s",
-            len(cached_scene_names),
+            len(cached_by_scene),
             len(cached_images),
             images_file,
         )
-        logger.info(f"First 3 cached scenes: {list(cached_scene_names)[:3]}")
+        logger.info(f"First 3 cached scenes: {list(cached_by_scene)[:3]}")
         logger.info(f"First 3 query scenes: {scenes['Name'].head(3).tolist()}")
     else:
         logger.info(f"No images cache at {images_file}")
-        cached_keys = set()
-        cached_scene_names = set()
-        scene_asset_names_by_scene = {}
 
-    # resolve bands once (logs fallbacks once) — must be before _scene_fully_cached
-    if mission.upper() == "S2":
+    # resolve bands once (logs fallbacks once) before judging cache completeness
+    if mission.upper() == Mission.s2:
         resolved_bands = _resolve_s2_bands(bands, resolution, logger)
     else:
         resolved_bands = None
+    selection = AssetSelection(mission, list(bands), resolved_bands)
 
-    # split scenes; a scene is only "fully cached" if ALL requested bands are cached
+    # A scene is only "fully cached" if every requested asset (and, for S2, the SAFE
+    # metadata) is cached; ``selection`` is the single definition of that rule.
+    selected_cached = {
+        name: selected
+        for name, frame in cached_by_scene.items()
+        if (selected := selection.select(name, frame)) is not None
+    }
+
     def _scene_fully_cached(name: str) -> bool:
         """Check if all requested assets have already been resolved from S3."""
-        if name not in cached_scene_names:
-            return False
-        bands_to_check = (
-            resolved_bands
-            if mission.upper() == "S2" and resolved_bands is not None
-            else [ResolvedBand(band=b, resolution=0) for b in bands]
-        )
-        for rb in bands_to_check:
-            if (name, rb.band, rb.resolution) not in cached_keys:
-                return False
-        # Require metadata assets for S2 scenes, otherwise the scene is not fully cached
-        if mission.upper() == "S2":
-            metadata_name = s2_metadata_name(name)
-            scene_asset_names = scene_asset_names_by_scene.get(name, set())
-            if (
-                metadata_name not in scene_asset_names
-                or "MTD_TL" not in scene_asset_names
-            ):
-                return False
-        return True
+        return name in selected_cached
 
     fully_cached = scenes["Name"].apply(_scene_fully_cached)
     uncached_df = scenes[~fully_cached]
@@ -1775,7 +1798,7 @@ def resolve_and_download(
 
     logger.info(
         f"Total: {len(scenes)} scenes — "
-        f"{len(cached_keys)} cached, {len(uncached_df)} to resolve"
+        f"{len(cached_df)} cached, {len(uncached_df)} to resolve"
     )
 
     all_results: list[DownloadResult] = []
@@ -1823,7 +1846,7 @@ def resolve_and_download(
         # Append one immutable part; newer rows override older ones when read.
         asset_store.append(rows_to_write)
         completed_rows = [
-            row for row in rows_to_write if row.get("download_status") == "complete"
+            row for row in rows_to_write if row.get("download_status") == DownloadStatus.complete
         ]
         # Flush completed rows to the local downloads cache
         if completed_rows:
@@ -1848,7 +1871,7 @@ def resolve_and_download(
         # Always resolve via S3 so s3_expected_size is authoritative. If the files
         # already exist locally, the download step will stat them and, on a size match,
         # skip + record local_actual_size into the cache
-        if mission.upper() == "S2":
+        if mission.upper() == Mission.s2:
             if resolved_bands is None:
                 logger.error(f"resolved_bands is None for S2 scene: {name}")
                 return DownloadResult(scene_name=name)
@@ -1860,7 +1883,7 @@ def resolve_and_download(
                 f"Scene {name}: resolved images: "
                 f"{', '.join(f'{t["band_name"]}@{t["resolution_m"]}m' for t in images)}"
             )
-        elif mission.upper() == "S1":
+        elif mission.upper() == Mission.s1:
             images = _find_s1_scene_images(
                 name, raw_s3_path, bands, config_file, logger=logger
             )
@@ -1884,7 +1907,7 @@ def resolve_and_download(
         # Determine which expected images are missing
         expected_keys = (
             {(rb.band, rb.resolution) for rb in resolved_bands}
-            if mission.upper() == "S2" and resolved_bands is not None
+            if mission.upper() == Mission.s2 and resolved_bands is not None
             else {(band.upper(), 0) for band in bands}
         )
         found_keys = {
@@ -1896,7 +1919,7 @@ def resolve_and_download(
             for band, resolution in sorted(expected_keys - found_keys)
         ]
         # For S2, also check for required metadata assets
-        if mission.upper() == "S2":
+        if mission.upper() == Mission.s2:
             metadata_name = s2_metadata_name(name)
             if not any(image["band_name"] == metadata_name for image in images):
                 missing_labels.append(metadata_name)
@@ -1985,43 +2008,23 @@ def resolve_and_download(
         if new_scene_storage is not None:
             storage_message = (
                 "New-scene storage estimate: "
-                f"dataset ~{_format_bytes(new_scene_storage.projected_footprint)} total; "
-                f"~{_format_bytes(new_scene_storage.projected_additional)} additional "
+                f"dataset ~{format_bytes_compact(new_scene_storage.projected_footprint)} total; "
+                f"~{format_bytes_compact(new_scene_storage.projected_additional)} additional "
                 f"disk space (based on {new_scene_storage.resolved_scenes}/"
                 f"{new_scene_storage.total_scenes} resolved scenes)"
             )
             if initial_free_bytes is not None:
-                storage_message += f"; {_format_bytes(initial_free_bytes)} free at start"
+                storage_message += f"; {format_bytes_compact(initial_free_bytes)} free at start"
                 if new_scene_storage.projected_additional > initial_free_bytes:
                     storage_message += " — estimated requirement exceeds available space"
             logger.info(storage_message)
 
         # Cached scenes: verify + download only --------------------------------------------
-        if not cached_images.empty and not cached_df.empty:
-            cached_names = set(cached_df["Name"])
-            if mission.upper() == "S2" and resolved_bands is not None:
-                requested_keys = {(rb.band, rb.resolution) for rb in resolved_bands}
-                band_names = cached_images["band_name"].astype(str)
-                resolutions = (
-                    pd.to_numeric(cached_images["resolution_m"], errors="coerce")
-                    .fillna(0)
-                    .astype(int)
-                )
-                requested_mask = pd.MultiIndex.from_arrays(
-                    [band_names, resolutions]
-                ).isin(requested_keys)
-                cached_assets_for_request = cached_images[
-                    requested_mask | band_names.isin(S2_METADATA_ASSETS).to_numpy()
-                ]
-            else:
-                requested_names = {band.upper() for band in bands}
-                cached_assets_for_request = cached_images[
-                    cached_images["band_name"].astype(str).str.upper().isin(requested_names)
-                ]
+        if not cached_df.empty:
             grouped = [
-                (name, group.to_dict("records"))
-                for name, group in cached_assets_for_request.groupby("safedir")
-                if name in cached_names
+                (name, selected_cached[name].to_dict("records"))
+                for name in sorted(set(cached_df["Name"]))
+                if name in selected_cached
             ]
 
             if grouped:

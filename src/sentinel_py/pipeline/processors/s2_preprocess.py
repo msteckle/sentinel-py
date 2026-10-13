@@ -198,11 +198,10 @@ class S2PreprocessProcessor(BaseProcessor):
             resolution=pipeline.output_grid.resolution,
             anchor=pipeline.output_grid.anchor,
         )
-        source_state = REGISTRY["cdse_downloads"].path(source.data_dir)
-        fingerprint = (
-            (str(source_state), source_state.stat().st_size, source_state.stat().st_mtime_ns)
-            if source_state.exists() else (str(source.data_dir), source.data_dir.stat().st_mtime_ns)
-        )
+        # The state fingerprint covers checkpoint parts as well as the base file.
+        fingerprint = REGISTRY["cdse_downloads"].store(source.data_dir).fingerprint()
+        if fingerprint is None:
+            fingerprint = (str(source.data_dir), source.data_dir.stat().st_mtime_ns)
         cache_key = point_sample_cache_key(
             reader_name="s2.l2a.local",
             source_fingerprint=fingerprint,

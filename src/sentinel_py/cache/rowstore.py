@@ -191,6 +191,33 @@ class RowStore:
                     raise
         raise AssertionError("unreachable")  # pragma: no cover
 
+    def fingerprint(self) -> tuple | None:
+        """Return a hashable description of the store's current files.
+
+        The base file entry has the same ``(path, size, mtime_ns)`` shape that
+        callers used before parts existed, so a compacted store yields the same
+        value as the single file did. Part files are appended only while some
+        exist, so state held in uncompacted parts still changes the fingerprint.
+
+        Returns
+        -------
+        tuple | None
+            ``None`` when the store has no files.
+        """
+        entries = []
+        if self.path.is_file():
+            stat = self.path.stat()
+            entries.append((str(self.path), stat.st_size, stat.st_mtime_ns))
+        for part in self.part_paths():
+            try:
+                stat = part.stat()
+            except FileNotFoundError:  # compacted concurrently
+                continue
+            entries.append((part.name, stat.st_size, stat.st_mtime_ns))
+        if not entries:
+            return None
+        return entries[0] if len(entries) == 1 else tuple(entries)
+
     def keys(self) -> pd.DataFrame:
         """Return only the key columns of every stored row."""
         return self.read(columns=self.key_columns)

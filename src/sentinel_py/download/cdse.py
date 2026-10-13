@@ -37,7 +37,6 @@ from sentinel_py.cache import (
     legacy_provider_cache_root,
     mark_cache_used,
     merge_parquet_cache,
-    merge_state_rows,
     write_json_atomic,
     write_parquet_atomic,
 )
@@ -1375,6 +1374,19 @@ def _download_scene_from_images(
 # --------------------------------------------------------------------------------------
 
 
+class _CancelOnErrorPool(ThreadPoolExecutor):
+    """Thread pool that drops queued work when its block exits on an error.
+
+    A plain ``with ThreadPoolExecutor`` waits for every submitted task when an
+    exception or interrupt unwinds, so a failure in a 60k-scene run would still
+    start every remaining scene. Tasks already running are allowed to finish.
+    """
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.shutdown(wait=True, cancel_futures=exc_type is not None)
+        return False
+
+
 def prepare_cdse_download(
     scenes_cache: Path,
     mission: str,
@@ -1711,6 +1723,7 @@ def resolve_and_download(
         key_filters={"safedir": scenes["Name"].astype(str).tolist()}
     )
     downloads_file = REGISTRY["cdse_downloads"].path(output_dir)
+    downloads_store = REGISTRY["cdse_downloads"].store(output_dir)
     logger.info(f"Looking for images cache at: {images_file}")
     if not cached_images.empty:
         # ensure local_actual_size column exists for back-compat with older caches
@@ -1742,10 +1755,6 @@ def resolve_and_download(
         cached_keys = set()
         cached_scene_names = set()
         scene_asset_names_by_scene = {}
-
-    local_downloads = (
-        pd.read_parquet(downloads_file) if downloads_file.exists() else pd.DataFrame()
-    )
 
     # resolve bands once (logs fallbacks once) — must be before _scene_fully_cached
     if mission.upper() == "S2":
@@ -1833,17 +1842,7 @@ def resolve_and_download(
         ]
         # Flush completed rows to the local downloads cache
         if completed_rows:
-            existing_local = (
-                pd.read_parquet(downloads_file)
-                if downloads_file.exists()
-                else local_downloads
-            )
-            combined_local = merge_state_rows(
-                existing_local,
-                completed_rows,
-                key_columns=IMAGE_KEY_COLS,
-            )
-            write_parquet_atomic(combined_local, downloads_file, index=False)
+            downloads_store.append(completed_rows)
         logger.info(
             f"Flushed {len(rows_to_write)} remote asset row(s) and "
             f"{len(completed_rows)} local download row(s)"
@@ -1940,124 +1939,10 @@ def resolve_and_download(
         result.failed.extend(f"MISSING:{label}" for label in missing_labels)
         return result
 
-    # Process uncached rows
-    if not uncached_df.empty:
-        uncached_rows = [row for _, row in uncached_df.iterrows()]
-
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            TextColumn("[cyan]{task.fields[status]}"),
-        ) as progress:
-            task_id = progress.add_task(
-                "Resolving & downloading new scenes",
-                total=len(uncached_rows),
-                status=_progress_status(),
-            )
-
-            with ThreadPoolExecutor(max_workers=parallel_scenes) as pool:
-                futures = {
-                    pool.submit(_resolve_and_dl, r): r["Name"] for r in uncached_rows
-                }
-                fatal_error = None
-                for future in as_completed(futures):
-                    name = futures[future]
-                    try:
-                        result = future.result()
-                    except RuntimeError as exc:
-                        cancel.set()
-                        fatal_error = exc
-                        for f in futures:
-                            f.cancel()
-                        break
-                    except Exception as exc:
-                        logger.error(f"Scene {name} failed: {exc}")
-                        result = DownloadResult(
-                            scene_name=str(name), failed=["SCENE_ERROR"]
-                        )
-
-                    _record_progress_result(result)
-                    all_results.append(result)
-                    _flush_images(force=False)
-                    progress.update(
-                        task_id,
-                        advance=1,
-                        status=_progress_status(),
-                    )
-
-                if fatal_error:
-                    raise fatal_error
-
-    # final flush for any remaining images from the uncached pass
-    _flush_images(force=True)
-
-    new_scene_storage = storage_estimator.projection()
-    if new_scene_storage is not None:
-        storage_message = (
-            "New-scene storage estimate: "
-            f"dataset ~{_format_bytes(new_scene_storage.projected_footprint)} total; "
-            f"~{_format_bytes(new_scene_storage.projected_additional)} additional "
-            f"disk space (based on {new_scene_storage.resolved_scenes}/"
-            f"{new_scene_storage.total_scenes} resolved scenes)"
-        )
-        if initial_free_bytes is not None:
-            storage_message += f"; {_format_bytes(initial_free_bytes)} free at start"
-            if new_scene_storage.projected_additional > initial_free_bytes:
-                storage_message += " — estimated requirement exceeds available space"
-        logger.info(storage_message)
-
-    # Cached scenes: verify + download only --------------------------------------------
-    if not cached_images.empty and not cached_df.empty:
-        cached_names = set(cached_df["Name"])
-        if mission.upper() == "S2" and resolved_bands is not None:
-            requested_keys = {(rb.band, rb.resolution) for rb in resolved_bands}
-            band_names = cached_images["band_name"].astype(str)
-            resolutions = (
-                pd.to_numeric(cached_images["resolution_m"], errors="coerce")
-                .fillna(0)
-                .astype(int)
-            )
-            requested_mask = pd.MultiIndex.from_arrays(
-                [band_names, resolutions]
-            ).isin(requested_keys)
-            cached_assets_for_request = cached_images[
-                requested_mask | band_names.isin(S2_METADATA_ASSETS).to_numpy()
-            ]
-        else:
-            requested_names = {band.upper() for band in bands}
-            cached_assets_for_request = cached_images[
-                cached_images["band_name"].astype(str).str.upper().isin(requested_names)
-            ]
-        grouped = [
-            (name, group.to_dict("records"))
-            for name, group in cached_assets_for_request.groupby("safedir")
-            if name in cached_names
-        ]
-
-        if grouped:
-
-            def _dl_cached(name_images: tuple[str, list[dict]]) -> DownloadResult:
-                if cancel.is_set():
-                    return DownloadResult(scene_name=name_images[0])
-                name, images = name_images
-                s3_path = s3_paths.get(name, "").removeprefix("/eodata")
-                result = _download_scene_from_images(
-                    scene_name=name,
-                    s3_path=s3_path,
-                    images=images,
-                    output_dir=output_dir,
-                    config_file=config_file,
-                    parallel_bands=parallel_bands,
-                    logger=logger,
-                )
-                if result.updated_images:
-                    with lock:
-                        pending_image_rows.extend(result.updated_images)
-                return result
+    try:
+        # Process uncached rows
+        if not uncached_df.empty:
+            uncached_rows = [row for _, row in uncached_df.iterrows()]
 
             with Progress(
                 SpinnerColumn(),
@@ -2069,15 +1954,14 @@ def resolve_and_download(
                 TextColumn("[cyan]{task.fields[status]}"),
             ) as progress:
                 task_id = progress.add_task(
-                    "Checking cached scenes & restoring files",
-                    total=len(grouped),
+                    "Resolving & downloading new scenes",
+                    total=len(uncached_rows),
                     status=_progress_status(),
                 )
 
-                with ThreadPoolExecutor(max_workers=parallel_scenes) as pool:
+                with _CancelOnErrorPool(max_workers=parallel_scenes) as pool:
                     futures = {
-                        pool.submit(_dl_cached, (str(ng[0]), ng[1])): str(ng[0])
-                        for ng in grouped
+                        pool.submit(_resolve_and_dl, r): r["Name"] for r in uncached_rows
                     }
                     fatal_error = None
                     for future in as_completed(futures):
@@ -2095,6 +1979,7 @@ def resolve_and_download(
                             result = DownloadResult(
                                 scene_name=str(name), failed=["SCENE_ERROR"]
                             )
+
                         _record_progress_result(result)
                         all_results.append(result)
                         _flush_images(force=False)
@@ -2107,11 +1992,130 @@ def resolve_and_download(
                     if fatal_error:
                         raise fatal_error
 
-            # flush any remaining updates from the cached-scenes pass
-            _flush_images(force=True)
+        # final flush for any remaining images from the uncached pass
+        _flush_images(force=True)
 
-    # Fold this run's checkpoint parts back into the base asset file.
+        new_scene_storage = storage_estimator.projection()
+        if new_scene_storage is not None:
+            storage_message = (
+                "New-scene storage estimate: "
+                f"dataset ~{_format_bytes(new_scene_storage.projected_footprint)} total; "
+                f"~{_format_bytes(new_scene_storage.projected_additional)} additional "
+                f"disk space (based on {new_scene_storage.resolved_scenes}/"
+                f"{new_scene_storage.total_scenes} resolved scenes)"
+            )
+            if initial_free_bytes is not None:
+                storage_message += f"; {_format_bytes(initial_free_bytes)} free at start"
+                if new_scene_storage.projected_additional > initial_free_bytes:
+                    storage_message += " — estimated requirement exceeds available space"
+            logger.info(storage_message)
+
+        # Cached scenes: verify + download only --------------------------------------------
+        if not cached_images.empty and not cached_df.empty:
+            cached_names = set(cached_df["Name"])
+            if mission.upper() == "S2" and resolved_bands is not None:
+                requested_keys = {(rb.band, rb.resolution) for rb in resolved_bands}
+                band_names = cached_images["band_name"].astype(str)
+                resolutions = (
+                    pd.to_numeric(cached_images["resolution_m"], errors="coerce")
+                    .fillna(0)
+                    .astype(int)
+                )
+                requested_mask = pd.MultiIndex.from_arrays(
+                    [band_names, resolutions]
+                ).isin(requested_keys)
+                cached_assets_for_request = cached_images[
+                    requested_mask | band_names.isin(S2_METADATA_ASSETS).to_numpy()
+                ]
+            else:
+                requested_names = {band.upper() for band in bands}
+                cached_assets_for_request = cached_images[
+                    cached_images["band_name"].astype(str).str.upper().isin(requested_names)
+                ]
+            grouped = [
+                (name, group.to_dict("records"))
+                for name, group in cached_assets_for_request.groupby("safedir")
+                if name in cached_names
+            ]
+
+            if grouped:
+
+                def _dl_cached(name_images: tuple[str, list[dict]]) -> DownloadResult:
+                    if cancel.is_set():
+                        return DownloadResult(scene_name=name_images[0])
+                    name, images = name_images
+                    s3_path = s3_paths.get(name, "").removeprefix("/eodata")
+                    result = _download_scene_from_images(
+                        scene_name=name,
+                        s3_path=s3_path,
+                        images=images,
+                        output_dir=output_dir,
+                        config_file=config_file,
+                        parallel_bands=parallel_bands,
+                        logger=logger,
+                    )
+                    if result.updated_images:
+                        with lock:
+                            pending_image_rows.extend(result.updated_images)
+                    return result
+
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[bold blue]{task.description}"),
+                    BarColumn(),
+                    MofNCompleteColumn(),
+                    TimeElapsedColumn(),
+                    TimeRemainingColumn(),
+                    TextColumn("[cyan]{task.fields[status]}"),
+                ) as progress:
+                    task_id = progress.add_task(
+                        "Checking cached scenes & restoring files",
+                        total=len(grouped),
+                        status=_progress_status(),
+                    )
+
+                    with _CancelOnErrorPool(max_workers=parallel_scenes) as pool:
+                        futures = {
+                            pool.submit(_dl_cached, (str(ng[0]), ng[1])): str(ng[0])
+                            for ng in grouped
+                        }
+                        fatal_error = None
+                        for future in as_completed(futures):
+                            name = futures[future]
+                            try:
+                                result = future.result()
+                            except RuntimeError as exc:
+                                cancel.set()
+                                fatal_error = exc
+                                for f in futures:
+                                    f.cancel()
+                                break
+                            except Exception as exc:
+                                logger.error(f"Scene {name} failed: {exc}")
+                                result = DownloadResult(
+                                    scene_name=str(name), failed=["SCENE_ERROR"]
+                                )
+                            _record_progress_result(result)
+                            all_results.append(result)
+                            _flush_images(force=False)
+                            progress.update(
+                                task_id,
+                                advance=1,
+                                status=_progress_status(),
+                            )
+
+                        if fatal_error:
+                            raise fatal_error
+
+                # flush any remaining updates from the cached-scenes pass
+                _flush_images(force=True)
+    finally:
+        # Persist rows buffered since the last flush, including after an interrupt.
+        _flush_images(force=True)
+
+    # Fold this run's checkpoint parts back into the base state files.
     asset_store.compact()
+    downloads_store.compact()
 
     # Summary --------------------------------------------------------------------------
     total_ok = sum(len(r.succeeded) for r in all_results)

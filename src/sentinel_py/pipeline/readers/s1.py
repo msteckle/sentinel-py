@@ -20,7 +20,7 @@ from pydantic import BaseModel
 from shapely.geometry import Polygon
 
 from sentinel_py.cache import REGISTRY, write_parquet_atomic
-from sentinel_py.download.s1_orbits import ORBIT_STATE_RELPATH, parse_scene_name
+from sentinel_py.download.s1_orbits import parse_scene_name
 from sentinel_py.enums import ASFOrbitDirection, S1OrbitPolicy
 from sentinel_py.pipeline.readers.base import BaseReader
 
@@ -213,10 +213,10 @@ def attach_orbits(catalog: pd.DataFrame, data_dir: Path) -> pd.DataFrame:
     result = catalog.copy()
     for column in ("orbit_type", "orbit_file", "orbit_path"):
         result[column] = pd.Series(pd.NA, index=result.index, dtype="object")
-    state_path = data_dir / ORBIT_STATE_RELPATH
-    if result.empty or not state_path.is_file():
+    # Reading through the store includes checkpoint parts of an interrupted run.
+    state = REGISTRY["s1_orbits"].store(data_dir).read()
+    if result.empty or state.empty:
         return result
-    state = pd.read_parquet(state_path)
     state = state[state["status"] == "staged"].drop_duplicates("scene", keep="last")
     by_scene = state.set_index("scene").to_dict("index")
     for index, scene in result["scene"].items():

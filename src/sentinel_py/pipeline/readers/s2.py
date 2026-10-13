@@ -321,7 +321,6 @@ def discover_s2_granules(
     ``granules = discover_s2_granules(raw_dir, ("B02", "B03"), 20, years=(2024,))``
     """
     input_dir = Path(input_dir).resolve()
-    state_path = REGISTRY["cdse_downloads"].path(input_dir)
 
     # Normalize the AOI once instead of reopening and reprojecting it per granule.
     aoi_geometry = None
@@ -333,8 +332,11 @@ def discover_s2_granules(
 
     # Prefer the output-scoped download state to avoid recursively scanning the archive.
     safe_names: list[str] = []
-    if state_path.is_file():
-        state = pd.read_parquet(state_path, columns=["safedir", "download_status"])
+    # RowStore includes checkpoint parts left by an interrupted download.
+    state = REGISTRY["cdse_downloads"].store(input_dir).read(
+        columns=["safedir", "download_status"]
+    )
+    if not state.empty:
         state = state[state["download_status"] == "complete"]
         safe_names = sorted(state["safedir"].dropna().astype(str).unique())
     if not safe_names:

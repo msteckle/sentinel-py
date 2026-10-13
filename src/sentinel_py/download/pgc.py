@@ -28,7 +28,7 @@ from shapely import wkt
 from shapely.geometry import base as shapely_base
 from shapely.geometry import shape
 
-from sentinel_py.cache import REGISTRY, merge_state_rows, write_parquet_atomic
+from sentinel_py.cache import REGISTRY, RowStore
 
 PGC_CATALOG_URL = "https://stac.pgc.umn.edu/api/v1/"
 PGC_COLLECTION = "arcticdem-mosaics-v4.1-10m"
@@ -279,8 +279,9 @@ def select_cached_tiles(
     selected["_geometry"] = selected["geometry_wkt"].map(wkt.loads)
     selected = selected[selected["_geometry"].map(aoi_geometry.intersects)].copy()
     selected = selected.drop(columns=["_geometry"])
-    if state_file is not None and Path(state_file).exists():
-        state = pd.read_parquet(state_file)
+    if state_file is not None:
+        # Includes checkpoint parts left by an interrupted download.
+        state = RowStore(Path(state_file), ["url"]).read()
         if not state.empty and "url" in state.columns:
             state = state.drop_duplicates("url", keep="last")
             selected = selected.merge(
@@ -355,11 +356,10 @@ def download_arcticdem(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     state_file = state_file or REGISTRY["pgc_downloads"].path(out_dir)
-    state = (
-        pd.read_parquet(state_file)
-        if state_file.exists()
-        else pd.DataFrame(columns=PGC_DOWNLOAD_STATE_COLUMNS)
-    )
+    state_store = RowStore(state_file, ["url"])
+    state = state_store.read()
+    if state.empty:
+        state = pd.DataFrame(columns=PGC_DOWNLOAD_STATE_COLUMNS)
     state_by_url = (
         state.drop_duplicates("url", keep="last").set_index("url").to_dict("index")
         if not state.empty and "url" in state.columns
@@ -445,15 +445,21 @@ def download_arcticdem(
         for record in records
     ]
     try:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            TextColumn("[cyan]{task.fields[status]}"),
-        ) as progress:
+        # State rows are checkpointed in small batches as downloads complete, so an
+        # interrupted run keeps what finished without rewriting the whole state file
+        # after every tile. The writer compacts the parts on a clean exit.
+        with (
+            state_store.writer(batch_rows=25, flush_seconds=15.0) as state_writer,
+            Progress(
+                SpinnerColumn(),
+                TextColumn("[bold blue]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+                TextColumn("[cyan]{task.fields[status]}"),
+            ) as progress,
+        ):
             task = progress.add_task(
                 "Checking & downloading ArcticDEM tiles",
                 total=len(records),
@@ -461,23 +467,28 @@ def download_arcticdem(
             )
             with ThreadPoolExecutor(max_workers=processes) as pool:
                 futures = [pool.submit(download_one, record) for record in records]
-                for future in as_completed(futures):
-                    row = future.result()
-                    state = merge_state_rows(state, [row], key_columns=["url"])
-                    write_parquet_atomic(state, state_file, index=False)
-                    if row["last_action"] == "downloaded":
-                        completed += 1
-                    elif row["last_action"] == "skipped":
-                        skipped += 1
-                    else:
-                        failed += 1
-                    progress.update(
-                        task,
-                        advance=1,
-                        status=(
-                            f"downloaded {completed} · skipped {skipped} · failed {failed}"
-                        ),
-                    )
+                try:
+                    for future in as_completed(futures):
+                        row = future.result()
+                        state_writer.add([row])
+                        if row["last_action"] == "downloaded":
+                            completed += 1
+                        elif row["last_action"] == "skipped":
+                            skipped += 1
+                        else:
+                            failed += 1
+                        progress.update(
+                            task,
+                            advance=1,
+                            status=(
+                                f"downloaded {completed} · skipped {skipped} · "
+                                f"failed {failed}"
+                            ),
+                        )
+                except BaseException:
+                    # Do not start the remaining queued downloads after an interrupt.
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    raise
     finally:
         for partial_path in partial_paths:
             partial_path.unlink(missing_ok=True)

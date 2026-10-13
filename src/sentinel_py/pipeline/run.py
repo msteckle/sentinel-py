@@ -142,6 +142,14 @@ def run_pipeline(
             task_progress_callback=task_progress_callback,
             initial_completed_tasks=initial_completed + offset,
         ))
+        # Writers that expose ``checkpoint`` persist resume state after every batch
+        # instead of only in finalize(), so an interrupt keeps completed work.
+        for output_id, (writer, plan) in plans.items():
+            checkpoint = getattr(writer, "checkpoint", None)
+            start, end = task_ranges[output_id]
+            low, high = max(start, offset), min(end, offset + len(batch))
+            if checkpoint is not None and low < high:
+                checkpoint(plan, tuple(computed_parts[low:high]), low - start)
     computed = tuple(computed_parts)
     output_results = {}
     for output_id, output in config.outputs.items():

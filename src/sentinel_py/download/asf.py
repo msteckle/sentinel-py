@@ -27,7 +27,7 @@ from rich.progress import (
 from shapely import wkt
 from shapely.geometry.polygon import orient
 
-from sentinel_py.cache import REGISTRY, merge_state_rows, write_parquet_atomic
+from sentinel_py.cache import REGISTRY, RowStore
 
 # Sentinel-1-specific values documented by ASF rather than the full generic
 # asf_search constant catalog, which also includes values for other missions:
@@ -545,12 +545,13 @@ def download_asf(
         )
 
     state_file = state_file or REGISTRY["asf_downloads"].path(out_dir)
-    if state_file.exists():
-        state = pd.read_parquet(state_file)
-        logger.info("Loaded ASF download state from %s", state_file)
-    else:
+    state_store = RowStore(state_file, ["url"])
+    state = state_store.read()
+    if state.empty:
         state = pd.DataFrame(columns=ASF_DOWNLOAD_STATE_COLUMNS)
         logger.info("No existing ASF download state at %s", state_file)
+    else:
+        logger.info("Loaded ASF download state from %s", state_file)
     for column in ("local_mtime_ns", "fingerprint_version"):
         if column not in state.columns:
             state[column] = pd.Series(pd.NA, index=state.index, dtype="Int64")
@@ -709,11 +710,10 @@ def download_asf(
     pending_state_rows: list[dict] = []
 
     def _flush_state() -> None:
-        nonlocal state
+        """Append buffered rows to the state store as one immutable part."""
         if not pending_state_rows:
             return
-        state = merge_state_rows(state, pending_state_rows, key_columns=["url"])
-        write_parquet_atomic(state, state_file, index=False)
+        state_store.append(pending_state_rows)
         pending_state_rows.clear()
 
     try:
@@ -737,26 +737,31 @@ def download_asf(
                     pool.submit(_download_one, product): str(product["url"])
                     for product in product_records
                 }
-                for future in as_completed(futures):
-                    row = future.result()
-                    cache_updated += 1
-                    if row["last_action"] == "downloaded":
-                        completed += 1
-                    elif row["last_action"] == "skipped":
-                        skipped += 1
-                    else:
-                        failed += 1
-                    pending_state_rows.append(row)
-                    if len(pending_state_rows) >= 100:
-                        _flush_state()
-                    progress.update(
-                        task_id,
-                        advance=1,
-                        status=(
-                            f"downloaded {completed} · skipped {skipped} · "
-                            f"failed {failed} · cache updated {cache_updated}"
-                        ),
-                    )
+                try:
+                    for future in as_completed(futures):
+                        row = future.result()
+                        cache_updated += 1
+                        if row["last_action"] == "downloaded":
+                            completed += 1
+                        elif row["last_action"] == "skipped":
+                            skipped += 1
+                        else:
+                            failed += 1
+                        pending_state_rows.append(row)
+                        if len(pending_state_rows) >= 100:
+                            _flush_state()
+                        progress.update(
+                            task_id,
+                            advance=1,
+                            status=(
+                                f"downloaded {completed} · skipped {skipped} · "
+                                f"failed {failed} · cache updated {cache_updated}"
+                            ),
+                        )
+                except BaseException:
+                    # Do not start the remaining queued downloads after an interrupt.
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    raise
     finally:
         try:
             _flush_state()
@@ -769,6 +774,9 @@ def download_asf(
                     partial_path.unlink(missing_ok=True)
                 except OSError:
                     pass
+
+    # Reached only after a clean run: fold this run's parts into the state file.
+    state_store.compact()
 
     end = time.time()
     end_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end))

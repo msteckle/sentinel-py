@@ -137,6 +137,7 @@ _ENTRIES = (
         CacheLocation.output_dir,
         f"{SIDECAR_DIR}/cog_outputs.parquet",
         "Resumable state of written COG outputs keyed by recipe fingerprint.",
+        key_columns=("task_id",),
     ),
     CacheNamespace(
         "point_samples",

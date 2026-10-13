@@ -11,15 +11,9 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pandas as pd
 
 from sentinel_py import raster_io
-from sentinel_py.cache import (
-    REGISTRY,
-    deterministic_cache_key,
-    merge_state_rows,
-    write_parquet_atomic,
-)
+from sentinel_py.cache import REGISTRY, RowStore, deterministic_cache_key
 from sentinel_py.pipeline.writers import OutputWritePlan
 from sentinel_py.pipeline.artifacts import ArtifactKind
 
@@ -175,7 +169,8 @@ class COGOutputWriter:
             raise ValueError("COG output requires a reflectance variable")
 
         state_path = cog_state_path(output.path)
-        state = pd.read_parquet(state_path) if state_path.is_file() else pd.DataFrame()
+        state_store = RowStore(state_path, ["task_id"])
+        state = state_store.read()
         cached = {
             str(row["task_id"]): row
             for row in state.to_dict("records")
@@ -300,8 +295,55 @@ class COGOutputWriter:
             output,
             tuple(tasks),
             tuple(completed),
-            {"state_path": state_path, "state": state},
+            {
+                "state_path": state_path,
+                "state": state,
+                "store": state_store,
+                # Task ids already persisted by checkpoint(), so finalize() does
+                # not write them twice.
+                "checkpointed": set(),
+            },
         )
+
+    def checkpoint(
+        self,
+        plan: OutputWritePlan,
+        computed: tuple[Any, ...],
+        offset: int = 0,
+    ) -> None:
+        """Persist resume state for one computed batch of this output's tasks.
+
+        The pipeline calls this after every materialization batch, so an
+        interrupted run keeps the state of all tiles written before the interrupt.
+
+        Parameters
+        ----------
+        plan : OutputWritePlan
+            Plan returned by :meth:`build`.
+        computed : tuple
+            Results of a contiguous run of this output's tasks.
+        offset : int, default 0
+            Index of ``computed[0]`` within the output's task list.
+        """
+        if "subplans" in plan.metadata:
+            position = 0
+            for subplan in plan.metadata["subplans"]:
+                low, high = position, position + len(subplan.tasks)
+                start = max(low, offset)
+                end = min(high, offset + len(computed))
+                if start < end:
+                    self.checkpoint(
+                        subplan, computed[start - offset:end - offset], start - low
+                    )
+                position = high
+            return
+        checkpointed: set[str] = plan.metadata["checkpointed"]
+        rows = [
+            result.state_row for result in computed if result.task_id not in checkpointed
+        ]
+        if rows:
+            plan.metadata["store"].append(rows)
+            checkpointed.update(row["task_id"] for row in rows)
 
     def finalize(
         self,
@@ -317,10 +359,14 @@ class COGOutputWriter:
                 offset += count
             return tuple(results)
         results = tuple(plan.completed) + tuple(computed)
-        state = merge_state_rows(
-            plan.metadata["state"],
-            (result.state_row for result in results),
-            key_columns=["task_id"],
+        checkpointed: set[str] = plan.metadata["checkpointed"]
+        store: RowStore = plan.metadata["store"]
+        store.append(
+            [
+                result.state_row
+                for result in results
+                if result.task_id not in checkpointed
+            ]
         )
-        write_parquet_atomic(state, plan.metadata["state_path"], index=False)
+        store.compact()
         return results

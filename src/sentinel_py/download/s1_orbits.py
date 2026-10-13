@@ -30,7 +30,7 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
-from sentinel_py.cache import REGISTRY, merge_state_rows, write_parquet_atomic
+from sentinel_py.cache import REGISTRY, RowStore
 from sentinel_py.enums import S1OrbitPolicy
 
 # ASF mirrors the ESA/Copernicus POD orbit archive over plain HTTP without
@@ -313,11 +313,10 @@ def stage_orbits(
         )
 
     state_path = out_dir / ORBIT_STATE_RELPATH
-    state = (
-        pd.read_parquet(state_path)
-        if state_path.is_file()
-        else pd.DataFrame(columns=ORBIT_STATE_COLUMNS)
-    )
+    state_store = RowStore(state_path, ["scene"])
+    state = state_store.read()
+    if state.empty:
+        state = pd.DataFrame(columns=ORBIT_STATE_COLUMNS)
     previous = (
         state.drop_duplicates(subset=["scene"], keep="last")
         .set_index("scene")
@@ -398,42 +397,14 @@ def stage_orbits(
         if not (out_dir / _relative_orbit_path(orbit)).is_file()
     }
     failed_files: dict[str, str] = {}
-    if needed:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue]Downloading Sentinel-1 orbit files"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-        ) as progress:
-            task = progress.add_task("orbits", total=len(needed))
-            with ThreadPoolExecutor(max_workers=max(1, processes)) as pool:
-                futures = {
-                    pool.submit(
-                        _download_orbit,
-                        orbit,
-                        out_dir,
-                        session,
-                        retries=retries,
-                        retry_backoff=retry_backoff,
-                        logger=logger,
-                    ): name
-                    for name, orbit in needed.items()
-                }
-                for future in as_completed(futures):
-                    name = futures[future]
-                    try:
-                        future.result()
-                    except Exception as error:  # noqa: BLE001 - recorded per file
-                        logger.error("FAILED orbit %s: %s", name, error)
-                        failed_files[name] = str(error)
-                    progress.advance(task)
-
     now = datetime.now(timezone.utc).isoformat()
     rows: list[dict[str, Any]] = []
     missing: list[str] = []
     failed = 0
-    for scene in pending:
+
+    def _scene_row(scene: SceneTimes) -> dict[str, Any]:
+        """Build the state row for one scene once its orbit outcome is known."""
+        nonlocal failed
         orbit = assignments.get(scene.scene)
         base = {
             "scene": scene.scene,
@@ -442,22 +413,17 @@ def stage_orbits(
             "scene_stop": scene.stop.isoformat(),
             "checked_at": now,
         }
-        if scene.scene in reused:
-            continue
         if orbit is not None and orbit.name not in failed_files:
-            rows.append(
-                {
-                    **base,
-                    "orbit_type": orbit.kind,
-                    "orbit_file": orbit.name,
-                    "orbit_path": _relative_orbit_path(orbit).as_posix(),
-                    "valid_start": orbit.valid_start.isoformat(),
-                    "valid_stop": orbit.valid_stop.isoformat(),
-                    "status": "staged",
-                    "error": None,
-                }
-            )
-            continue
+            return {
+                **base,
+                "orbit_type": orbit.kind,
+                "orbit_file": orbit.name,
+                "orbit_path": _relative_orbit_path(orbit).as_posix(),
+                "valid_start": orbit.valid_start.isoformat(),
+                "valid_stop": orbit.valid_stop.isoformat(),
+                "status": "staged",
+                "error": None,
+            }
         error = errors.get(scene.scene) or (
             failed_files.get(orbit.name) if orbit is not None else None
         )
@@ -465,22 +431,77 @@ def stage_orbits(
             failed += 1
         else:
             missing.append(scene.scene)
-        rows.append(
-            {
-                **base,
-                "orbit_type": None,
-                "orbit_file": None,
-                "orbit_path": None,
-                "valid_start": None,
-                "valid_stop": None,
-                "status": "failed" if error is not None else "missing",
-                "error": error,
-            }
-        )
+        return {
+            **base,
+            "orbit_type": None,
+            "orbit_file": None,
+            "orbit_path": None,
+            "valid_start": None,
+            "valid_stop": None,
+            "status": "failed" if error is not None else "missing",
+            "error": error,
+        }
 
-    if rows:
-        merged = merge_state_rows(state, rows, key_columns=["scene"])
-        write_parquet_atomic(merged, state_path, index=False)
+    # Scenes whose orbit file is already on disk (or that have no orbit) are final
+    # now; the rest are finalized as their orbit file finishes downloading.
+    awaiting: dict[str, list[SceneTimes]] = {}
+    immediate: list[SceneTimes] = []
+    for scene in pending:
+        if scene.scene in reused:
+            continue
+        orbit = assignments.get(scene.scene)
+        if orbit is not None and orbit.name in needed:
+            awaiting.setdefault(orbit.name, []).append(scene)
+        else:
+            immediate.append(scene)
+
+    # Rows are checkpointed in batches, so an interrupted run keeps every scene
+    # whose outcome was already known; the writer compacts on a clean exit.
+    with state_store.writer(batch_rows=500, flush_seconds=30.0) as state_writer:
+
+        def _record(scenes_to_record: list[SceneTimes]) -> None:
+            for scene in scenes_to_record:
+                row = _scene_row(scene)
+                rows.append(row)
+                state_writer.add([row])
+
+        _record(immediate)
+        if needed:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[bold blue]Downloading Sentinel-1 orbit files"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+            ) as progress:
+                task = progress.add_task("orbits", total=len(needed))
+                with ThreadPoolExecutor(max_workers=max(1, processes)) as pool:
+                    futures = {
+                        pool.submit(
+                            _download_orbit,
+                            orbit,
+                            out_dir,
+                            session,
+                            retries=retries,
+                            retry_backoff=retry_backoff,
+                            logger=logger,
+                        ): name
+                        for name, orbit in needed.items()
+                    }
+                    try:
+                        for future in as_completed(futures):
+                            name = futures[future]
+                            try:
+                                future.result()
+                            except Exception as error:  # noqa: BLE001 - per file
+                                logger.error("FAILED orbit %s: %s", name, error)
+                                failed_files[name] = str(error)
+                            _record(awaiting.pop(name, []))
+                            progress.advance(task)
+                    except BaseException:
+                        # Do not start queued downloads after an interrupt.
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        raise
 
     staged_now = sum(1 for row in rows if row["status"] == "staged")
     messages = [

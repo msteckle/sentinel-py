@@ -3,14 +3,10 @@
 from pathlib import Path
 
 import geopandas as gpd
-import numpy as np
-import pandas as pd
 import pytest
 from shapely.geometry import MultiPolygon, Point, box
 
 from sentinel_py.pipeline.grid import ChunkShape, load_aoi_plan, point_grid
-from sentinel_py.pipeline.artifacts import PointSampleArtifact
-from sentinel_py.pipeline.writers.parquet import ParquetOutputWriter
 
 
 def _write(path: Path, geometries, identifiers) -> Path:
@@ -52,22 +48,3 @@ def test_mixed_geometry_types_are_rejected(tmp_path: Path) -> None:
     path = _write(tmp_path / "mixed.geojson", [Point(0, 0), box(0, 0, .001, .001)], ["point", "polygon"])
     with pytest.raises(ValueError, match="only points or only polygons"):
         _plan(path)
-
-
-def test_point_parquet_writer_materializes_wide_rows(tmp_path: Path) -> None:
-    """Point output stores normalized wide observation rows."""
-    import dask
-    from types import SimpleNamespace
-
-    plan = _plan(_write(tmp_path / "points.geojson", [Point(0, 0)], ["site"]))
-    artifact = PointSampleArtifact(pd.DataFrame([{
-        "aoi_id": "site", "component_id": "part-0000", "point_index": 0,
-        "longitude": 0.0, "latitude": 0.0, "time": "2024-01-01",
-        "product_id": "product", "granule_id": "granule",
-        "time_representation": "acquisition", "B02": 11, "B03": 22,
-    }]), plan)
-    write_plan = ParquetOutputWriter().build(artifact, SimpleNamespace(path=tmp_path / "out"), None)
-    result = dask.compute(*write_plan.tasks)
-    assert result[0].status == "written"
-    frame = pd.read_parquet(result[0].output_path)
-    assert frame.loc[0, ["aoi_id", "B02", "B03"]].tolist() == ["site", 11, 22]

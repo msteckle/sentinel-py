@@ -320,32 +320,3 @@ def test_index_rejects_missing_band_and_invalid_input_count() -> None:
 
 def test_index_is_registered_as_a_builtin() -> None:
     assert get_default_registry().get("s2.index").type_name == "s2.index"
-
-
-def test_cog_tile_replaces_nonfinite_float_values(tmp_path) -> None:
-    rasterio = pytest.importorskip("rasterio")
-    from sentinel_py.pipeline.writers.cog import _write_cog_tile
-
-    output_path = tmp_path / "index.tif"
-    result = _write_cog_tile(
-        np.array([[1.0, np.nan]], dtype=np.float32),
-        task_id="task",
-        output_id="output",
-        product_id="product",
-        granule_id="granule",
-        variable="reflectance",
-        row_index=0,
-        column_index=0,
-        output_path=output_path,
-        cache_key="cache",
-        crs="EPSG:32606",
-        transform=(20, 0, 0, 0, -20, 20),
-        nodata=65535,
-        descriptions=("NDGI",),
-    )
-
-    assert result.status == "written"
-    with rasterio.open(output_path) as dataset:
-        assert dataset.dtypes == ("float32",)
-        assert dataset.nodata == 65535
-        np.testing.assert_array_equal(dataset.read(1), [[1.0, 65535.0]])

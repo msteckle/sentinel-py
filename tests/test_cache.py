@@ -4,6 +4,10 @@ import json
 import pandas as pd
 
 from sentinel_py.cache import (
+    DEFAULT_ASF_CACHE_DIR,
+    DEFAULT_CACHE_DIR,
+    DEFAULT_CDSE_CACHE_DIR,
+    SENTINEL_PY_HOME,
     QueryCache,
     deterministic_cache_key,
     merge_state_rows,
@@ -68,3 +72,9 @@ def test_query_cache_keys_differ_by_payload(tmp_path):
     second = QueryCache.for_payload(tmp_path, {"a": 2}, "manifest.parquet")
 
     assert first.directory != second.directory
+
+
+def test_default_provider_caches_share_sentinel_py_home():
+    assert DEFAULT_CACHE_DIR == SENTINEL_PY_HOME / "cache"
+    assert DEFAULT_CDSE_CACHE_DIR == DEFAULT_CACHE_DIR / "cdse"
+    assert DEFAULT_ASF_CACHE_DIR == DEFAULT_CACHE_DIR / "asf"

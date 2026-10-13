@@ -7,6 +7,7 @@ import pytest
 from pydantic import BaseModel, ConfigDict
 from shapely.geometry import box
 
+from helpers import write_s2_pipeline_yaml
 from sentinel_py.pipeline import PipelineConfig, PipelineConfigError
 from sentinel_py.pipeline.processors.base import ProcessorRegistry
 
@@ -35,53 +36,8 @@ def _dummy_registry() -> ProcessorRegistry:
     return registry
 
 
-def _pipeline_yaml(tmp_path: Path, extra: str = "") -> Path:
-    (tmp_path / "raw").mkdir()
-    gpd.GeoDataFrame(
-        {"site": ["site-1"]}, geometry=[box(500000, 999960, 500040, 1000000)], crs="EPSG:32606"
-    ).to_file(tmp_path / "aoi.geojson", driver="GeoJSON")
-    path = tmp_path / "pipeline.yaml"
-    path.write_text(
-        f"""
-version: 1
-execution:
-  method: local
-  workers: 2
-selection:
-  aoi: aoi.geojson
-  aoi_id_field: site
-  years: [2023, 2024]
-  speriod: "06-01"
-  eperiod: "08-31"
-output_grid:
-  crs: EPSG:32606
-  resolution: 20
-  extent: aoi
-  anchor: [0, 0]
-  chunks: {{y: 512, x: 512}}
-sources:
-  s2:
-    type: s2.l2a.local
-    data_dir: raw
-nodes:
-  - id: preprocess
-    type: s2.preprocess
-    source: s2
-    bands: [B02, B08]
-    mask_classes: [0, 1, 3, 8, 9, 10, 11]
-outputs:
-  result:
-    from: preprocess
-    path: output
-    format: cog
-{extra}
-"""
-    )
-    return path
-
-
 def test_load_pipeline_resolves_paths_and_node(tmp_path: Path):
-    config = PipelineConfig.from_file(_pipeline_yaml(tmp_path))
+    config = PipelineConfig.from_file(write_s2_pipeline_yaml(tmp_path))
 
     assert config.execution.method == "local"
     assert config.execution.workers == 2
@@ -93,7 +49,7 @@ def test_load_pipeline_resolves_paths_and_node(tmp_path: Path):
 
 
 def test_s2_preprocessor_accepts_canonical_cog_grid(tmp_path: Path):
-    path = _pipeline_yaml(tmp_path)
+    path = write_s2_pipeline_yaml(tmp_path)
 
     config = PipelineConfig.from_file(path)
 
@@ -103,7 +59,7 @@ def test_s2_preprocessor_accepts_canonical_cog_grid(tmp_path: Path):
 
 
 def test_s2_preprocessor_rejects_retired_native_grid(tmp_path: Path):
-    path = _pipeline_yaml(tmp_path)
+    path = write_s2_pipeline_yaml(tmp_path)
     path.write_text(
         path.read_text().replace(
             "  crs: EPSG:32606\n"
@@ -120,14 +76,14 @@ def test_s2_preprocessor_rejects_retired_native_grid(tmp_path: Path):
 
 
 def test_pipeline_rejects_unknown_keys(tmp_path: Path):
-    path = _pipeline_yaml(tmp_path, "unexpected: true")
+    path = write_s2_pipeline_yaml(tmp_path, "unexpected: true")
 
     with pytest.raises(PipelineConfigError, match="Unsupported key"):
         PipelineConfig.from_file(path)
 
 
 def test_pipeline_accepts_legacy_output_node_alias(tmp_path: Path):
-    path = _pipeline_yaml(tmp_path)
+    path = write_s2_pipeline_yaml(tmp_path)
     path.write_text(path.read_text().replace("from: preprocess", "node: preprocess"))
 
     config = PipelineConfig.from_file(path)
@@ -136,7 +92,7 @@ def test_pipeline_accepts_legacy_output_node_alias(tmp_path: Path):
 
 
 def test_pipeline_rejects_backend_settings_that_would_be_ignored(tmp_path: Path):
-    path = _pipeline_yaml(tmp_path)
+    path = write_s2_pipeline_yaml(tmp_path)
     path.write_text(
         path.read_text().replace(
             "workers: 2", "workers: 2\n  scheduler_address: tcp://scheduler:8786"
@@ -148,7 +104,7 @@ def test_pipeline_rejects_backend_settings_that_would_be_ignored(tmp_path: Path)
 
 
 def test_pipeline_accepts_complete_slurm_execution(tmp_path: Path):
-    path = _pipeline_yaml(tmp_path)
+    path = write_s2_pipeline_yaml(tmp_path)
     path.write_text(
         path.read_text().replace(
             "method: local\n  workers: 2",
@@ -273,7 +229,7 @@ def test_processor_pydantic_model_rejects_unknown_configuration(tmp_path: Path):
 
 
 def test_polygon_aoi_rejects_point_only_parquet_output(tmp_path: Path):
-    path = _pipeline_yaml(tmp_path)
+    path = write_s2_pipeline_yaml(tmp_path)
     path.write_text(path.read_text().replace("format: cog", "format: parquet"))
 
     with pytest.raises(PipelineConfigError, match="parquet output is incompatible"):
@@ -283,7 +239,7 @@ def test_polygon_aoi_rejects_point_only_parquet_output(tmp_path: Path):
 def test_point_aoi_rejects_raster_only_cog_output(tmp_path: Path):
     from shapely.geometry import Point
 
-    path = _pipeline_yaml(tmp_path)
+    path = write_s2_pipeline_yaml(tmp_path)
     gpd.GeoDataFrame(
         {"site": ["site-1"]}, geometry=[Point(500020, 999980)], crs="EPSG:32606"
     ).to_file(tmp_path / "aoi.geojson", driver="GeoJSON")

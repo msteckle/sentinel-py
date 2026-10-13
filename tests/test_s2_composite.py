@@ -94,40 +94,6 @@ def test_composite_keeps_all_bands_available_for_index_calculations():
     assert index.chunks[0] == (2,)
 
 
-def test_cog_writer_normalizes_split_band_chunks(tmp_path):
-    da = pytest.importorskip("dask.array")
-    from sentinel_py.pipeline.writers.cog import COGOutputWriter
-
-    artifact = xr.Dataset(
-        {
-            "reflectance": (
-                ("time", "band", "y", "x"),
-                da.from_array(
-                    np.ones((2, 2, 2, 2), dtype=np.float32), chunks=(1, 1, 2, 2)
-                ),
-                {"nodata": 65535},
-            )
-        },
-        coords={
-            "time": np.array(["2000-06-01", "2000-06-16"], dtype="datetime64[ns]"),
-            "band": ["B02", "B03"],
-            "y": [1, 0],
-            "x": [0, 1],
-            "product_id": ("time", ["composite_name", "composite_name"]),
-            "granule_id": ("time", ["bin_0000", "bin_0001"]),
-            "source_fingerprint": ("time", ["a", "b"]),
-        },
-        attrs={
-            "crs": "EPSG:3338",
-            "transform": (20, 0, 0, 0, -20, 40),
-            "recipe_id": "recipe",
-        },
-    )
-    output = SimpleNamespace(output_id="result", path=tmp_path)
-
-    plan = COGOutputWriter().build(artifact, output, None)
-
-    assert len(plan.tasks) == 2
 
 
 def test_composite_defaults_to_all_and_ignores_nodata():

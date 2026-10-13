@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import json
+import os
+import time
 from pathlib import Path
 
 import geopandas as gpd
+import pandas as pd
 from shapely.geometry import box
 from typer.testing import CliRunner
+
+from sentinel_py.cache import REGISTRY
 
 runner = CliRunner()
 
@@ -93,3 +99,51 @@ outputs:
 """
     )
     return path
+
+
+DAY = 86400.0
+
+
+def age_files(paths, days: float) -> None:
+    """Make files look last used ``days`` ago."""
+    stamp = time.time() - days * DAY
+    for path in paths:
+        os.utime(path, (stamp, stamp))
+
+
+def make_query(
+    cache_dir: Path, provider: str, key: str, *, days: float, rows: int = 2
+) -> Path:
+    """Create a keyed query directory like ``QueryCache`` does."""
+    directory = cache_dir / provider / key
+    directory.mkdir(parents=True)
+    table_name = "scenes.parquet" if provider == "cdse" else "manifest.parquet"
+    table = directory / table_name
+    pd.DataFrame({"url": [f"u{i}" for i in range(rows)]}).to_parquet(table)
+    (directory / "query_info.json").write_text(
+        json.dumps({"num_products": rows, "years": [2024], "collection": "S1"})
+    )
+    age_files([table], days)
+    return directory
+
+
+def make_point_sample(cache_dir: Path, key: str, *, days: float) -> Path:
+    """Create a cached point-sample table."""
+    path = cache_dir / "pipeline" / "point-samples" / "s2.l2a.local" / f"{key}.parquet"
+    path.parent.mkdir(parents=True)
+    pd.DataFrame({"value": [1, 2, 3]}).to_parquet(path)
+    age_files([path], days)
+    return path
+
+
+def make_assets_store(cache_dir: Path, *, batches: int = 2):
+    """Create the CDSE asset store holding ``batches`` uncompacted parts."""
+    store = REGISTRY["cdse_assets"].store(cache_dir / "cdse")
+    for batch in range(batches):
+        store.append(
+            [
+                {"safedir": f"S{batch}", "img_path_in_safedir": f"a{n}", "size": n}
+                for n in range(3)
+            ]
+        )
+    return store

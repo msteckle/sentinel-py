@@ -462,3 +462,12 @@ class CacheLocation(str, Enum):
     home = "home"
     data_dir = "data_dir"
     output_dir = "output_dir"
+
+
+class CachePruneTarget(StrEnum):
+    """Home-cache areas that ``sentinel-py cache prune`` may delete from."""
+
+    asf = "asf"
+    cdse = "cdse"
+    pgc = "pgc"
+    point_samples = "point-samples"

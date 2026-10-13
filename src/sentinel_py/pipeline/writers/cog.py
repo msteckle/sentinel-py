@@ -128,6 +128,31 @@ def _write_cog_tile(
         temporary.unlink(missing_ok=True)
 
 
+def _tile_variables(artifact: Any) -> list[tuple[str, int, tuple[str, ...]]]:
+    """List the dataset variables written as COG tiles.
+
+    Parameters
+    ----------
+    artifact : xarray.Dataset
+        Dataset with a ``reflectance`` variable and an optional ``scl`` variable.
+
+    Returns
+    -------
+    list[tuple[str, int, tuple[str, ...]]]
+        ``(variable name, nodata value, band descriptions)`` per tiled variable.
+    """
+    variables = [
+        (
+            "reflectance",
+            int(artifact.reflectance.attrs["nodata"]),
+            tuple(str(value) for value in artifact.band.values),
+        )
+    ]
+    if "scl" in artifact.data_vars:
+        variables.append(("scl", int(artifact.scl.attrs["nodata"]), ("SCL",)))
+    return variables
+
+
 class COGOutputWriter(BaseOutputWriter):
     """Build chunk-level COG tasks and maintain output-scoped resume state."""
 
@@ -139,8 +164,9 @@ class COGOutputWriter(BaseOutputWriter):
 
         Parameters
         ----------
-        artifact : RasterArtifact
-            Lazy per-AOI datasets to materialize.
+        artifact : RasterArtifact | xarray.Dataset
+            Lazy per-AOI datasets to materialize, or one dataset (used for each AOI
+            component).
         output : OutputConfig
             Named output supplying the destination directory.
         pipeline : PipelineConfig
@@ -153,29 +179,40 @@ class COGOutputWriter(BaseOutputWriter):
         """
         try:
             import xarray as xr
-            from dask import delayed
         except ImportError as error:
             raise RuntimeError("COG output requires xarray and Dask") from error
         from sentinel_py.pipeline.artifacts import RasterArtifact
+
         if isinstance(artifact, RasterArtifact):
-            if artifact.plan.kind != AOIKind.polygon:
-                raise ValueError("COG output requires polygon AOIs")
-            subplans = []
-            for key, dataset in artifact.datasets.items():
-                unit = artifact.plan.by_key[key]
-                scoped_output = replace(output, path=output.path / unit.aoi_id / unit.component_id)
-                subplans.append(self.build(dataset, scoped_output, pipeline))
-            return OutputWritePlan(
-                output,
-                tuple(task for plan in subplans for task in plan.tasks),
-                tuple(result for plan in subplans for result in plan.completed),
-                {"subplans": tuple(subplans)},
-            )
+            return self._build_artifact(artifact, output, pipeline)
         if not isinstance(artifact, xr.Dataset):
             raise TypeError("COG output requires an xarray Dataset artifact")
         if "reflectance" not in artifact.data_vars:
             raise ValueError("COG output requires a reflectance variable")
+        return self._build_dataset(artifact, output)
 
+    def _build_artifact(
+        self, artifact: Any, output: Any, pipeline: Any
+    ) -> OutputWritePlan:
+        """Plan every AOI component of a raster artifact under its own directory."""
+        if artifact.plan.kind != AOIKind.polygon:
+            raise ValueError("COG output requires polygon AOIs")
+        subplans = []
+        for key, dataset in artifact.datasets.items():
+            unit = artifact.plan.by_key[key]
+            scoped_output = replace(
+                output, path=output.path / unit.aoi_id / unit.component_id
+            )
+            subplans.append(self.build(dataset, scoped_output, pipeline))
+        return OutputWritePlan(
+            output,
+            tuple(task for plan in subplans for task in plan.tasks),
+            tuple(result for plan in subplans for result in plan.completed),
+            {"subplans": tuple(subplans)},
+        )
+
+    def _build_dataset(self, artifact: Any, output: Any) -> OutputWritePlan:
+        """Plan the tile tasks of one dataset, reusing completed tiles from state."""
         state_path = cog_state_path(output.path)
         state_store = RowStore(state_path, ["task_id"])
         state = state_store.read()
@@ -184,121 +221,22 @@ class COGOutputWriter(BaseOutputWriter):
             for row in state.to_dict("records")
             if row.get("status") in {WriteStatus.written, WriteStatus.skipped}
         }
-        transform = tuple(float(value) for value in artifact.attrs["transform"])
-        x_resolution = transform[0]
-        y_resolution = abs(transform[4])
-        recipe_id = str(artifact.attrs["recipe_id"])
+        # One band chunk per tile; rechunking once keeps graph building O(variables).
         reflectance = artifact.reflectance.chunk({"band": -1})
-        tasks = []
-        completed = []
-
+        tasks: list[Any] = []
+        completed: list[COGWriteResult] = []
         for time_index in range(artifact.sizes["time"]):
-            product_id = str(artifact.product_id.values[time_index])
-            granule_id = str(artifact.granule_id.values[time_index])
-            source_fingerprint = str(artifact.source_fingerprint.values[time_index])
-            variables = [
-                (
-                    "reflectance",
-                    int(reflectance.attrs["nodata"]),
-                    tuple(str(value) for value in artifact.band.values),
+            for variable in _tile_variables(artifact):
+                self._plan_variable_tiles(
+                    artifact,
+                    reflectance,
+                    output,
+                    time_index,
+                    variable,
+                    cached,
+                    tasks,
+                    completed,
                 )
-            ]
-            if "scl" in artifact.data_vars:
-                variables.append(
-                    ("scl", int(artifact.scl.attrs["nodata"]), ("SCL",))
-                )
-            for variable, nodata, descriptions in variables:
-                data_array = (
-                    reflectance if variable == "reflectance" else artifact[variable]
-                )
-                array = data_array.data[time_index]
-                delayed_blocks = array.to_delayed(optimize_graph=False)
-                y_chunks = array.chunks[-2]
-                x_chunks = array.chunks[-1]
-                row_offset = 0
-                for row_index, height in enumerate(y_chunks):
-                    column_offset = 0
-                    for column_index, width in enumerate(x_chunks):
-                        if variable == "reflectance":
-                            block = delayed_blocks[0, row_index, column_index]
-                        else:
-                            block = delayed_blocks[row_index, column_index]
-                        relative = (
-                            Path(product_id)
-                            / granule_id
-                            / f"{variable}.r{row_index:04d}.c{column_index:04d}.tif"
-                        )
-                        output_path = output.path / relative
-                        cache_key = deterministic_cache_key(
-                            {
-                                "writer_version": COG_WRITER_VERSION,
-                                "output_id": output.output_id,
-                                "recipe_id": recipe_id,
-                                "source_fingerprint": source_fingerprint,
-                                "variable": variable,
-                                "row": row_index,
-                                "column": column_index,
-                                "shape": (height, width),
-                            }
-                        )
-                        task_id = deterministic_cache_key(
-                            {
-                                "output_id": output.output_id,
-                                "relative_path": str(relative),
-                            }
-                        )
-                        cached_row = cached.get(task_id)
-                        if (
-                            cached_row is not None
-                            and cached_row.get("cache_key") == cache_key
-                            and output_path.is_file()
-                        ):
-                            completed.append(
-                                COGWriteResult(
-                                    task_id=task_id,
-                                    output_id=output.output_id,
-                                    product_id=product_id,
-                                    granule_id=granule_id,
-                                    variable=variable,
-                                    row_index=row_index,
-                                    column_index=column_index,
-                                    output_path=output_path,
-                                    cache_key=cache_key,
-                                    status=WriteStatus.skipped,
-                                    bytes_written=output_path.stat().st_size,
-                                    error=None,
-                                    completed_at=datetime.now(UTC).isoformat(),
-                                )
-                            )
-                        else:
-                            window_transform = (
-                                transform[2] + column_offset * x_resolution,
-                                transform[0],
-                                transform[1],
-                                transform[5] - row_offset * y_resolution,
-                                transform[3],
-                                transform[4],
-                            )
-                            tasks.append(
-                                delayed(_write_cog_tile, pure=False)(
-                                    block,
-                                    task_id=task_id,
-                                    output_id=output.output_id,
-                                    product_id=product_id,
-                                    granule_id=granule_id,
-                                    variable=variable,
-                                    row_index=row_index,
-                                    column_index=column_index,
-                                    output_path=output_path,
-                                    cache_key=cache_key,
-                                    crs=str(artifact.attrs["crs"]),
-                                    transform=window_transform,
-                                    nodata=nodata,
-                                    descriptions=descriptions,
-                                )
-                            )
-                        column_offset += width
-                    row_offset += height
         return OutputWritePlan(
             output,
             tuple(tasks),
@@ -312,6 +250,127 @@ class COGOutputWriter(BaseOutputWriter):
                 "checkpointed": set(),
             },
         )
+
+    @staticmethod
+    def _plan_variable_tiles(
+        artifact: Any,
+        reflectance: Any,
+        output: Any,
+        time_index: int,
+        variable: tuple[str, int, tuple[str, ...]],
+        cached: dict[str, Any],
+        tasks: list[Any],
+        completed: list[COGWriteResult],
+    ) -> None:
+        """Append one task (or one skipped result) per chunk of one time step.
+
+        Parameters
+        ----------
+        artifact : xarray.Dataset
+            Dataset carrying ``crs``, ``transform`` and ``recipe_id`` attributes.
+        reflectance : xarray.DataArray
+            ``artifact.reflectance`` rechunked to one chunk along ``band``.
+        output : OutputConfig
+            Output supplying ``output_id`` and the destination ``path``.
+        time_index : int
+            Position along ``time``.
+        variable : tuple[str, int, tuple[str, ...]]
+            ``(name, nodata, band descriptions)`` from :func:`_tile_variables`.
+        cached : dict[str, Any]
+            Completed state rows by task id.
+        tasks, completed : list
+            Output lists extended in place.
+        """
+        from dask import delayed
+
+        name, nodata, descriptions = variable
+        transform = tuple(float(value) for value in artifact.attrs["transform"])
+        x_resolution = transform[0]
+        y_resolution = abs(transform[4])
+        recipe_id = str(artifact.attrs["recipe_id"])
+        product_id = str(artifact.product_id.values[time_index])
+        granule_id = str(artifact.granule_id.values[time_index])
+        source_fingerprint = str(artifact.source_fingerprint.values[time_index])
+
+        data_array = reflectance if name == "reflectance" else artifact[name]
+        array = data_array.data[time_index]
+        delayed_blocks = array.to_delayed(optimize_graph=False)
+        row_offset = 0
+        for row_index, height in enumerate(array.chunks[-2]):
+            column_offset = 0
+            for column_index, width in enumerate(array.chunks[-1]):
+                block = (
+                    delayed_blocks[0, row_index, column_index]
+                    if name == "reflectance"
+                    else delayed_blocks[row_index, column_index]
+                )
+                relative = (
+                    Path(product_id)
+                    / granule_id
+                    / f"{name}.r{row_index:04d}.c{column_index:04d}.tif"
+                )
+                output_path = output.path / relative
+                cache_key = deterministic_cache_key(
+                    {
+                        "writer_version": COG_WRITER_VERSION,
+                        "output_id": output.output_id,
+                        "recipe_id": recipe_id,
+                        "source_fingerprint": source_fingerprint,
+                        "variable": name,
+                        "row": row_index,
+                        "column": column_index,
+                        "shape": (height, width),
+                    }
+                )
+                task_id = deterministic_cache_key(
+                    {"output_id": output.output_id, "relative_path": str(relative)}
+                )
+                identity = {
+                    "task_id": task_id,
+                    "output_id": output.output_id,
+                    "product_id": product_id,
+                    "granule_id": granule_id,
+                    "variable": name,
+                    "row_index": row_index,
+                    "column_index": column_index,
+                    "output_path": output_path,
+                    "cache_key": cache_key,
+                }
+                cached_row = cached.get(task_id)
+                if (
+                    cached_row is not None
+                    and cached_row.get("cache_key") == cache_key
+                    and output_path.is_file()
+                ):
+                    completed.append(
+                        COGWriteResult(
+                            **identity,
+                            status=WriteStatus.skipped,
+                            bytes_written=output_path.stat().st_size,
+                            error=None,
+                            completed_at=datetime.now(UTC).isoformat(),
+                        )
+                    )
+                else:
+                    tasks.append(
+                        delayed(_write_cog_tile, pure=False)(
+                            block,
+                            **identity,
+                            crs=str(artifact.attrs["crs"]),
+                            transform=(
+                                transform[2] + column_offset * x_resolution,
+                                transform[0],
+                                transform[1],
+                                transform[5] - row_offset * y_resolution,
+                                transform[3],
+                                transform[4],
+                            ),
+                            nodata=nodata,
+                            descriptions=descriptions,
+                        )
+                    )
+                column_offset += width
+            row_offset += height
 
     def checkpoint(
         self,

@@ -11,6 +11,7 @@ import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from sentinel_py.cache import deterministic_cache_key
+from sentinel_py.pipeline.lazy import warp_to_window
 from sentinel_py.pipeline.processors.base import (
     BaseProcessor,
     ProcessorConfig,
@@ -194,9 +195,8 @@ def _native_feature_chunk(
     """Read a native DEM halo, calculate one output chunk, and align it."""
     try:
         import rasterio
-        from rasterio.enums import Resampling
         from rasterio.merge import merge
-        from rasterio.warp import reproject, transform_bounds
+        from rasterio.warp import transform_bounds
     except ImportError as error:
         raise RuntimeError("DEM processing requires rasterio") from error
     with rasterio.open(paths[0]) as first:
@@ -269,27 +269,18 @@ def _native_feature_chunk(
             hillshade_azimuth=config.hillshade_azimuth,
             hillshade_altitude=config.hillshade_altitude,
         )
-        destination = np.full((window.height, window.width), np.nan, dtype=np.float32)
+        # The derivative grid is offset by one pixel from the merged native read.
         native_transform = transform * rasterio.Affine.translation(1, 1)
-        destination_transform = rasterio.Affine(
-            grid.resolution[0],
-            0,
-            window.bounds[0],
-            0,
-            -grid.resolution[1],
-            window.bounds[3],
-        )
-        reproject(
+        destination = warp_to_window(
             native,
-            destination,
-            src_transform=native_transform,
-            src_crs=source_crs,
-            dst_transform=destination_transform,
-            dst_crs=grid.crs,
+            native_transform,
+            source_crs,
+            grid,
+            window,
+            resampling="bilinear",
             src_nodata=np.nan,
             dst_nodata=np.nan,
-            resampling=Resampling.bilinear,
-            num_threads=1,
+            dtype=np.float32,
         )
         bands.append(destination)
     return np.stack(bands)

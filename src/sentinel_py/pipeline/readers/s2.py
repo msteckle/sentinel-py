@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import re
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -28,10 +27,16 @@ from shapely.geometry import box
 from shapely.geometry.base import BaseGeometry
 
 from sentinel_py import raster_io
+from sentinel_py.cache import REGISTRY
 from sentinel_py.aoi import GeometryLike, aoi_as_geom
 from sentinel_py.enums import S2_BAND_IDS
 from sentinel_py.pipeline.aoi import AOIUnit, point_grid
 from sentinel_py.pipeline.grid import ChunkShape, GridSpec, GridWindow
+from sentinel_py.pipeline.lazy import (
+    native_pixel_window,
+    select_resampling,
+    warp_to_window,
+)
 from sentinel_py.pipeline.readers.base import BaseReader, apply_polygon_mask
 
 S2_ACQUISITION_PATTERN = re.compile(r"_MSIL2A_(\d{8}T\d{6})_")
@@ -316,7 +321,7 @@ def discover_s2_granules(
     ``granules = discover_s2_granules(raw_dir, ("B02", "B03"), 20, years=(2024,))``
     """
     input_dir = Path(input_dir).resolve()
-    state_path = input_dir / ".sentinel-py" / "cdse_downloads.parquet"
+    state_path = REGISTRY["cdse_downloads"].path(input_dir)
 
     # Normalize the AOI once instead of reopening and reprojecting it per granule.
     aoi_geometry = None
@@ -405,62 +410,6 @@ class S2SceneSource:
     nodata: int
 
 
-def _rasterio_modules():
-    """Import rasterio lazily so graph construction does not require it."""
-    try:
-        import rasterio
-        from rasterio.enums import Resampling
-        from rasterio.warp import reproject, transform_bounds
-        from rasterio.windows import Window
-    except ImportError as error:
-        raise RuntimeError(
-            "Rasterio is required when lazy Sentinel-2 chunks are computed. "
-            "Install the processing dependencies."
-        ) from error
-    return rasterio, Resampling, reproject, transform_bounds, Window
-
-
-def _source_window(
-    dataset,
-    target_bounds: tuple[float, float, float, float],
-    target_crs: str,
-    *,
-    padding: int = 3,
-) -> tuple[int, int, int, int] | None:
-    """Find the native-pixel envelope needed for one output window."""
-    _, _, _, transform_bounds, _ = _rasterio_modules()
-    source_transform = dataset.transform
-    if source_transform.b != 0 or source_transform.d != 0:
-        raise ValueError("Lazy S2 reads require north-up source rasters")
-    if dataset.crs is None:
-        raise ValueError(f"Raster source has no CRS: {dataset.name}")
-    source_bounds = transform_bounds(
-        target_crs,
-        dataset.crs,
-        *target_bounds,
-        densify_pts=21,
-    )
-    inverse = ~source_transform
-    xmin, ymin, xmax, ymax = source_bounds
-    pixels = [
-        inverse @ (x, y)
-        for x, y in ((xmin, ymin), (xmin, ymax), (xmax, ymin), (xmax, ymax))
-    ]
-    x_offset = max(0, math.floor(min(point[0] for point in pixels)) - padding)
-    y_offset = max(0, math.floor(min(point[1] for point in pixels)) - padding)
-    x_end = min(
-        dataset.width,
-        math.ceil(max(point[0] for point in pixels)) + padding,
-    )
-    y_end = min(
-        dataset.height,
-        math.ceil(max(point[1] for point in pixels)) + padding,
-    )
-    if x_end <= x_offset or y_end <= y_offset:
-        return None
-    return x_offset, y_offset, x_end - x_offset, y_end - y_offset
-
-
 def _correct_dn_values(
     values: np.ndarray,
     *,
@@ -486,10 +435,17 @@ def _window_dataset(
     invalid_values: tuple[int, ...] = (),
 ) -> tuple[np.ndarray | None, Affine | None, object | None, float]:
     """Decode one native source window and retain its exact spatial metadata."""
-    rasterio, _, _, _, Window = _rasterio_modules()
+    try:
+        import rasterio
+        from rasterio.windows import Window
+    except ImportError as error:
+        raise RuntimeError(
+            "Rasterio is required when lazy Sentinel-2 chunks are computed. "
+            "Install the processing dependencies."
+        ) from error
     with rasterio.open(path) as source:
         source_resolution = abs(float(source.transform.a))
-        source_window = _source_window(source, window.bounds, grid.crs)
+        source_window = native_pixel_window(source, window.bounds, grid.crs)
         if source_window is None:
             return None, None, None, source_resolution
         x_offset, y_offset, width, height = source_window
@@ -509,80 +465,6 @@ def _window_dataset(
     else:
         values = values.astype(np.uint16, copy=False)
     return values, source_transform, source_crs, source_resolution
-
-
-def _warp_window(
-    source: np.ndarray | None,
-    source_transform: Affine | None,
-    source_crs: object | None,
-    grid: GridSpec,
-    window: GridWindow,
-    *,
-    resampling: str,
-    nodata: int | None,
-) -> np.ndarray:
-    """Reproject one native array onto its exact canonical-grid window."""
-    rasterio, Resampling, reproject, _, _ = _rasterio_modules()
-    if source is None:
-        fill = 0 if nodata is None else nodata
-        return np.full((window.height, window.width), fill, dtype=np.uint16)
-    if source_transform is None or source_crs is None:
-        raise ValueError("Source transform and CRS are required for reprojection")
-    fill = 0 if nodata is None else nodata
-    destination_values = np.full((window.height, window.width), fill, dtype=np.uint16)
-    xmin, _, _, ymax = window.bounds
-    destination_transform = Affine(
-        grid.resolution[0],
-        0.0,
-        xmin,
-        0.0,
-        -grid.resolution[1],
-        ymax,
-    )
-    source_options = {
-        "driver": "GTiff",
-        "width": source.shape[1],
-        "height": source.shape[0],
-        "count": 1,
-        "dtype": source.dtype,
-        "crs": source_crs,
-        "transform": source_transform,
-        "nodata": nodata,
-    }
-    destination_options = {
-        "driver": "GTiff",
-        "width": window.width,
-        "height": window.height,
-        "count": 1,
-        "dtype": destination_values.dtype,
-        "crs": grid.crs,
-        "transform": destination_transform,
-        "nodata": nodata,
-    }
-    with rasterio.io.MemoryFile() as source_memory:
-        with source_memory.open(**source_options) as source_dataset:
-            source_dataset.write(source, 1)
-            with rasterio.io.MemoryFile() as destination_memory:
-                with destination_memory.open(**destination_options) as destination:
-                    destination.write(destination_values, 1)
-                    reproject(
-                        source=rasterio.band(source_dataset, 1),
-                        destination=rasterio.band(destination, 1),
-                        src_nodata=nodata,
-                        dst_nodata=nodata,
-                        resampling=getattr(Resampling, resampling),
-                        num_threads=1,
-                        init_dest_nodata=True,
-                    )
-                    return destination.read(1)
-
-
-def _resampling(source_resolution: float, grid: GridSpec) -> str:
-    """Pick the resampling method for a native-to-grid resolution ratio."""
-    target_resolution = min(grid.resolution)
-    if math.isclose(source_resolution, target_resolution, abs_tol=1e-9):
-        return "nearest"
-    return "average" if source_resolution < target_resolution else "bilinear"
 
 
 def _read_scene_chunk(
@@ -610,14 +492,15 @@ def _read_scene_chunk_locked(
         nodata=None,
         offset=None,
     )
-    scl = _warp_window(
+    scl = warp_to_window(
         scl_source,
         scl_transform,
         scl_crs,
         grid,
         window,
         resampling="nearest",
-        nodata=None,
+        src_nodata=None,
+        dst_nodata=None,
     )
     mask = (scl == 0) | (scl > 11)
     for value in scene.mask_classes:
@@ -641,14 +524,15 @@ def _read_scene_chunk_locked(
             offset=scene.offsets[band_name],
             invalid_values=scene.special_values,
         )
-        values = _warp_window(
+        values = warp_to_window(
             source,
             source_transform,
             source_crs,
             grid,
             window,
-            resampling=_resampling(source_resolution, grid),
-            nodata=scene.nodata,
+            resampling=select_resampling(source_resolution, grid),
+            src_nodata=scene.nodata,
+            dst_nodata=scene.nodata,
         )
         output[index] = np.where(
             # Raw no-data and saturation codes were already normalized to the

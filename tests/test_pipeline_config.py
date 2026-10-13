@@ -270,3 +270,26 @@ def test_processor_pydantic_model_rejects_unknown_configuration(tmp_path: Path):
     with pytest.raises(PipelineConfigError, match="Invalid configuration") as error:
         PipelineConfig.from_file(path, registry=_dummy_registry())
     assert "unexpected" in str(error.value)
+
+
+def test_polygon_aoi_rejects_point_only_parquet_output(tmp_path: Path):
+    path = _pipeline_yaml(tmp_path)
+    path.write_text(path.read_text().replace("format: cog", "format: parquet"))
+
+    with pytest.raises(PipelineConfigError, match="parquet output is incompatible"):
+        PipelineConfig.from_file(path)
+
+
+def test_point_aoi_rejects_raster_only_cog_output(tmp_path: Path):
+    from shapely.geometry import Point
+
+    path = _pipeline_yaml(tmp_path)
+    gpd.GeoDataFrame(
+        {"site": ["site-1"]}, geometry=[Point(500020, 999980)], crs="EPSG:32606"
+    ).to_file(tmp_path / "aoi.geojson", driver="GeoJSON")
+
+    with pytest.raises(PipelineConfigError, match="cog output is incompatible"):
+        PipelineConfig.from_file(path)
+
+    path.write_text(path.read_text().replace("format: cog", "format: parquet"))
+    assert PipelineConfig.from_file(path).outputs["result"].format == "parquet"

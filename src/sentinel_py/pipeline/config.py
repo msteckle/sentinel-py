@@ -19,7 +19,13 @@ from typing import Any, Literal, cast
 import yaml
 from pydantic import BaseModel, ValidationError
 
-from sentinel_py.enums import AOIKind, ExecutionMethod, OutputFormat, SourceType
+from sentinel_py.enums import (
+    AOIKind,
+    ArtifactKind,
+    ExecutionMethod,
+    OutputFormat,
+    SourceType,
+)
 from sentinel_py.pipeline.grid import AOIPlan, ChunkShape, GridSpec, load_aoi_plan
 from sentinel_py.pipeline.processors import ProcessorRegistry, get_default_registry
 
@@ -147,6 +153,49 @@ def _coordinate_pair(
 ########################################################################################
 
 
+# Keys each execution backend accepts (the union is the full ``execution`` schema).
+_EXECUTION_METHOD_KEYS: dict[ExecutionMethod, frozenset[str]] = {
+    ExecutionMethod.local: frozenset({"method", "workers", "threads_per_worker"}),
+    ExecutionMethod.dask: frozenset({"method", "scheduler_address"}),
+    ExecutionMethod.slurm: frozenset(
+        {
+            "method",
+            "local_directory",
+            "jobs",
+            "cores_per_job",
+            "processes_per_job",
+            "memory_per_job",
+            "queue",
+            "account",
+            "walltime",
+            "job_extra_directives",
+            "job_script_prologue",
+            "interface",
+        }
+    ),
+}
+_EXECUTION_METHOD_LABELS: dict[ExecutionMethod, str] = {
+    ExecutionMethod.local: "local",
+    ExecutionMethod.dask: "external Dask",
+    ExecutionMethod.slurm: "Slurm",
+}
+
+
+def _optional_positive_int(value: Mapping[str, Any], key: str) -> int | None:
+    """Return ``execution.<key>`` as a positive integer, or ``None`` when absent."""
+    if value.get(key) is None:
+        return None
+    return _positive_int(value[key], f"execution.{key}")
+
+
+def _string_list(value: Mapping[str, Any], key: str) -> tuple[str, ...]:
+    """Return ``execution.<key>`` as a tuple of strings (empty when absent)."""
+    items = value.get(key, [])
+    if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+        raise PipelineConfigError(f"execution.{key} must be a list of strings")
+    return tuple(items)
+
+
 @dataclass(frozen=True)
 class ExecutionConfig:
     """
@@ -224,29 +273,9 @@ class ExecutionConfig:
             If a value is missing, unknown, or not valid for the chosen method.
         """
 
-        # Extract the execution configuration from the raw mapping and validate its keys
         value = _mapping(raw, "execution")
-        allowed = {
-            "method",
-            "workers",
-            "threads_per_worker",
-            "local_directory",
-            "scheduler_address",
-            "jobs",
-            "cores_per_job",
-            "processes_per_job",
-            "memory_per_job",
-            "queue",
-            "account",
-            "walltime",
-            "job_extra_directives",
-            "job_script_prologue",
-            "interface",
-        }
-        only_keys(value, allowed, "execution")
+        only_keys(value, set().union(*_EXECUTION_METHOD_KEYS.values()), "execution")
 
-        # Extract and validate the allowed values
-        # Ensure the method is one of the allowed values
         try:
             method = ExecutionMethod(required(value, "method", "execution"))
         except ValueError as error:
@@ -254,13 +283,10 @@ class ExecutionConfig:
                 "execution.method must be local, dask, or slurm"
             ) from error
 
-        # Ensure the workers and threads per worker are positive integers
         workers = _positive_int(value.get("workers", 1), "execution.workers")
         threads = _positive_int(
             value.get("threads_per_worker", 1), "execution.threads_per_worker"
         )
-
-        # Ensure the local directory is resolved correctly
         local_directory = (
             resolve_path(
                 value["local_directory"], base_dir, "execution.local_directory"
@@ -269,89 +295,36 @@ class ExecutionConfig:
             else None
         )
 
-        # Ensure the scheduler address is valid and required for Dask method
         scheduler_address = value.get("scheduler_address")
         if scheduler_address is not None and (
             not isinstance(scheduler_address, str) or not scheduler_address.strip()
         ):
             raise PipelineConfigError("execution.scheduler_address must be a string")
-
-        # Raise an error if the scheduler address is required but not provided
         if method == ExecutionMethod.dask and scheduler_address is None:
             raise PipelineConfigError(
                 "execution.scheduler_address is required when method is dask"
             )
 
-        # Check for unsupported keys in local execution method
-        if method == ExecutionMethod.local:
-            unsupported = sorted(
-                key
-                for key in value
-                if key not in {"method", "workers", "threads_per_worker"}
+        # Each backend accepts only its own keys.
+        unsupported = sorted(set(value) - _EXECUTION_METHOD_KEYS[method])
+        if unsupported:
+            raise PipelineConfigError(
+                f"Unsupported {_EXECUTION_METHOD_LABELS[method]} execution value(s): "
+                + ", ".join(unsupported)
             )
-            if unsupported:
-                raise PipelineConfigError(
-                    "Unsupported local execution value(s): " + ", ".join(unsupported)
-                )
 
-        # Check for unsupported keys in Dask execution method
-        if method == ExecutionMethod.dask:
-            unsupported = sorted(
-                key for key in value if key not in {"method", "scheduler_address"}
-            )
-            if unsupported:
-                raise PipelineConfigError(
-                    "Unsupported external Dask execution value(s): "
-                    + ", ".join(unsupported)
-                )
-
-        # Ensure the Slurm execution parameters are positive integers if provided
-        jobs = (
-            _positive_int(value["jobs"], "execution.jobs")
-            if value.get("jobs") is not None
-            else None
-        )
-        cores = (
-            _positive_int(value["cores_per_job"], "execution.cores_per_job")
-            if value.get("cores_per_job") is not None
-            else None
-        )
-        processes = (
-            _positive_int(value["processes_per_job"], "execution.processes_per_job")
-            if value.get("processes_per_job") is not None
-            else None
-        )
+        jobs = _optional_positive_int(value, "jobs")
+        cores = _optional_positive_int(value, "cores_per_job")
+        processes = _optional_positive_int(value, "processes_per_job")
         if method == ExecutionMethod.slurm:
-            slurm_keys = {
-                "method",
-                "local_directory",
-                "jobs",
-                "cores_per_job",
-                "processes_per_job",
-                "memory_per_job",
-                "queue",
-                "account",
-                "walltime",
-                "job_extra_directives",
-                "job_script_prologue",
-                "interface",
+            present = {
+                "jobs": jobs,
+                "cores_per_job": cores,
+                "processes_per_job": processes,
+                "memory_per_job": value.get("memory_per_job"),
+                "walltime": value.get("walltime"),
             }
-            unsupported = sorted(key for key in value if key not in slurm_keys)
-            if unsupported:
-                raise PipelineConfigError(
-                    "Unsupported Slurm execution value(s): " + ", ".join(unsupported)
-                )
-            missing = [
-                key
-                for key, current in (
-                    ("jobs", jobs),
-                    ("cores_per_job", cores),
-                    ("processes_per_job", processes),
-                    ("memory_per_job", value.get("memory_per_job")),
-                    ("walltime", value.get("walltime")),
-                )
-                if current is None
-            ]
+            missing = [key for key, current in present.items() if current is None]
             if missing:
                 raise PipelineConfigError(
                     "Missing required Slurm execution value(s): " + ", ".join(missing)
@@ -361,31 +334,13 @@ class ExecutionConfig:
                     "execution.processes_per_job cannot exceed cores_per_job"
                 )
 
-        # Validate job extra directives and job script prologue
-        directives = value.get("job_extra_directives", [])
-        if not isinstance(directives, list) or not all(
-            isinstance(item, str) for item in directives
-        ):
-            raise PipelineConfigError(
-                "execution.job_extra_directives must be a list of strings"
-            )
-        prologue = value.get("job_script_prologue", [])
-        if not isinstance(prologue, list) or not all(
-            isinstance(item, str) for item in prologue
-        ):
-            raise PipelineConfigError(
-                "execution.job_script_prologue must be a list of strings"
-            )
-
-        # Validate that certain execution values are non-empty strings
-        string_fields = {
-            key: value.get(key)
-            for key in ("memory_per_job", "queue", "account", "walltime", "interface")
-        }
+        directives = _string_list(value, "job_extra_directives")
+        prologue = _string_list(value, "job_script_prologue")
         invalid_strings = [
             key
-            for key, item in string_fields.items()
-            if item is not None and (not isinstance(item, str) or not item.strip())
+            for key in ("memory_per_job", "queue", "account", "walltime", "interface")
+            if value.get(key) is not None
+            and (not isinstance(value[key], str) or not value[key].strip())
         ]
         if invalid_strings:
             raise PipelineConfigError(
@@ -393,7 +348,6 @@ class ExecutionConfig:
                 + ", ".join(invalid_strings)
             )
 
-        # Return the validated execution configuration
         return cls(
             method=method,
             workers=workers,
@@ -407,8 +361,8 @@ class ExecutionConfig:
             queue=value.get("queue"),
             account=value.get("account"),
             walltime=value.get("walltime"),
-            job_extra_directives=tuple(directives),
-            job_script_prologue=tuple(prologue),
+            job_extra_directives=directives,
+            job_script_prologue=prologue,
             interface=value.get("interface"),
         )
 
@@ -981,17 +935,7 @@ class PipelineConfig:
         outputs = OutputConfig.parse_many(
             required(root, "outputs", "pipeline"), nodes, base_dir
         )
-        invalid_format = (
-            OutputFormat.parquet
-            if aoi_plan is not None and aoi_plan.kind == AOIKind.polygon
-            else OutputFormat.cog
-        )
-        if aoi_plan is not None and any(
-            output.format == invalid_format for output in outputs.values()
-        ):
-            raise PipelineConfigError(
-                f"{invalid_format} output is incompatible with {aoi_plan.kind} AOIs"
-            )
+        cls._validate_output_writers(outputs, aoi_plan)
 
         # Validate each processor specified under the nodes section
         cls._validate_processors(nodes, sources, outputs, output_grid, registry)
@@ -1048,6 +992,39 @@ class PipelineConfig:
         for node in nodes:
             visit(node)
         return tuple(ordered)
+
+    @staticmethod
+    def _validate_output_writers(
+        outputs: Mapping[str, OutputConfig], aoi_plan: AOIPlan | None
+    ) -> None:
+        """Reject outputs whose writer cannot materialize the AOI kind's artifact.
+
+        Polygon AOIs produce raster artifacts and point AOIs produce point-sample
+        artifacts; each writer declares the artifact kinds it accepts. Unknown
+        formats are left for the run stage to report.
+
+        Raises
+        ------
+        PipelineConfigError
+            If an output format cannot write the artifacts of ``aoi_plan``.
+        """
+        if aoi_plan is None:
+            return
+        from sentinel_py.pipeline.writers import get_default_writer_registry
+
+        artifact_kind = (
+            ArtifactKind.point if aoi_plan.kind == AOIKind.point else ArtifactKind.raster
+        )
+        writers = get_default_writer_registry()
+        for output in outputs.values():
+            try:
+                writer = writers.get(output.format)
+            except KeyError:
+                continue
+            if artifact_kind not in writer.accepted_artifact_kinds:
+                raise PipelineConfigError(
+                    f"{output.format} output is incompatible with {aoi_plan.kind} AOIs"
+                )
 
     @staticmethod
     def _validate_processors(

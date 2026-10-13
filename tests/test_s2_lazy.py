@@ -12,7 +12,7 @@ from shapely.geometry import box
 
 from sentinel_py.pipeline import PipelineConfig
 from sentinel_py.pipeline.run import run_pipeline
-from sentinel_py.s2.lazy import _correct_dn_values
+from sentinel_py.pipeline.readers.s2 import _correct_dn_values
 
 
 def _write_raster(path: Path, values: np.ndarray, resolution: int) -> None:
@@ -132,7 +132,7 @@ def test_lazy_s2_processor_defers_reads_and_preserves_grid_masks_and_dtypes(
     monkeypatch: pytest.MonkeyPatch,
 ):
     da = pytest.importorskip("dask.array")
-    from sentinel_py.s2 import lazy
+    from sentinel_py.pipeline.readers import s2 as lazy
 
     pipeline_path, _ = _synthetic_pipeline(tmp_path)
     calls = []
@@ -182,7 +182,7 @@ def test_local_dask_cog_outputs_share_reads_and_resume(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from sentinel_py.pipeline.writers.cog import cog_state_path
-    from sentinel_py.s2 import lazy
+    from sentinel_py.pipeline.readers import s2 as lazy
 
     pipeline_path, _ = _synthetic_pipeline(tmp_path)
     pipeline_path.write_text(

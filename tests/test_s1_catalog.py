@@ -9,7 +9,7 @@ from shapely.geometry import Point
 from sentinel_py.download.s1_orbits import ORBIT_STATE_RELPATH
 from sentinel_py.pipeline.config import PipelineConfigError, S1SourceConfig
 from sentinel_py.pipeline.readers.base import get_default_reader_registry
-from sentinel_py.s1.catalog import (
+from sentinel_py.pipeline.readers.s1 import (
     attach_orbits,
     build_scene_catalog,
     read_scene_manifest,
@@ -80,7 +80,7 @@ def test_catalog_caches_and_rereads_only_changed_archives(tmp_path: Path, monkey
     assert list(first["scene"]) == [SCENE_A]
 
     calls = []
-    import sentinel_py.s1.catalog as module
+    import sentinel_py.pipeline.readers.s1 as module
 
     original = module.read_scene_manifest
     monkeypatch.setattr(

@@ -214,3 +214,63 @@ def test_download_cli_stages_orbits_and_honors_none(tmp_path: Path, monkeypatch)
     calls.clear()
     result = CliRunner().invoke(app, [*base, "--orbits", "none"])
     assert result.exit_code == 0 and calls == []
+
+
+SECOND_SCENE = "S1A_IW_GRDH_1SDV_20240901T164404_20240901T164429_055699_06C000_ABCD"
+SECOND_PRECISE = (
+    "S1A_OPER_AUX_POEORB_OPOD_20240921T080000_V20240831T225942_20240902T005942.EOF"
+)
+
+
+class InterruptingSession(FakeSession):
+    """Interrupt while downloading the second orbit file."""
+
+    def get(self, url, timeout=None, stream=False):
+        if url.endswith(SECOND_PRECISE):
+            raise KeyboardInterrupt
+        return super().get(url, timeout=timeout, stream=stream)
+
+
+def test_interrupted_orbit_staging_keeps_resolved_scenes_and_resumes(tmp_path: Path):
+    from sentinel_py.cache import REGISTRY
+    from sentinel_py.pipeline.readers.s1 import attach_orbits
+
+    products = pd.DataFrame(
+        {
+            "granule": [SCENE, SECOND_SCENE],
+            "url": [f"https://example.test/{n}.zip" for n in (SCENE, SECOND_SCENE)],
+        }
+    )
+    listings = {"POEORB": [PRECISE, SECOND_PRECISE]}
+
+    with pytest.raises(KeyboardInterrupt):
+        stage_orbits(
+            products, tmp_path, S1OrbitPolicy.precise_or_restituted,
+            session=InterruptingSession(listings), processes=1, retries=0,
+            retry_backoff=0,
+        )
+
+    store = REGISTRY["s1_orbits"].store(tmp_path)
+    recorded = store.read().set_index("scene")
+    # The scene whose orbit finished downloading was checkpointed before the abort.
+    assert list(recorded.index) == [SCENE]
+    assert recorded.loc[SCENE, "status"] == "staged"
+    assert store.part_paths()
+
+    # Readers see the checkpoint without waiting for compaction.
+    catalog = attach_orbits(pd.DataFrame({"scene": [SCENE, SECOND_SCENE]}), tmp_path)
+    assert catalog.loc[0, "orbit_file"] == PRECISE
+    assert pd.isna(catalog.loc[1, "orbit_file"])
+
+    session = FakeSession(listings)
+    summary = stage_orbits(
+        products, tmp_path, S1OrbitPolicy.precise_or_restituted,
+        session=session, processes=1, retries=0, retry_backoff=0,
+    )
+
+    assert summary.staged == 1 and summary.failed == 0 and not summary.missing
+    assert not any(url.endswith(PRECISE) for url in session.requests)  # not refetched
+    assert store.part_paths() == []
+    final = pd.read_parquet(tmp_path / ORBIT_STATE_RELPATH)
+    assert sorted(final["scene"]) == sorted([SCENE, SECOND_SCENE])
+    assert set(final["status"]) == {"staged"}

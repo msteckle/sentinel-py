@@ -162,3 +162,62 @@ def test_download_arcticdem_skips_verified_existing_file(tmp_path: Path, monkeyp
     assert summary.downloaded == 0
     assert summary.skipped == 1
     assert (tmp_path / ".sentinel-py" / "pgc_downloads.parquet").exists()
+
+
+def test_interrupted_pgc_download_keeps_finished_state_and_resumes(
+    tmp_path: Path, monkeypatch
+):
+    products = pd.DataFrame(
+        [
+            {"item_id": f"{n}", "tile_id": f"t{n}", "url": f"https://example.test/{n}.tif",
+             "filename": f"{n}.tif", "expected_size": 4}
+            for n in range(3)
+        ]
+    )
+    # Tiles 0 and 1 already exist and verify; downloading tile 2 is interrupted.
+    for n in range(2):
+        (tmp_path / f"{n}.tif").write_bytes(b"data")
+
+    def interrupted_get(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pgc.requests, "get", interrupted_get)
+    with pytest.raises(KeyboardInterrupt):
+        pgc.download_arcticdem(products, tmp_path, processes=1, retries=0)
+
+    state_file = tmp_path / ".sentinel-py" / "pgc_downloads.parquet"
+    from sentinel_py.cache import RowStore
+
+    store = RowStore(state_file, ["url"])
+    recorded = store.read().set_index("url")
+    assert recorded.loc["https://example.test/0.tif", "status"] == "complete"
+    assert recorded.loc["https://example.test/1.tif", "status"] == "complete"
+    assert store.part_paths()  # checkpoint parts exist; no clean-exit compaction
+
+    # A selection that runs before the next download still sees the saved state.
+    manifest = products.assign(geometry_wkt=box(0, 0, 1, 1).wkt)
+    selected = pgc.select_cached_tiles(
+        manifest, box(0.1, 0.1, 0.2, 0.2), state_file=state_file
+    )
+    assert (selected["status"] == "complete").sum() == 2
+
+    # Resuming completes the run and compacts the parts into the state file.
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, size):
+            yield b"data"
+
+    monkeypatch.setattr(pgc.requests, "get", lambda *a, **k: Response())
+    summary = pgc.download_arcticdem(products, tmp_path, processes=1)
+
+    assert (summary.downloaded, summary.skipped) == (1, 2)
+    assert store.part_paths() == []
+    assert len(pd.read_parquet(state_file)) == 3

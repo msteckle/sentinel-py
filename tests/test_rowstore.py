@@ -205,3 +205,68 @@ def test_read_key_filters_limit_rows_and_reject_non_key_columns(tmp_path: Path):
     assert store.read(key_filters={"scene": []}).empty
     with pytest.raises(ValueError, match="key columns"):
         store.read(key_filters={"value": [1]})
+
+
+def test_cog_writer_checkpoints_batches_and_finalize_does_not_duplicate(tmp_path: Path):
+    from sentinel_py.pipeline.writers.base import OutputWritePlan
+    from sentinel_py.pipeline.writers.cog import COGOutputWriter, COGWriteResult
+
+    def result(index: int) -> COGWriteResult:
+        return COGWriteResult(
+            f"task-{index}", "out", "p", "g", "reflectance", 0, index,
+            tmp_path / f"{index}.tif", "key", "written", 10, None, "2026-01-01",
+        )
+
+    state_path = tmp_path / "state.parquet"
+    store = RowStore(state_path, ["task_id"])
+    plan = OutputWritePlan(
+        None,
+        tuple(object() for _ in range(4)),
+        (),
+        {"state_path": state_path, "state": pd.DataFrame(), "store": store,
+         "checkpointed": set()},
+    )
+    writer = COGOutputWriter()
+    all_results = tuple(result(i) for i in range(4))
+
+    # Two batches finish before the run is interrupted: nothing else is needed.
+    writer.checkpoint(plan, all_results[:2], 0)
+    writer.checkpoint(plan, all_results[2:3], 2)
+    assert sorted(store.read()["task_id"]) == ["task-0", "task-1", "task-2"]
+
+    final = writer.finalize(plan, all_results)
+
+    assert len(final) == 4
+    assert store.part_paths() == []
+    on_disk = pd.read_parquet(state_path)
+    assert sorted(on_disk["task_id"]) == [f"task-{i}" for i in range(4)]
+
+
+def test_cog_checkpoint_routes_batches_to_subplans(tmp_path: Path):
+    from sentinel_py.pipeline.writers.base import OutputWritePlan
+    from sentinel_py.pipeline.writers.cog import COGOutputWriter, COGWriteResult
+
+    def result(name: str) -> COGWriteResult:
+        return COGWriteResult(
+            name, "out", "p", "g", "reflectance", 0, 0,
+            tmp_path / f"{name}.tif", "key", "written", 1, None, "2026-01-01",
+        )
+
+    def leaf(name: str, count: int) -> OutputWritePlan:
+        store = RowStore(tmp_path / f"{name}.parquet", ["task_id"])
+        return OutputWritePlan(
+            None, tuple(object() for _ in range(count)), (),
+            {"store": store, "checkpointed": set(), "state_path": store.path,
+             "state": pd.DataFrame()},
+        )
+
+    first, second = leaf("a", 2), leaf("b", 2)
+    plan = OutputWritePlan(None, (), (), {"subplans": (first, second)})
+    writer = COGOutputWriter()
+    results = tuple(result(f"t{i}") for i in range(4))
+
+    # A batch that straddles both sub-plans: tasks 1..2 of the output's 4 tasks.
+    writer.checkpoint(plan, results[1:3], 1)
+
+    assert first.metadata["store"].read()["task_id"].tolist() == ["t1"]
+    assert second.metadata["store"].read()["task_id"].tolist() == ["t2"]

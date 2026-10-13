@@ -5,6 +5,7 @@ from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 import pytest
 import rasterio
 from rasterio.transform import from_origin
@@ -233,3 +234,44 @@ def test_local_dask_cog_outputs_share_reads_and_resume(
     assert not reads.exists()
     for output_result in second.output_results.values():
         assert {item.status for item in output_result.results} == {"skipped"}
+
+
+def test_cog_state_is_checkpointed_after_every_materialization_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from sentinel_py.pipeline import run as run_module
+    from sentinel_py.pipeline.writers.cog import COGOutputWriter, cog_state_path
+
+    pipeline_path, _ = _synthetic_pipeline(tmp_path)
+    pipeline_path.write_text(
+        pipeline_path.read_text().replace(
+            "  result: {from: preprocess, path: unused, format: xarray}",
+            "  result: {from: preprocess, path: cog-out, format: cog}",
+        )
+    )
+    monkeypatch.setattr(run_module, "MAX_MATERIALIZATION_TASKS_PER_BATCH", 3)
+    batches = []
+    original = COGOutputWriter.checkpoint
+
+    def recording(self, plan, computed, offset=0):
+        if "subplans" in plan.metadata:  # count only the pipeline's own calls
+            batches.append((len(computed), offset))
+        return original(self, plan, computed, offset)
+
+    monkeypatch.setattr(COGOutputWriter, "checkpoint", recording)
+    logger = logging.getLogger("cog-checkpoint-test")
+    logger.addHandler(logging.NullHandler())
+
+    result = run_pipeline(PipelineConfig.from_file(pipeline_path), logger)
+
+    # 8 tile tasks in batches of 3: checkpoints cover every task exactly once.
+    assert sum(size for size, _ in batches) == 8
+    assert len(batches) >= 3
+    output_result = result.output_results["result"]
+    assert {item.status for item in output_result.results} == {"written"}
+    state_path = cog_state_path(tmp_path / "cog-out" / "test-site" / "part-0000")
+    assert len(pd.read_parquet(state_path)) == 8
+    assert not (state_path.with_name(state_path.name + ".parts")).exists() or not list(
+        state_path.with_name(state_path.name + ".parts").glob("part-*.parquet")
+    )

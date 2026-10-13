@@ -1153,18 +1153,17 @@ def test_download_asf_batches_state_writes(tmp_path: Path, monkeypatch):
             }
         )
 
-    original_write = asf_download_module.write_parquet_atomic
-    write_calls = 0
+    from sentinel_py.cache import RowStore
 
-    def counting_write(*args, **kwargs):
-        nonlocal write_calls
-        write_calls += 1
-        return original_write(*args, **kwargs)
+    original_append = RowStore.append
+    append_sizes: list[int] = []
 
-    monkeypatch.setattr(
-        "sentinel_py.download.asf.write_parquet_atomic",
-        counting_write,
-    )
+    def counting_append(self, rows):
+        frame = rows if isinstance(rows, pd.DataFrame) else pd.DataFrame(list(rows))
+        append_sizes.append(len(frame))
+        return original_append(self, rows)
+
+    monkeypatch.setattr(RowStore, "append", counting_append)
 
     summary = download_asf(
         pd.DataFrame(products),
@@ -1174,7 +1173,8 @@ def test_download_asf_batches_state_writes(tmp_path: Path, monkeypatch):
     )
 
     assert summary.skipped == 101
-    assert write_calls == 2
+    # One part per 100 buffered rows, plus the remainder.
+    assert append_sizes == [100, 1]
     state = pd.read_parquet(outdir / ".sentinel-py" / "asf_downloads.parquet")
     assert len(state) == 101
 

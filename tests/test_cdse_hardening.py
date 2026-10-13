@@ -479,3 +479,126 @@ def test_download_cli_exits_nonzero_for_required_asset_failure(
 
     assert result.exit_code == 1
     assert "failed required asset" in result.stderr
+
+
+def _download_state_fixture(tmp_path: Path, names: list[str], monkeypatch):
+    cache_root = tmp_path / "cache"
+    query_dir = cache_root / "query"
+    query_dir.mkdir(parents=True)
+    scenes_cache = query_dir / "scenes.parquet"
+    pd.DataFrame(
+        [{"Name": name, "S3Path": f"/Sentinel-2/test/{name}"} for name in names]
+    ).to_parquet(scenes_cache, index=False)
+
+    def listing(scene_name, *args, **kwargs):
+        base = {"safedir": scene_name, "s3_path": f"/Sentinel-2/test/{scene_name}",
+                "local_actual_size": None}
+        return [
+            {**base, "band_name": "B04", "resolution_m": 20, "s3_expected_size": 4,
+             "img_path_in_safedir": "GRANULE/G1/IMG_DATA/R20m/G1_B04_20m.jp2",
+             "asset_type": "image"},
+            {**base, "band_name": "MTD_MSIL2A", "resolution_m": 0,
+             "s3_expected_size": 4, "img_path_in_safedir": "MTD_MSIL2A.xml",
+             "asset_type": "metadata"},
+            {**base, "band_name": "MTD_TL", "resolution_m": 0, "s3_expected_size": 4,
+             "img_path_in_safedir": "GRANULE/G1/MTD_TL.xml", "asset_type": "metadata"},
+        ]
+
+    monkeypatch.setattr(cdse, "_list_s2_product_assets", listing)
+    return scenes_cache
+
+
+def _complete_scene_download(kwargs) -> "cdse.DownloadResult":
+    result = cdse.DownloadResult(scene_name=kwargs["scene_name"])
+    for image in kwargs["images"]:
+        result.succeeded.append(image["band_name"])
+        result.updated_images.append(
+            {**image, "local_actual_size": image["s3_expected_size"],
+             "download_status": "complete"}
+        )
+    return result
+
+
+def test_interrupted_download_keeps_state_and_resumes(tmp_path: Path, monkeypatch):
+    names = [f"S2A_MSIL2A_SCENE{n}.SAFE" for n in range(3)]
+    scenes_cache = _download_state_fixture(tmp_path, names, monkeypatch)
+    output_dir = tmp_path / "downloads"
+    common = dict(
+        scenes_cache=scenes_cache, mission="S2", bands=["B04"], resolution=20,
+        output_dir=output_dir, config_file="unused", parallel_scenes=1,
+        parallel_bands=1,
+    )
+
+    def interrupted(**kwargs):
+        if kwargs["scene_name"] == names[2]:
+            raise KeyboardInterrupt
+        return _complete_scene_download(kwargs)
+
+    monkeypatch.setattr(cdse, "_download_scene_from_images", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        cdse.resolve_and_download(**common)
+
+    # Rows buffered since the last flush were written even though the run aborted.
+    downloads = cdse.REGISTRY["cdse_downloads"].store(output_dir)
+    state = downloads.read()
+    assert set(state["safedir"]) == set(names[:2])
+    assert set(state["download_status"]) == {"complete"}
+    assert downloads.part_paths()  # not compacted: the run did not finish
+
+    # Resuming completes the remaining scene and compacts into the state file.
+    monkeypatch.setattr(
+        cdse, "_download_scene_from_images",
+        lambda **kwargs: _complete_scene_download(kwargs),
+    )
+    results = cdse.resolve_and_download(**common)
+
+    assert all(result.ok for result in results)
+    assert downloads.part_paths() == []
+    final = pd.read_parquet(downloads.path)
+    assert set(final["safedir"]) == set(names)
+    assert len(final) == 9
+
+
+def test_s2_discovery_and_fingerprint_see_uncompacted_download_state(
+    tmp_path: Path, monkeypatch
+):
+    from shapely.geometry import box
+
+    from sentinel_py.cache import REGISTRY
+    from sentinel_py.pipeline.readers import s2 as s2_reader
+
+    data_dir = tmp_path / "raw"
+    recorded = "S2A_MSIL2A_20240601T000000_N0510_R001_T06WVB_20240601T010000.SAFE"
+    unrecorded = "S2A_MSIL2A_20240602T000000_N0510_R001_T06WVB_20240602T010000.SAFE"
+    for safe in (recorded, unrecorded):
+        image_dir = data_dir / safe / "GRANULE" / "L2A_T06WVB_A000001" / "IMG_DATA" / "R20m"
+        image_dir.mkdir(parents=True)
+        (image_dir / "T06WVB_B04_20m.jp2").write_bytes(b"x")
+        (image_dir / "T06WVB_SCL_20m.jp2").write_bytes(b"x")
+    monkeypatch.setattr(
+        s2_reader, "read_granule_footprint", lambda *args, **kwargs: box(0, 0, 1, 1)
+    )
+
+    store = REGISTRY["cdse_downloads"].store(data_dir)
+    assert store.fingerprint() is None
+
+    # Only checkpoint parts exist (a download was interrupted before compaction).
+    store.append(
+        [{"safedir": recorded, "img_path_in_safedir": "MTD_MSIL2A.xml",
+          "download_status": "complete"}]
+    )
+    parts_only = store.fingerprint()
+    assert parts_only is not None
+
+    granules = s2_reader.discover_s2_granules(data_dir, ("B04",), 20)
+    # The state parts, not a directory glob, selected the SAFE to discover.
+    assert [granule.safe_dir.name for granule in granules] == [recorded]
+
+    store.compact()
+    compacted = store.fingerprint()
+    assert compacted != parts_only
+    assert compacted == (
+        str(store.path), store.path.stat().st_size, store.path.stat().st_mtime_ns
+    )  # same shape a single state file always produced
+    assert [g.safe_dir.name for g in s2_reader.discover_s2_granules(
+        data_dir, ("B04",), 20)] == [recorded]

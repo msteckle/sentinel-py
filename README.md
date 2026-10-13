@@ -303,3 +303,26 @@ sentinel-py pgc download \
 ```
 
 Download state is stored at `<outdir>/.sentinel-py/pgc_downloads.parquet`. It records each tile's URL, local path, size, status, and last action. Existing files are checked only when referenced by the manifest and verified complete files are skipped; the output directory is never recursively crawled. Downloads use atomic temporary files, retries, and a Rich progress bar. PGC ArcticDEM mosaics use EPSG:3413 and ellipsoidal heights; follow PGC's attribution requirements when publishing results.
+
+### Managing caches
+
+Query results, shared asset listings, and checkpointed download state accumulate under `~/.sentinel-py/cache` (override the location with `SENTINEL_PY_HOME`), and state files sit beside your data in `.sentinel-py` directories. The `cache` commands show and tidy them without touching downloaded data or processing outputs.
+
+```bash
+# Summarize cached queries, point samples, and stores (add --entries for each item)
+sentinel-py cache list
+
+# Include the state files kept beside your data (only <PATH>/.sentinel-py is examined)
+sentinel-py cache list --data-dir data/s2/raw --data-dir data/s1/raw
+
+# Fold checkpoint parts left by interrupted runs back into single store files
+sentinel-py cache compact --dry-run
+sentinel-py cache compact
+
+# Delete query caches and point samples not used for 90 days
+sentinel-py cache prune --older-than 90 --dry-run
+sentinel-py cache prune --older-than 90
+```
+
+`cache prune` only deletes keyed query directories and cached point-sample tables, which are regenerated on demand; it prints what it will delete and asks for confirmation unless `--yes` is given. Shared asset listings, scene catalogs, and every state file beside your data are never deleted by the CLI, and a store is compacted in place by `cache compact`.
+

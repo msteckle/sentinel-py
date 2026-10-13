@@ -24,7 +24,7 @@ Find the right home before writing code. Source is under `src/sentinel_py`; test
 | `enums.py` | Every controlled vocabulary (CLI choices, pipeline choices, status values). |
 | `aoi.py` | AOI file parsing, batching, GeoJSON conversion, lat/lon grids, `atomic_aoi_geometries`. |
 | `log.py` | `get_logger`; persistent file logging plus Rich console output. |
-| `cache/` | Cache primitives: `base.py` (keys, atomic writes, `QueryCache`), `rowstore.py` (`RowStore`, `RowWriter`), `registry.py` (`REGISTRY` of named namespaces). |
+| `cache/` | Cache primitives: `base.py` (keys, atomic writes, `QueryCache`), `rowstore.py` (`RowStore`, `RowWriter`), `registry.py` (`REGISTRY` of named namespaces), `maintenance.py` (inspect, compact, and prune; backs `sentinel-py cache`). |
 | `download/` | Provider query and download: `asf.py`, `cdse.py`, `pgc.py`, `s1_orbits.py`, shared `base.py` and `preflight.py`. |
 | `cli/` | Typer commands. `main.py` only assembles the app; one module per subcommand; shared options in `options.py`. |
 | `pipeline/config.py` | YAML parsing and validation into frozen dataclasses. No execution, no I/O beyond reading config. |
@@ -47,6 +47,7 @@ Do not re-implement these. If one is almost right, extend it (and its tests) rat
 | Download summary, `.part` paths, safe filename from URL | `download.base.DownloadSummary`, `part_path`, `url_filename` |
 | Storage preflight for a manifest | `download.preflight.manifest_storage_summary`, `confirm_download` |
 | Query result cache (key, directory, reuse, save) | `cache.QueryCache` |
+| Enumerate, compact, or prune caches | `cache.list_entries`, `compact_stores`, `select_prunable`, `delete_entries` |
 | Keyed state/rows with checkpoints | `cache.REGISTRY[...]` then `.store(root)` or `.store_at(path)`; `RowStore.writer(...)` |
 | Deterministic hash of parameters | `cache.deterministic_cache_key` |
 | Atomic file writes | `cache.write_parquet_atomic`, `write_json_atomic` |

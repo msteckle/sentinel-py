@@ -192,7 +192,12 @@ def point_sample_requests(
 
 def point_sample_cache_path(reader_name: str, cache_key: str) -> Path:
     """Return the shared, reader-namespaced cache location for point rows."""
-    return DEFAULT_PIPELINE_CACHE_DIR / "point-samples" / reader_name / f"{cache_key}.parquet"
+    return (
+        DEFAULT_PIPELINE_CACHE_DIR
+        / "point-samples"
+        / reader_name
+        / f"{cache_key}.parquet"
+    )
 
 
 def point_sample_cache_key(

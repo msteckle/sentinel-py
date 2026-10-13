@@ -53,7 +53,7 @@ nodes:
   - id: indices
     type: s2.index
     inputs: {data: all-composite}
-    indices: [NDGI, NDWI1]
+    indices: [NDGI, NDWI1, NDWI2, MSAVI, VARI, RVI, OSAVI, TGI, GLI, NGRDI, CIG, GNDVI, CVI, MTVI2, TCARI, TCI, NARI, TCAPB, TCAPG, TCAPW]
 
   # ArcticDEM processing steps
   # 1. calculate terrain features from the DEM

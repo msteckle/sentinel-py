@@ -510,11 +510,14 @@ def _append_indices(source: Any, config: S2IndexNodeConfig) -> Any:
     """Append configured indices to one lazy xarray dataset."""
     import xarray as xr
 
+    # Validate that the source dataset contains the necessary reflectance data & bands
     if not isinstance(source, xr.Dataset) or "reflectance" not in source:
         raise TypeError("s2.index input must be an xarray Dataset with reflectance")
     reflectance = source["reflectance"]
     if "band" not in reflectance.dims:
         raise ValueError("s2.index input reflectance must have a band dimension")
+
+    # Gather available and required bands for the requested indices
     available = {str(value) for value in reflectance.band.values}
     required = tuple(
         dict.fromkeys(
@@ -523,12 +526,18 @@ def _append_indices(source: Any, config: S2IndexNodeConfig) -> Any:
             for band in SpectralIndex.registry[index_name].bands
         )
     )
+
+    # Check for missing bands required by the requested indices
     missing = tuple(band for band in required if band not in available)
     if missing:
         raise ValueError("s2.index input is missing bands: " + ", ".join(missing))
+
+    # Convert DN to reflectance before applying the index calculations
     values = _raster_reflectance(source, reflectance.sel(band=list(required)))
     nodata = reflectance.attrs.get("nodata")
     arrays = []
+
+    # Apply the index calculations to the reflectance values
     for index_name in config.indices:
         index_class = SpectralIndex.registry[index_name]
         selected = values.sel(band=list(index_class.bands))
@@ -540,11 +549,15 @@ def _append_indices(source: Any, config: S2IndexNodeConfig) -> Any:
             nodata=nodata,
         )
         arrays.append(result.expand_dims(band=[index_name]))
+
+    # Combine the original reflectance data with the newly calculated index arrays
     combined = xr.concat([reflectance.astype(np.float32), *arrays], dim="band")
     combined.attrs.update(reflectance.attrs)
     combined.attrs["nodata"] = nodata
     result = source.drop_vars("reflectance").assign_coords(band=combined.band)
     result["reflectance"] = combined
+
+    # Generate ID for the processed dataset based on the input and configuration
     recipe_id = deterministic_cache_key(
         {
             "processor": "s2.index",
@@ -553,6 +566,8 @@ def _append_indices(source: Any, config: S2IndexNodeConfig) -> Any:
             "source_recipe": source.attrs.get("recipe_id"),
         }
     )[:12]
+
+    # Assign the generated recipe ID to the result dataset
     if "source_fingerprint" in source.coords:
         result = result.assign_coords(
             source_fingerprint=(

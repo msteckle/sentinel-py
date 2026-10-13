@@ -164,7 +164,7 @@ def test_prepare_cdse_download_checkpoints_and_resumes_after_failure(
             raise RuntimeError("listing failed")
         return _fake_images(scene_name)
 
-    monkeypatch.setattr("sentinel_py.download.cdse._find_s2_scene_images", failing)
+    monkeypatch.setattr("sentinel_py.download.cdse._list_s2_product_assets", failing)
     with pytest.raises(RuntimeError, match="listing failed"):
         prepare_cdse_download(**kwargs)
 
@@ -178,10 +178,30 @@ def test_prepare_cdse_download_checkpoints_and_resumes_after_failure(
         listed.append(scene_name)
         return _fake_images(scene_name)
 
-    monkeypatch.setattr("sentinel_py.download.cdse._find_s2_scene_images", recording)
+    monkeypatch.setattr("sentinel_py.download.cdse._list_s2_product_assets", recording)
     summary = prepare_cdse_download(**kwargs)
 
     assert sorted(listed) == names[3:]
     assert summary.asset_count == 15
     assert set(store.read()["safedir"]) == set(names)
     assert store.part_paths() == []  # clean run compacts back into assets.parquet
+
+
+def test_read_key_filters_limit_rows_and_reject_non_key_columns(tmp_path: Path):
+    store = RowStore(tmp_path / "t.parquet", ["scene", "path"])
+    store.append(
+        [
+            {"scene": "a", "path": "1", "value": 1},
+            {"scene": "b", "path": "1", "value": 1},
+            {"scene": "c", "path": "1", "value": 1},
+        ]
+    )
+    store.append([{"scene": "b", "path": "1", "value": 2}])
+
+    subset = store.read(key_filters={"scene": ["b", "c"]}).sort_values("scene")
+
+    assert subset["scene"].tolist() == ["b", "c"]
+    assert subset["value"].tolist() == [2, 1]  # newest row for "b" still wins
+    assert store.read(key_filters={"scene": []}).empty
+    with pytest.raises(ValueError, match="key columns"):
+        store.read(key_filters={"value": [1]})

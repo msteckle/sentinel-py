@@ -15,7 +15,7 @@ import logging
 import threading
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -123,15 +123,29 @@ class RowStore:
             )
 
     def _read_files(
-        self, files: list[Path], columns: list[str] | None
+        self,
+        files: list[Path],
+        columns: list[str] | None,
+        key_filters: dict[str, Collection[Any]] | None = None,
     ) -> pd.DataFrame:
         """Read and deduplicate files in order, newest row per key winning."""
         wanted = None
         if columns is not None:
             wanted = list(dict.fromkeys([*self.key_columns, *columns]))
+        filters = None
+        if key_filters:
+            unknown = set(key_filters) - set(self.key_columns)
+            if unknown:
+                raise ValueError(
+                    "key_filters may only use key columns (all versions of a key "
+                    f"share them); got: {', '.join(sorted(unknown))}"
+                )
+            if any(len(values) == 0 for values in key_filters.values()):
+                return pd.DataFrame(columns=wanted or [])
+            filters = [(name, "in", list(values)) for name, values in key_filters.items()]
         frames = []
         for file in files:
-            frame = pd.read_parquet(file, columns=wanted)
+            frame = pd.read_parquet(file, columns=wanted, filters=filters)
             if not frame.empty:
                 frames.append(frame)
         if not frames:
@@ -141,7 +155,12 @@ class RowStore:
         combined = combined.reset_index(drop=True)
         return combined if columns is None else combined[list(columns)]
 
-    def read(self, columns: list[str] | None = None) -> pd.DataFrame:
+    def read(
+        self,
+        columns: list[str] | None = None,
+        *,
+        key_filters: dict[str, Collection[Any]] | None = None,
+    ) -> pd.DataFrame:
         """Return the deduplicated table.
 
         Parameters
@@ -149,6 +168,11 @@ class RowStore:
         columns : list[str], optional
             Columns to return; reading fewer columns is much cheaper. All columns
             are returned when omitted.
+        key_filters : dict[str, Collection], optional
+            Keep only rows whose key column is in the given values, e.g.
+            ``{"safedir": scene_names}``. Only key columns are allowed because
+            every version of a row shares them, so filtering cannot resurrect a
+            superseded row.
 
         Returns
         -------
@@ -160,7 +184,7 @@ class RowStore:
             parts = self.part_paths()
             files = ([self.path] if self.path.is_file() else []) + parts
             try:
-                return self._read_files(files, columns)
+                return self._read_files(files, columns, key_filters)
             except FileNotFoundError:
                 # A concurrent compaction folded parts into the base file.
                 if attempt == _READ_RETRIES - 1:

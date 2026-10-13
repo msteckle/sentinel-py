@@ -168,20 +168,105 @@ def test_failed_query_batch_is_not_cached_as_complete(tmp_path: Path, monkeypatc
     assert not list(cache_dir.glob("*/scenes.parquet"))
 
 
-def test_s2_discovery_lists_each_resolution_once_and_includes_metadata(monkeypatch):
+def _recursive_listing(scene_path: str) -> str:
+    return "\n".join(
+        [
+            f"2024/01/01 00:00:00 7 s3://eodata{scene_path}/MTD_MSIL2A.xml",
+            f"2024/01/01 00:00:00 9 s3://eodata{scene_path}/manifest.safe",
+            "2024/01/01 00:00:00 8 L2A_G1/MTD_TL.xml",
+            "2024/01/01 00:00:00 1 L2A_G1/QI_DATA/MSK_CLDPRB_20m.jp2",
+            "2024/01/01 00:00:00 4 L2A_G1/IMG_DATA/R10m/G1_B04_10m.jp2",
+            "2024/01/01 00:00:00 4 L2A_G1/IMG_DATA/R20m/G1_B04_20m.jp2",
+            "2024/01/01 00:00:00 5 L2A_G1/IMG_DATA/R20m/G1_B05_20m.jp2",
+            "2024/01/01 00:00:00 6 L2A_G2/IMG_DATA/R20m/G2_B04_20m.jp2",
+            "2024/01/01 00:00:00 2 L2A_G1/IMG_DATA/R20m/G1_SCL_20m.jp2",
+        ]
+    )
+
+
+def test_s2_discovery_uses_one_recursive_listing_and_caches_every_asset(monkeypatch):
     scene_path = "/Sentinel-2/test/S2A_TEST.SAFE"
     calls: list[str] = []
 
     def fake_s5cmd(command: str, *, config_file: str, **kwargs):
         calls.append(command)
+        return _recursive_listing(scene_path)
+
+    monkeypatch.setattr(cdse, "run_s5cmd_with_config", fake_s5cmd)
+    logger = logging.getLogger("test_s2_asset_discovery")
+
+    listing = cdse._list_s2_product_assets(
+        "S2A_MSIL2A_TEST.SAFE", scene_path, "unused", logger
+    )
+
+    assert len(calls) == 1
+    assert calls[0].endswith(f"{scene_path}/*\"")
+    # Every recognized band and resolution is kept so other requests need no S3 call.
+    assert {(a["band_name"], a["resolution_m"]) for a in listing} == {
+        ("MTD_MSIL2A", 0),
+        ("MTD_TL", 0),
+        ("B04", 10),
+        ("B04", 20),
+        ("B05", 20),
+        ("SCL", 20),
+    }
+    assert all(not a["img_path_in_safedir"].startswith("s3://") for a in listing)
+    assert {
+        a["img_path_in_safedir"] for a in listing if a["band_name"] == "MTD_TL"
+    } == {"GRANULE/L2A_G1/MTD_TL.xml"}
+    assert {
+        a["img_path_in_safedir"]
+        for a in listing
+        if (a["band_name"], a["resolution_m"]) == ("B04", 20)
+    } == {
+        "GRANULE/L2A_G1/IMG_DATA/R20m/G1_B04_20m.jp2",
+        "GRANULE/L2A_G2/IMG_DATA/R20m/G2_B04_20m.jp2",
+    }
+
+    selected = cdse._select_s2_assets(
+        listing,
+        [cdse.ResolvedBand("B04", 20), cdse.ResolvedBand("B05", 20)],
+        "S2A_MSIL2A_TEST.SAFE",
+    )
+    assert {(a["band_name"], a["resolution_m"]) for a in selected} == {
+        ("MTD_MSIL2A", 0),
+        ("MTD_TL", 0),
+        ("B04", 20),
+        ("B05", 20),
+    }
+
+
+def test_s2_selection_reports_requested_assets_missing_from_listing(caplog):
+    listing = [
+        {"band_name": "B04", "resolution_m": 20},
+        {"band_name": "MTD_MSIL2A", "resolution_m": 0},
+        {"band_name": "MTD_TL", "resolution_m": 0},
+    ]
+    logger = logging.getLogger("test_s2_selection")
+    with caplog.at_level(logging.WARNING, logger="test_s2_selection"):
+        selected = cdse._select_s2_assets(
+            listing,
+            [cdse.ResolvedBand("B04", 20), cdse.ResolvedBand("B09", 60)],
+            "S2A_MSIL2A_TEST.SAFE",
+            logger,
+        )
+    assert len(selected) == 3
+    assert "B09@60m: not found" in caplog.text
+
+
+def test_s2_discovery_falls_back_to_directory_listings_when_recursive_unusable(
+    monkeypatch,
+):
+    scene_path = "/Sentinel-2/test/S2A_TEST.SAFE"
+    calls: list[str] = []
+
+    def fake_s5cmd(command: str, *, config_file: str, **kwargs):
+        calls.append(command)
+        if command.endswith("/*\""):
+            # Unusable shape: paths lack the GRANULE structure the downloader needs.
+            return "2024/01/01 00:00:00 4 G1_B04_20m.jp2"
         if "R20m/*.jp2" in command:
-            return "\n".join(
-                [
-                    "2024/01/01 00:00:00 4 L2A_G1/IMG_DATA/R20m/G1_B04_20m.jp2",
-                    "2024/01/01 00:00:00 5 L2A_G1/IMG_DATA/R20m/G1_B05_20m.jp2",
-                    "2024/01/01 00:00:00 6 L2A_G2/IMG_DATA/R20m/G2_B04_20m.jp2",
-                ]
-            )
+            return "2024/01/01 00:00:00 4 L2A_G1/IMG_DATA/R20m/G1_B04_20m.jp2"
         if "MTD_MSIL2A.xml" in command:
             return f"2024/01/01 00:00:00 7 s3://eodata{scene_path}/MTD_MSIL2A.xml"
         if "MTD_TL.xml" in command:
@@ -190,33 +275,18 @@ def test_s2_discovery_lists_each_resolution_once_and_includes_metadata(monkeypat
 
     monkeypatch.setattr(cdse, "run_s5cmd_with_config", fake_s5cmd)
 
-    assets = cdse._find_s2_scene_images(
+    listing = cdse._list_s2_product_assets(
         "S2A_MSIL2A_TEST.SAFE",
         scene_path,
-        [
-            cdse.ResolvedBand("B04", 20),
-            cdse.ResolvedBand("B05", 20),
-        ],
-        config_file="unused",
-        logger=logging.getLogger("test_s2_asset_discovery"),
+        "unused",
+        logging.getLogger("test_s2_fallback"),
     )
 
-    assert sum("R20m/*.jp2" in call for call in calls) == 1
-    assert len(calls) == 3
-    assert [asset["band_name"] for asset in assets].count("B04") == 2
-    assert {asset["band_name"] for asset in assets} == {
-        "B04",
-        "B05",
-        "MTD_MSIL2A",
-        "MTD_TL",
-    }
-    assert all(not asset["img_path_in_safedir"].startswith("s3://") for asset in assets)
-    assert {
-        asset["img_path_in_safedir"] for asset in assets if asset["band_name"] == "B04"
-    } == {
-        "GRANULE/L2A_G1/IMG_DATA/R20m/G1_B04_20m.jp2",
-        "GRANULE/L2A_G2/IMG_DATA/R20m/G2_B04_20m.jp2",
-    }
+    assert len(calls) == 6  # 1 recursive + 3 resolution directories + 2 metadata
+    assert {a["band_name"] for a in listing} == {"B04", "MTD_MSIL2A", "MTD_TL"}
+    assert [a["img_path_in_safedir"] for a in listing if a["band_name"] == "B04"] == [
+        "GRANULE/L2A_G1/IMG_DATA/R20m/G1_B04_20m.jp2"
+    ]
 
 
 def test_download_is_atomic_and_retries_size_mismatch(tmp_path: Path, monkeypatch):
@@ -310,7 +380,9 @@ def test_download_state_is_scoped_to_output_directory(
         ]
     ]
 
-    monkeypatch.setattr(cdse, "_find_s2_scene_images", lambda *args, **kwargs: assets)
+    monkeypatch.setattr(
+        cdse, "_list_s2_product_assets", lambda *args, **kwargs: assets
+    )
 
     def fake_download_scene(**kwargs):
         result = cdse.DownloadResult(scene_name=kwargs["scene_name"])

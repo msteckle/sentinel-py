@@ -162,7 +162,7 @@ def test_prepare_cdse_download_resolves_sizes_without_downloading(
         ]
 
     monkeypatch.setattr(
-        "sentinel_py.download.cdse._find_s2_scene_images",
+        "sentinel_py.download.cdse._list_s2_product_assets",
         fake_find_images,
     )
 
@@ -227,7 +227,7 @@ def test_prepare_cdse_download_lists_only_a_deterministic_sample(
         listed.append(scene_name)
         return _scene_images(scene_name, 100)
 
-    monkeypatch.setattr("sentinel_py.download.cdse._find_s2_scene_images", fake_find)
+    monkeypatch.setattr("sentinel_py.download.cdse._list_s2_product_assets", fake_find)
     kwargs = dict(
         scenes_cache=scenes_cache, mission="S2", bands=["B04"], resolution=20,
         output_dir=tmp_path / "downloads", config_file=str(tmp_path / ".s5cfg"),
@@ -275,3 +275,50 @@ def test_estimate_always_prompts_but_exact_complete_download_does_not(monkeypatc
                                        sampled_scenes=5, total_scenes=50),
     )
     assert prompts == [1]
+
+
+def test_cached_product_listing_serves_a_different_band_request(
+    tmp_path: Path, monkeypatch
+):
+    scenes_cache = tmp_path / "cache" / "query" / "scenes.parquet"
+    scenes_cache.parent.mkdir(parents=True)
+    scene = "S2A_SCENE_MSIL2A.SAFE"
+    pd.DataFrame({"Name": [scene], "S3Path": ["/eodata/s"]}).to_parquet(
+        scenes_cache, index=False
+    )
+    base = {"safedir": scene, "s3_path": "/s", "local_actual_size": None}
+
+    def full_listing(*args, **kwargs):
+        rows = [
+            {**base, "band_name": band, "resolution_m": 20,
+             "img_path_in_safedir": f"GRANULE/G/IMG_DATA/R20m/{band}_20m.jp2",
+             "s3_expected_size": size, "asset_type": "image"}
+            for band, size in (("B04", 100), ("B05", 200))
+        ]
+        rows += [
+            {**base, "band_name": name, "resolution_m": 0,
+             "img_path_in_safedir": path, "s3_expected_size": 5,
+             "asset_type": "metadata"}
+            for name, path in (("MTD_MSIL2A", "MTD_MSIL2A.xml"),
+                               ("MTD_TL", "GRANULE/G/MTD_TL.xml"))
+        ]
+        return rows
+
+    listings = []
+    monkeypatch.setattr(
+        "sentinel_py.download.cdse._list_s2_product_assets",
+        lambda *a, **k: listings.append(1) or full_listing(),
+    )
+    common = dict(
+        scenes_cache=scenes_cache, mission="S2", resolution=20,
+        output_dir=tmp_path / "downloads", config_file=str(tmp_path / ".s5cfg"),
+    )
+
+    first = prepare_cdse_download(bands=["B04"], **common)
+    second = prepare_cdse_download(bands=["B05"], **common)
+    both = prepare_cdse_download(bands=["B04", "B05"], **common)
+
+    assert len(listings) == 1  # one S3 listing served all three requests
+    assert first.known_total_bytes == 110
+    assert second.known_total_bytes == 210
+    assert both.known_total_bytes == 310

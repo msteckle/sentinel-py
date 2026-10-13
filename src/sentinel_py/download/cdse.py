@@ -134,7 +134,10 @@ Sentinel-py (cdse) has 4 metadata layers to avoid redundant queries and download
 2. Shared scene catalog [~/.sentinel-py/cache/cdse/catalog.parquet]
     - Scene footprints and acquisition dates are deduplicated across query manifests
 3. Remote asset discovery [~/.sentinel-py/cache/cdse/assets.parquet]
-    - Resolved S3 objects are shared across queries
+    - One recursive S3 listing per product is cached with every recognized band and
+      resolution, so changing the requested bands or resolution does not return to S3.
+      Rows are checkpointed in batches (see sentinel_py.cache.RowStore) and shared
+      across queries
 4. Local download state [<data_dir>/.sentinel-py/cdse_downloads.parquet]
     - Each output root records verified local files in
       <output>/.sentinel-py/cdse_downloads.parquet. Filesystem checks remain
@@ -747,34 +750,49 @@ def _list_scene_assets(
     return assets
 
 
-def _find_s2_scene_images(
+_S2_IMAGE_PATTERN_L2A = re.compile(
+    r"_(B(?:0[1-9]|1[0-2]|8A)|SCL|TCI|AOT|WVP)_(10|20|60)M\.JP2$"
+)
+_S2_IMAGE_PATTERN_L1C = re.compile(r"_(B(?:0[1-9]|1[0-2]|8A)|SCL|TCI|AOT|WVP)\.JP2$")
+
+
+def _s2_asset_rows(
     scene_name: str,
     s3_path: str,
-    resolved: list[ResolvedBand],
-    config_file: str,
-    logger: logging.Logger,
+    listed: list[tuple[int, str]],
+    *,
+    is_l1c: bool,
 ) -> list[dict]:
-    """
-    Find S2 images in a scene (.SAFE directory) by querying S3 directly given resolved
-    bands.
-    """
-    # Normalize the S3 path to remove the "/eodata" prefix and any trailing slashes
-    s3_path = s3_path.removeprefix("/eodata").rstrip("/")
-    is_l1c = "MSIL1C" in scene_name.upper()
-    images: list[dict] = []
-    requested = {(rb.band, 0 if is_l1c else rb.resolution) for rb in resolved}
-    found: set[tuple[str, int]] = set()
+    """Convert listed S3 objects into asset rows for every recognized S2 asset.
 
-    # Helper function to append an asset to the images list
-    def _append_asset(
-        expected_size: int,
-        rel_path: str,
-        *,
-        band_name: str,
-        resolution_m: int,
-        asset_type: str,
-    ) -> None:
-        images.append(
+    All spectral and auxiliary image assets at every resolution are kept, together
+    with the product and granule metadata files, so one listing can serve any later
+    band or resolution request without returning to S3.
+    """
+    rows: list[dict] = []
+    seen: set[str] = set()
+    metadata_root = "MTD_MSIL1C.XML" if is_l1c else "MTD_MSIL2A.XML"
+    for expected_size, rel_path in listed:
+        if rel_path in seen:
+            continue
+        filename = Path(rel_path).name.upper()
+        band_name: str | None = None
+        resolution_m = 0
+        asset_type = "image"
+        if rel_path.upper() == metadata_root:
+            band_name, asset_type = metadata_root.removesuffix(".XML"), "metadata"
+        elif filename == "MTD_TL.XML" and rel_path.startswith("GRANULE/"):
+            band_name, asset_type = "MTD_TL", "metadata"
+        else:
+            pattern = _S2_IMAGE_PATTERN_L1C if is_l1c else _S2_IMAGE_PATTERN_L2A
+            match = pattern.search(filename)
+            if match:
+                band_name = match.group(1)
+                resolution_m = 0 if is_l1c else int(match.group(2))
+        if band_name is None:
+            continue
+        seen.add(rel_path)
+        rows.append(
             {
                 "safedir": scene_name,
                 "s3_path": s3_path,
@@ -786,24 +804,92 @@ def _find_s2_scene_images(
                 "asset_type": asset_type,
             }
         )
+    return rows
 
+
+def _s2_listing_is_trustworthy(rows: list[dict], *, is_l1c: bool) -> bool:
+    """Check that a recursive listing produced usable, correctly rooted paths.
+
+    The CDSE S3 endpoint reports wildcard-listed paths in several shapes, so a
+    recursive listing is only accepted when it contains images and both metadata
+    files and every path is relative to the SAFE product as the downloader expects.
+    """
+    metadata_name = "MTD_MSIL1C" if is_l1c else "MTD_MSIL2A"
+    images = [row for row in rows if row["asset_type"] == "image"]
+    names = {row["band_name"] for row in rows if row["asset_type"] == "metadata"}
+    return (
+        bool(images)
+        and {metadata_name, "MTD_TL"} <= names
+        and all(row["img_path_in_safedir"].startswith("GRANULE/") for row in images)
+    )
+
+
+def _list_s2_product_assets(
+    scene_name: str,
+    s3_path: str,
+    config_file: str,
+    logger: logging.Logger,
+) -> list[dict]:
+    """List every recognized asset of one S2 product with a single S3 request.
+
+    One recursive ``ls`` under the product replaces separate listings per
+    resolution directory and per metadata file. If the response is not in the
+    expected shape the targeted per-directory listings are used instead.
+
+    Parameters
+    ----------
+    scene_name : str
+        SAFE product name.
+    s3_path : str
+        Product path under ``/eodata``.
+    config_file : str
+        ``s5cmd`` configuration file.
+    logger : logging.Logger
+        Logger for fallback decisions and listing errors.
+
+    Returns
+    -------
+    list[dict]
+        Asset rows for all recognized images and metadata, regardless of which
+        bands the current request needs. Use :func:`_select_s2_assets` to narrow.
+    """
+    s3_path = s3_path.removeprefix("/eodata").rstrip("/")
+    is_l1c = "MSIL1C" in scene_name.upper()
     try:
-        # Determine the S3 patterns to list based on whether the scene is L1C
+        try:
+            listed = _list_scene_assets(f"s3://eodata{s3_path}/*", s3_path, config_file)
+            rows = _s2_asset_rows(scene_name, s3_path, listed, is_l1c=is_l1c)
+            if _s2_listing_is_trustworthy(rows, is_l1c=is_l1c):
+                return rows
+            logger.warning(
+                "  Recursive listing of %s was not usable; listing directories",
+                scene_name,
+            )
+        except FileNotFoundError:
+            raise
+        except Exception:
+            logger.warning(
+                "  ERR recursive listing of %s; listing directories",
+                scene_name,
+                exc_info=True,
+            )
+
+        # Fallback: targeted listings of each resolution directory and metadata file.
         if is_l1c:
-            patterns = [
-                f"s3://eodata{s3_path}/GRANULE/*/IMG_DATA/*.jp2",
-            ]
-        # Or if it's L2A, we need to list for each resolution
+            patterns = [f"s3://eodata{s3_path}/GRANULE/*/IMG_DATA/*.jp2"]
         else:
             patterns = [
                 f"s3://eodata{s3_path}/GRANULE/*/IMG_DATA/R{resolution}m/*.jp2"
-                for resolution in sorted({rb.resolution for rb in resolved})
+                for resolution in (10, 20, 60)
             ]
-
-        # List assets for each pattern
+        patterns += [
+            f"s3://eodata{s3_path}/{'MTD_MSIL1C.xml' if is_l1c else 'MTD_MSIL2A.xml'}",
+            f"s3://eodata{s3_path}/GRANULE/*/MTD_TL.xml",
+        ]
+        listed = []
         for pattern in patterns:
             try:
-                listed_assets = _list_scene_assets(pattern, s3_path, config_file)
+                listed.extend(_list_scene_assets(pattern, s3_path, config_file))
             except FileNotFoundError:
                 raise
             except Exception:
@@ -811,65 +897,7 @@ def _find_s2_scene_images(
                     f"  ERR listing imagery with {pattern} for {scene_name}",
                     exc_info=True,
                 )
-                continue
-
-            # Match listed assets to requested bands and resolutions
-            for expected_size, rel_path in listed_assets:
-                filename = Path(rel_path).name.upper()
-                if is_l1c:
-                    match = re.search(
-                        r"_(B(?:0[1-9]|1[0-2]|8A)|SCL|TCI|AOT|WVP)\.JP2$",
-                        filename,
-                    )
-                    key = (match.group(1), 0) if match else None
-                else:
-                    match = re.search(
-                        r"_(B(?:0[1-9]|1[0-2]|8A)|SCL|TCI|AOT|WVP)_"
-                        r"(10|20|60)M\.JP2$",
-                        filename,
-                    )
-                    key = (match.group(1), int(match.group(2))) if match else None
-                # Only append assets that match the requested bands and resolutions
-                if key is None or key not in requested:
-                    continue
-                _append_asset(
-                    expected_size,
-                    rel_path,
-                    band_name=key[0],
-                    resolution_m=key[1],
-                    asset_type="image",
-                )
-                found.add(key)
-
-        # Now handle metadata assets (MTD_MSIL1C or MTD_MSIL2A, and MTD_TL)
-        metadata_patterns = [
-            (
-                "MTD_MSIL1C" if is_l1c else "MTD_MSIL2A",
-                f"s3://eodata{s3_path}/"
-                f"{'MTD_MSIL1C.xml' if is_l1c else 'MTD_MSIL2A.xml'}",
-            ),
-            ("MTD_TL", f"s3://eodata{s3_path}/GRANULE/*/MTD_TL.xml"),
-        ]
-        for metadata_name, pattern in metadata_patterns:
-            # List metadata assets and append them to the images list
-            try:
-                metadata_assets = _list_scene_assets(pattern, s3_path, config_file)
-            except FileNotFoundError:
-                raise
-            except Exception:
-                logger.warning(
-                    f"  ERR {metadata_name}: not found in {scene_name}",
-                    exc_info=True,
-                )
-                continue
-            for expected_size, rel_path in metadata_assets:
-                _append_asset(
-                    expected_size,
-                    rel_path,
-                    band_name=metadata_name,
-                    resolution_m=0,
-                    asset_type="metadata",
-                )
+        return _s2_asset_rows(scene_name, s3_path, listed, is_l1c=is_l1c)
     except FileNotFoundError as e:
         if not Path(config_file).is_file():
             raise RuntimeError(
@@ -879,12 +907,46 @@ def _find_s2_scene_images(
             "s5cmd executable not found: ensure s5cmd is installed and in PATH"
         ) from e
 
-    # Log warnings for any requested bands/resolutions that were not found in the scene
-    for band_name, resolution in sorted(requested - found):
-        label = band_name if is_l1c else f"{band_name}@{resolution}m"
-        logger.warning(f"  ERR {label}: not found in {scene_name}")
 
-    return images
+def _select_s2_assets(
+    rows: list[dict],
+    resolved: list[ResolvedBand],
+    scene_name: str,
+    logger: logging.Logger | None = None,
+) -> list[dict]:
+    """Select the requested band/resolution assets and the metadata files.
+
+    Parameters
+    ----------
+    rows : list[dict]
+        Asset rows from :func:`_list_s2_product_assets`.
+    resolved : list[ResolvedBand]
+        Requested bands with their resolved resolutions.
+    scene_name : str
+        SAFE product name, used to detect Level-1C products.
+    logger : logging.Logger, optional
+        When given, requested assets absent from ``rows`` are reported.
+
+    Returns
+    -------
+    list[dict]
+        Rows needed for the request, in listing order.
+    """
+    is_l1c = "MSIL1C" in scene_name.upper()
+    requested = {(rb.band, 0 if is_l1c else rb.resolution) for rb in resolved}
+    metadata = {"MTD_MSIL1C" if is_l1c else "MTD_MSIL2A", "MTD_TL"}
+    selected = [
+        row
+        for row in rows
+        if (row["band_name"], int(row["resolution_m"] or 0)) in requested
+        or row["band_name"] in metadata
+    ]
+    if logger is not None:
+        found = {(row["band_name"], int(row["resolution_m"] or 0)) for row in selected}
+        for band_name, resolution in sorted(requested - found):
+            label = band_name if is_l1c else f"{band_name}@{resolution}m"
+            logger.warning(f"  ERR {label}: not found in {scene_name}")
+    return selected
 
 
 def _find_s1_scene_images(
@@ -1383,7 +1445,9 @@ def prepare_cdse_download(
     update_cdse_scene_catalog(cache_root, scenes)
     asset_store = _cdse_asset_store(cache_root)
     images_file = asset_store.path
-    cached_images = asset_store.read()
+    cached_images = asset_store.read(
+        key_filters={"safedir": sampled_scenes["Name"].astype(str).tolist()}
+    )
     if not cached_images.empty and "local_actual_size" not in cached_images.columns:
         cached_images["local_actual_size"] = None
 
@@ -1469,20 +1533,18 @@ def prepare_cdse_download(
         else:
             selected_by_scene[scene_name] = selected
 
-    def _resolve(row: pd.Series) -> tuple[str, list[dict]]:
-        """List one scene's requested S3 objects without downloading their content."""
+    def _resolve(row: pd.Series) -> tuple[str, list[dict], list[dict]]:
+        """List one scene in S3 and return its full listing and requested assets."""
         scene_name = str(row["Name"])
         s3_path = str(row["S3Path"])
         if mission.upper() == "S2":
             if resolved_bands is None:
                 raise ValueError("Resolved Sentinel-2 bands are unavailable")
-            images = _find_s2_scene_images(
-                scene_name,
-                s3_path,
-                resolved_bands,
-                config_file,
-                logger=logger,
+            listing = _list_s2_product_assets(
+                scene_name, s3_path, config_file, logger=logger
             )
+            images = _select_s2_assets(listing, resolved_bands, scene_name, logger)
+            return scene_name, listing, images
         elif mission.upper() == "S1":
             images = _find_s1_scene_images(
                 scene_name,
@@ -1493,7 +1555,7 @@ def prepare_cdse_download(
             )
         else:
             raise ValueError(f"Unsupported mission: {mission}")
-        return scene_name, images
+        return scene_name, images, images
 
     # 5. Resolve uncached scenes concurrently. The returned rows contain S3 paths and
     #    reported sizes only; the actual file-transfer functions are not called here.
@@ -1519,11 +1581,13 @@ def prepare_cdse_download(
                 futures = [pool.submit(_resolve, row) for row in rows_to_resolve]
                 try:
                     for future in as_completed(futures):
-                        scene_name, images = future.result()
+                        scene_name, listing, images = future.result()
                         selected_by_scene[scene_name] = images
-                        # One call per scene keeps a scene's rows in the same part.
-                        writer.add(images)
-                        resolved_rows += len(images)
+                        # Cache the whole product listing so any later band or
+                        # resolution request is served without S3. One call per
+                        # scene keeps a scene's rows in the same part.
+                        writer.add(listing)
+                        resolved_rows += len(listing)
                         progress.update(task_id, advance=1)
                 except BaseException:
                     # Do not wait for the remaining queued listings after an error
@@ -1642,7 +1706,10 @@ def resolve_and_download(
     update_cdse_scene_catalog(cache_root, scenes)
     asset_store = _cdse_asset_store(cache_root)
     images_file = asset_store.path
-    cached_images = asset_store.read()
+    # Only the queried scenes are needed; key filters avoid loading the whole cache.
+    cached_images = asset_store.read(
+        key_filters={"safedir": scenes["Name"].astype(str).tolist()}
+    )
     downloads_file = REGISTRY["cdse_downloads"].path(output_dir)
     logger.info(f"Looking for images cache at: {images_file}")
     if not cached_images.empty:
@@ -1754,7 +1821,7 @@ def resolve_and_download(
         with lock:
             if not pending_image_rows:
                 return
-            if not force and len(pending_image_rows) < 1000:
+            if not force and len(pending_image_rows) < 5000:
                 return
             rows_to_write = list(pending_image_rows)
             pending_image_rows.clear()
@@ -1800,9 +1867,10 @@ def resolve_and_download(
             if resolved_bands is None:
                 logger.error(f"resolved_bands is None for S2 scene: {name}")
                 return DownloadResult(scene_name=name)
-            images = _find_s2_scene_images(
-                name, raw_s3_path, resolved_bands, config_file, logger=logger
+            listing = _list_s2_product_assets(
+                name, raw_s3_path, config_file, logger=logger
             )
+            images = _select_s2_assets(listing, resolved_bands, name, logger)
             logger.info(
                 f"Scene {name}: resolved images: "
                 f"{', '.join(f'{t["band_name"]}@{t["resolution_m"]}m' for t in images)}"
@@ -1811,6 +1879,7 @@ def resolve_and_download(
             images = _find_s1_scene_images(
                 name, raw_s3_path, bands, config_file, logger=logger
             )
+            listing = images
             logger.info(
                 f"Scene {name}: resolved images: "
                 f"{', '.join(f'{t["band_name"]}' for t in images)}"
@@ -1853,7 +1922,7 @@ def resolve_and_download(
         # download step will produce updated rows with local_actual_size populated,
         # which will overwrite these seeds via the merge-by-key logic
         with lock:
-            pending_image_rows.extend(images)
+            pending_image_rows.extend(listing)
 
         logger.info(f"Scene {name}: downloading {len(images)} image(s)")
         result = _download_scene_from_images(
@@ -1946,15 +2015,17 @@ def resolve_and_download(
         cached_names = set(cached_df["Name"])
         if mission.upper() == "S2" and resolved_bands is not None:
             requested_keys = {(rb.band, rb.resolution) for rb in resolved_bands}
+            band_names = cached_images["band_name"].astype(str)
+            resolutions = (
+                pd.to_numeric(cached_images["resolution_m"], errors="coerce")
+                .fillna(0)
+                .astype(int)
+            )
+            requested_mask = pd.MultiIndex.from_arrays(
+                [band_names, resolutions]
+            ).isin(requested_keys)
             cached_assets_for_request = cached_images[
-                cached_images.apply(
-                    lambda row: (
-                        (str(row["band_name"]), int(row.get("resolution_m") or 0))
-                        in requested_keys
-                        or str(row["band_name"]) in S2_METADATA_ASSETS
-                    ),
-                    axis=1,
-                )
+                requested_mask | band_names.isin(S2_METADATA_ASSETS).to_numpy()
             ]
         else:
             requested_names = {band.upper() for band in bands}

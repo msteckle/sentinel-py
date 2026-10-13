@@ -1,36 +1,60 @@
 # Add processors
 
-Pipeline extensions use parallel contracts: readers acquire source data, processors apply semantic transformations, and writers materialize typed artifacts. A processor must inherit from ``BaseProcessor``, declare ``type_name`` and a frozen Pydantic ``config_model``, and implement both ``execute_raster()`` and ``execute_points()``. The base class dispatches from the validated AOI mode, so processors never need geometry-mode ``isinstance`` branches. Raster hooks exchange ``RasterArtifact`` objects containing lazy xarray datasets; point hooks exchange compact ``PointSampleArtifact`` tables.
+Pipeline extensions use parallel contracts: readers acquire source data, processors apply semantic transformations, and writers materialize typed artifacts. A processor inherits from ``BaseProcessor``, declares ``type_name`` and a frozen Pydantic ``config_model``, and implements both ``execute_raster()`` and ``execute_points()``. The base class dispatches from the validated AOI mode, so processors never need geometry-mode ``isinstance`` branches. Raster hooks exchange ``RasterArtifact`` objects containing lazy xarray datasets; point hooks exchange compact ``PointSampleArtifact`` tables.
 
-Below is an example of how to create a custom processor in ``sentinel-py``. This processor, named ``AdditionProcessor``, adds a specified value to each pixel of the input data. We will require the data source (defined in the ``YAML`` under ``sources``) and the integer we want to add to each pixel. Thus, we will start by creating our pydantic BaseModel to define and validate the configuration parameters for the processor.
+The best template is ``src/sentinel_py/pipeline/processors/s2_index.py``: a module docstring, a ``PROCESSOR_VERSION`` constant, banner-delimited sections (helpers, the node configuration, then the processor class), and NumPy-style docstrings on every function.
+
+## Checklist for a new processor
+
+1. Create ``src/sentinel_py/pipeline/processors/<name>.py`` with a module docstring, ``from __future__ import annotations``, and a ``PROCESSOR_VERSION`` integer. Bump the version whenever the produced values change, because it feeds the recipe ID and therefore output cache keys.
+2. Define a frozen, ``strict=True`` Pydantic node configuration. Because strict mode rejects plain YAML strings for enum fields, use ``Literal[...]`` for string choices on node configurations.
+3. Subclass ``BaseProcessor``; set ``type_name``, ``config_model``, and ``version = PROCESSOR_VERSION``. Set ``supported_output_formats`` only when the processor cannot write every format (the default is all of them).
+4. Implement ``validate``. Call ``super().validate(...)`` first, which checks output formats; do not re-check formats yourself.
+5. Use the shared helpers instead of re-implementing them: ``self.single_input(inputs)`` for exactly-one-upstream processors, ``make_recipe_id(type_name, version, **params)`` for the recipe ID (include ``source_recipe=`` when chained), ``mask_nodata`` for nodata masking, ``grid_for_unit`` for the per-unit grid, and ``RasterArtifact.map_datasets`` to apply a function to every AOI unit.
+6. Register the processor in ``register_builtin_processors`` in ``processors/__init__.py``.
+7. Add tests that cover the raster path, the point path, validation errors, and that the recipe ID changes with every result-affecting parameter. ``tests/test_repo_conventions.py`` fails if a processor is unregistered or has no ``PROCESSOR_VERSION``.
+
+Below is an example of a custom processor. This processor, named ``AdditionProcessor``, adds a specified value to each pixel of the input data. We will require the data source (defined in the ``YAML`` under ``sources``) and the integer we want to add to each pixel. Thus, we will start by creating our pydantic BaseModel to define and validate the configuration parameters for the processor.
 
 ```python
-from sentinel_py.pipeline.processors.base import BaseProcessor, ProcessorConfig, ProcessorContext
+from sentinel_py.pipeline.processors.base import (
+    BaseProcessor,
+    ProcessorConfig,
+    ProcessorContext,
+    make_recipe_id,
+)
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 from typing import Any, Mapping
 
+PROCESSOR_VERSION = 1
+
+
 class AdditionProcessorConfig(BaseModel):
+    """Validated parameters belonging specifically to the ``addition`` node."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    # Define your processor configuration parameters here
     source: str = Field(min_length=1)
     value: int = Field(..., description="The value to add per-pixel")
 
     @field_validator("value", mode="before")
     @classmethod
     def validate_value(cls, value: Any) -> int:
+        """Require an integer value."""
         if not isinstance(value, int):
             raise ValueError("The value must be an integer")
         return value
 ```
 
-Next, we can build the actual processor class. First, we will instantiate the ``validate`` function, which ensures that the parameters provided in the ``YAML`` configuration file meet the requirements we designed above in the ``AdditionProcessorConfig``.
+Next, we can build the actual processor class. The ``validate`` method ensures that the parameters provided in the ``YAML`` configuration file meet the requirements designed above in ``AdditionProcessorConfig``.
 
 ```python
 class AdditionProcessor(BaseProcessor):
+    """Add a constant to every pixel of one upstream cube."""
+
     type_name = "addition"
     config_model = AdditionProcessorConfig
+    version = PROCESSOR_VERSION
 
     def validate(
         self,
@@ -42,19 +66,38 @@ class AdditionProcessor(BaseProcessor):
         outputs: tuple[Any, ...],
         output_grid: Any,
     ) -> None:
-
-        # Ensure the configuration is of the correct type
+        """Validate the configuration type and the single upstream input."""
+        super().validate(
+            config,
+            node_id=node_id,
+            inputs=inputs,
+            sources=sources,
+            outputs=outputs,
+            output_grid=output_grid,
+        )
         if not isinstance(config, AdditionProcessorConfig):
             raise TypeError(f"{node_id} has an invalid addition configuration")
+        self.single_input(inputs)
 
     def execute_raster(self, config, inputs, context: ProcessorContext):
         """Return a RasterArtifact without materializing source chunks."""
+        source = self.single_input(inputs)
+        recipe_id = make_recipe_id(
+            self.type_name,
+            self.version,
+            value=config.value,
+            source_recipe=None,
+        )
         ...
 
     def execute_points(self, config, inputs, context: ProcessorContext):
         """Return a PointSampleArtifact with normalized wide value columns."""
         ...
 ```
+
+## Adding readers and writers
+
+A reader subclasses ``BaseReader`` in ``pipeline/readers/``, sets ``source_type`` from the ``SourceType`` enum, implements ``parse_config`` (using the public validators ``only_keys``, ``required``, and ``resolve_path`` from ``pipeline/config.py``), and is registered in ``get_default_reader_registry``. A writer subclasses ``BaseOutputWriter`` in ``pipeline/writers/``, sets ``format_name`` from the ``OutputFormat`` enum and ``accepted_artifact_kinds``, implements ``build`` and ``finalize``, and is registered in ``get_default_writer_registry``. Writers that can resume implement ``checkpoint`` so completed work survives an interrupt. All three registries share the generic ``Registry`` in ``pipeline/base.py``.
 
 ## Seasonal composites
 
@@ -115,4 +158,4 @@ nodes:
     hillshade_altitude: 45
 ```
 
-New DEM-derived bands can be added by defining and registering a ``DEMFeature`` subclass in ``sentinel_py.pipeline.processors.dem``. The processor validates feature names from the shared registry and assembles the selected bands without changing YAML dispatch.
+New DEM-derived bands can be added by defining and registering a ``DEMFeature`` subclass in ``sentinel_py.pipeline.processors.dem``. The processor validates feature names from the shared registry and assembles the selected bands without changing YAML dispatch. DEM raster reads run under the process-wide raster lock, like every other native GDAL call. Changing a feature's output requires bumping ``PROCESSOR_VERSION`` in ``dem.py``.

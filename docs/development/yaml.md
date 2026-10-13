@@ -1,8 +1,8 @@
 # Add YAML Configurations
 
-In the ``sentinel-py run`` command, users supply a YAML configuration file to initiate a processing pipeline. The YAML file is divided into sections, each corresponding to a specific aspect of the pipeline configuration. To change, add, or remove allowed sections of the YAML, users need to modify the ``pipeline/config.py`` file and the corresponding frozen dataclasses.
+In the ``sentinel-py run`` command, users supply a YAML configuration file to initiate a processing pipeline. The YAML file is divided into sections, each corresponding to a specific aspect of the pipeline configuration. To change, add, or remove allowed sections of the YAML, users need to modify the ``pipeline/config.py`` file and the corresponding frozen dataclasses. Fixed string choices such as execution methods, output formats, and source types are enums in ``src/sentinel_py/enums.py``; the shared validators ``only_keys``, ``required``, and ``resolve_path`` are public so readers can reuse them.
 
-There is one dataclass for each section of the YAML configuration file. For example, the ``SelectionConfig`` dataclass corresponds to the ``selection`` section of the YAML, and dictates what keys are allowed under that section, plus validation rules for each key's associated value(s). The dataclass should be frozen and is named after the section it represents, with the suffix ``Config``. The ``selection`` section is used to specify a user's study area of interest (AOI), the years of interest, and the start and end of season (or any set period) within each year. That information is used to subselect the relevant data to use for the processing pipeline. AOI files must include a stable, unique feature attribute named by ``selection.aoi_id_field``. Each feature is planned independently; disconnected multipart polygon components share their AOI ID but have separate aligned grids. Polygon AOIs use COG outputs and point AOIs use Parquet outputs. At the start of a new dataclass, developers should specify what keys are needed and their allowed data types:
+There is one dataclass for each section of the YAML configuration file. For example, the ``SelectionConfig`` dataclass corresponds to the ``selection`` section of the YAML, and dictates what keys are allowed under that section, plus validation rules for each key's associated value(s). The dataclass should be frozen and is named after the section it represents, with the suffix ``Config``. The ``selection`` section is used to specify a user's study area of interest (AOI), the years of interest, and the start and end of season (or any set period) within each year. That information is used to subselect the relevant data to use for the processing pipeline. AOI files must include a stable, unique feature attribute named by ``selection.aoi_id_field``. Each feature is planned independently; disconnected multipart polygon components share their AOI ID but have separate aligned grids. Polygon AOIs produce raster artifacts and point AOIs produce point-sample artifacts; each output format's writer declares which artifact kinds it accepts (``cog`` is raster-only, ``parquet`` is point-only, and ``xarray`` accepts both), and configuration validation rejects incompatible combinations. At the start of a new dataclass, developers should specify what keys are needed and their allowed data types:
 
 ```python
 @dataclass(frozen=True)
@@ -31,7 +31,7 @@ class SelectionConfig:
     end_period: tuple[int, int]
 ```
 
-Then, users should create a classmethod that, given a raw mapping (typically parsed from the YAML file), plus any other necessary information, will validate the contents of the mapping and return an instance of the dataclass. The ``SelectionConfig`` classmethod parses the raw mapping for the ``selection`` section, and validates its keys and values. In this case, we check that an expected set of keys are present using ``_only_keys``, we check that the AOI path exists and is a file, we validate the years selection, and we ensure the start and end periods are chronologically ordered. We raise helpful errors so that users can quickly identify and correct any issues in their YAML configuration.
+Then, users should create a classmethod that, given a raw mapping (typically parsed from the YAML file), plus any other necessary information, will validate the contents of the mapping and return an instance of the dataclass. The ``SelectionConfig`` classmethod parses the raw mapping for the ``selection`` section, and validates its keys and values. In this case, we check that an expected set of keys are present using ``only_keys``, we check that the AOI path exists and is a file, we validate the years selection, and we ensure the start and end periods are chronologically ordered. We raise helpful errors so that users can quickly identify and correct any issues in their YAML configuration.
 
 ```python
 
@@ -40,11 +40,11 @@ Then, users should create a classmethod that, given a raw mapping (typically par
 
         # Extract the "selection" section from the raw mapping and validate its keys
         value = _mapping(raw, "selection")
-        _only_keys(value, {"aoi", "aoi_id_field", "years", "speriod", "eperiod"}, "selection")
+        only_keys(value, {"aoi", "aoi_id_field", "years", "speriod", "eperiod"}, "selection")
 
         # Resolve the area of interest (AOI) file path and validate its existence
         aoi = (
-            _resolve_path(value["aoi"], base_dir, "selection.aoi")
+            resolve_path(value["aoi"], base_dir, "selection.aoi")
             if value.get("aoi") is not None
             else None
         )

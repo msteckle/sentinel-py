@@ -11,7 +11,8 @@ from typing import Any
 import pandas as pd
 
 from sentinel_py.pipeline.writers.base import OutputWritePlan
-from sentinel_py.pipeline.artifacts import ArtifactKind, PointSampleArtifact
+from sentinel_py.enums import ArtifactKind, OutputFormat
+from sentinel_py.pipeline.artifacts import PointSampleArtifact
 
 
 @dataclass(frozen=True)
@@ -39,8 +40,8 @@ def _write_rows(rows: pd.DataFrame, *, output_path: Path) -> ParquetWriteResult:
 class ParquetOutputWriter:
     """Materialize one normalized point artifact as an atomic Parquet table."""
 
-    format_name = "parquet"
-    accepted_artifact_kinds = frozenset({ArtifactKind.POINT})
+    format_name = OutputFormat.parquet
+    accepted_artifact_kinds = frozenset({ArtifactKind.point})
 
     def build(self, artifact: Any, output: Any, pipeline: Any) -> OutputWritePlan:
         from dask import delayed

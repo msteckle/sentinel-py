@@ -18,6 +18,7 @@ from sentinel_py.cache import (
     mark_cache_used,
     write_parquet_atomic,
 )
+from sentinel_py.enums import AOIKind
 from sentinel_py.pipeline.aoi import AOIUnit
 
 
@@ -46,7 +47,7 @@ def _mask_block(
 
 def apply_polygon_mask(dataset: Any, unit: AOIUnit) -> Any:
     """Lazily mask every spatial variable in a polygon AOI dataset."""
-    if unit.kind != "polygon":
+    if unit.kind != AOIKind.polygon:
         return dataset
     import dask.array as da
 
@@ -173,7 +174,7 @@ def point_sample_requests(
 
     requests = []
     for unit in units:
-        if unit.kind != "point":
+        if unit.kind != AOIKind.point:
             raise ValueError("Point sample requests require point AOI units")
         x, y = point_pixel(unit, crs=crs, resolution=resolution, anchor=anchor)
         point = unit.geometry_wgs84

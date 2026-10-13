@@ -11,6 +11,7 @@ import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from sentinel_py.cache import deterministic_cache_key
+from sentinel_py.enums import SourceType
 from sentinel_py.pipeline.lazy import warp_to_window
 from sentinel_py.pipeline.processors.base import (
     BaseProcessor,
@@ -311,8 +312,8 @@ class DEMProcessor(BaseProcessor):
         if inputs:
             raise ValueError("dem does not accept upstream inputs")
         source = sources.get(config.source)
-        if getattr(source, "source_type", None) != "dem.local":
-            raise ValueError("dem.source must reference a dem.local source")
+        if getattr(source, "source_type", None) != SourceType.dem_local:
+            raise ValueError(f"dem.source must reference a {SourceType.dem_local} source")
         if output_grid.chunks is None:
             raise ValueError("dem requires a canonical output grid")
         if any(output.format not in {"cog", "xarray", "parquet"} for output in outputs):

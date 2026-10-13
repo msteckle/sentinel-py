@@ -19,6 +19,7 @@ from typing import Any, Literal, cast
 import yaml
 from pydantic import BaseModel, ValidationError
 
+from sentinel_py.enums import AOIKind, ExecutionMethod, OutputFormat, SourceType
 from sentinel_py.pipeline.grid import ChunkShape, GridSpec
 from sentinel_py.pipeline.aoi import AOIPlan, load_aoi_plan
 from sentinel_py.pipeline.processors import ProcessorRegistry, get_default_registry
@@ -154,7 +155,7 @@ class ExecutionConfig:
 
     Arguments
     ---------
-    method : Literal["local", "dask", "slurm"]
+    method : ExecutionMethod
         Execution backend method.
     workers : int, optional
         Number of workers to use (default is 1).
@@ -186,7 +187,7 @@ class ExecutionConfig:
         Network interface to use (default is None).
     """
 
-    method: Literal["local", "dask", "slurm"]
+    method: ExecutionMethod
     workers: int = 1
     threads_per_worker: int = 1
     local_directory: Path | None = None
@@ -228,9 +229,12 @@ class ExecutionConfig:
 
         # Extract and validate the allowed values
         # Ensure the method is one of the allowed values
-        method = _required(value, "method", "execution")
-        if method not in {"local", "dask", "slurm"}:
-            raise PipelineConfigError("execution.method must be local, dask, or slurm")
+        try:
+            method = ExecutionMethod(_required(value, "method", "execution"))
+        except ValueError as error:
+            raise PipelineConfigError(
+                "execution.method must be local, dask, or slurm"
+            ) from error
 
         # Ensure the workers and threads per worker are positive integers
         workers = _positive_int(value.get("workers", 1), "execution.workers")
@@ -255,13 +259,13 @@ class ExecutionConfig:
             raise PipelineConfigError("execution.scheduler_address must be a string")
 
         # Raise an error if the scheduler address is required but not provided
-        if method == "dask" and scheduler_address is None:
+        if method == ExecutionMethod.dask and scheduler_address is None:
             raise PipelineConfigError(
                 "execution.scheduler_address is required when method is dask"
             )
 
         # Check for unsupported keys in local execution method
-        if method == "local":
+        if method == ExecutionMethod.local:
             unsupported = sorted(
                 key
                 for key in value
@@ -273,7 +277,7 @@ class ExecutionConfig:
                 )
 
         # Check for unsupported keys in Dask execution method
-        if method == "dask":
+        if method == ExecutionMethod.dask:
             unsupported = sorted(
                 key for key in value if key not in {"method", "scheduler_address"}
             )
@@ -299,7 +303,7 @@ class ExecutionConfig:
             if value.get("processes_per_job") is not None
             else None
         )
-        if method == "slurm":
+        if method == ExecutionMethod.slurm:
             slurm_keys = {
                 "method",
                 "local_directory",
@@ -591,12 +595,12 @@ class S2SourceConfig:
     data_dir : Path
         Directory containing the source data.
     source_type : str, optional
-        Type of the source (default is "s2.l2a.local").
+        Type of the source (default is ``SourceType.s2_l2a_local``).
     """
 
     source_id: str
     data_dir: Path
-    source_type: str = "s2.l2a.local"
+    source_type: str = SourceType.s2_l2a_local
 
 
 @dataclass(frozen=True)
@@ -606,7 +610,7 @@ class DEMSourceConfig:
     source_id: str
     data_dir: Path
     pattern: str = "*.tif"
-    source_type: str = "dem.local"
+    source_type: str = SourceType.dem_local
 
 
 @dataclass(frozen=True)
@@ -627,14 +631,14 @@ class S1SourceConfig:
         Acceptable orbit-file types: ``precise``, ``restituted`` or
         ``precise-or-restituted``.
     source_type : str, optional
-        Type of the source (default is "s1.grd.local").
+        Type of the source (default is ``SourceType.s1_grd_local``).
     """
 
     source_id: str
     data_dir: Path
     flight_direction: str = "BOTH"
     orbit: str = "precise-or-restituted"
-    source_type: str = "s1.grd.local"
+    source_type: str = SourceType.s1_grd_local
 
 
 SourceConfig = S2SourceConfig | DEMSourceConfig | S1SourceConfig
@@ -710,7 +714,7 @@ class OutputConfig:
                     f"{location}.from references missing node {node_id!r}"
                 )
             output_format = _identifier(
-                value.get("format", "cog"), f"{location}.format"
+                value.get("format", OutputFormat.cog), f"{location}.format"
             )
             path = _resolve_path(
                 _required(value, "path", location), base_dir, f"{location}.path"
@@ -936,8 +940,14 @@ class PipelineConfig:
         outputs = OutputConfig.parse_many(
             _required(root, "outputs", "pipeline"), nodes, base_dir
         )
-        invalid_format = "parquet" if aoi_plan is not None and aoi_plan.kind == "polygon" else "cog"
-        if aoi_plan is not None and any(output.format == invalid_format for output in outputs.values()):
+        invalid_format = (
+            OutputFormat.parquet
+            if aoi_plan is not None and aoi_plan.kind == AOIKind.polygon
+            else OutputFormat.cog
+        )
+        if aoi_plan is not None and any(
+            output.format == invalid_format for output in outputs.values()
+        ):
             raise PipelineConfigError(
                 f"{invalid_format} output is incompatible with {aoi_plan.kind} AOIs"
             )

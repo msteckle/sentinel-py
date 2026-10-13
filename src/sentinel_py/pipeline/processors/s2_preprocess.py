@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pyproj import CRS
 
 from sentinel_py.cache import REGISTRY, deterministic_cache_key
-from sentinel_py.enums import S2Bands
+from sentinel_py.enums import OutputFormat, S2Bands, SourceType
 from sentinel_py.pipeline.processors.base import (
     BaseProcessor,
     ProcessorConfig,
@@ -90,8 +90,10 @@ class S2PreprocessProcessor(BaseProcessor):
         if source is None:
             raise ValueError(f"{node_id}.source does not reference a configured source")
         # Ensure the source is of the correct type
-        if getattr(source, "source_type", None) != "s2.l2a.local":
-            raise ValueError(f"{node_id}.source must reference an s2.l2a.local source")
+        if getattr(source, "source_type", None) != SourceType.s2_l2a_local:
+            raise ValueError(
+                f"{node_id}.source must reference an {SourceType.s2_l2a_local} source"
+            )
         # Ensure the output grid is configured and of the correct type
         if output_grid.chunks is None:
             raise ValueError("s2.preprocess requires a canonical output grid")
@@ -203,7 +205,7 @@ class S2PreprocessProcessor(BaseProcessor):
         if fingerprint is None:
             fingerprint = (str(source.data_dir), source.data_dir.stat().st_mtime_ns)
         cache_key = point_sample_cache_key(
-            reader_name="s2.l2a.local",
+            reader_name=SourceType.s2_l2a_local,
             source_fingerprint=fingerprint,
             requests=requests,
             settings={
@@ -214,7 +216,7 @@ class S2PreprocessProcessor(BaseProcessor):
                 "anchor": pipeline.output_grid.anchor,
             },
         )
-        rows = load_point_sample_cache("s2.l2a.local", cache_key)
+        rows = load_point_sample_cache(SourceType.s2_l2a_local, cache_key)
         if rows is not None:
             context.logger.info("Using cached S2 point samples (%d rows)", len(rows))
             return PointSampleArtifact(rows, pipeline.aoi_plan)
@@ -246,5 +248,5 @@ class S2PreprocessProcessor(BaseProcessor):
             workers=pipeline.execution.workers,
             progress=report,
         )
-        save_point_sample_cache("s2.l2a.local", cache_key, rows)
+        save_point_sample_cache(SourceType.s2_l2a_local, cache_key, rows)
         return PointSampleArtifact(rows, pipeline.aoi_plan)

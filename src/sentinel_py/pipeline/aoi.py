@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import geopandas as gpd
 import numpy as np
@@ -13,6 +13,7 @@ from pyproj import Transformer
 from shapely.geometry.base import BaseGeometry
 
 from affine import Affine
+from sentinel_py.enums import AOIKind
 from sentinel_py.pipeline.grid import ChunkShape, GridSpec, plan_geometry_grid
 
 
@@ -22,7 +23,7 @@ class AOIUnit:
 
     aoi_id: str
     component_id: str
-    kind: Literal["polygon", "point"]
+    kind: AOIKind
     geometry: BaseGeometry
     geometry_wgs84: BaseGeometry
     grid: GridSpec | None
@@ -32,7 +33,7 @@ class AOIUnit:
 class AOIPlan:
     """Validated, homogeneous AOI units keyed by stable feature identity."""
 
-    kind: Literal["polygon", "point"]
+    kind: AOIKind
     units: tuple[AOIUnit, ...]
 
     @property
@@ -80,7 +81,14 @@ def load_aoi_plan(
         if geometry is None or geometry.is_empty:
             raise ValueError("selection.aoi cannot contain empty geometries")
         parts = _parts(geometry)
-        part_kinds = {"point" if part.geom_type == "Point" else "polygon" if part.geom_type == "Polygon" else "unsupported" for part in parts}
+        part_kinds = {
+            AOIKind.point
+            if part.geom_type == "Point"
+            else AOIKind.polygon
+            if part.geom_type == "Polygon"
+            else "unsupported"
+            for part in parts
+        }
         kinds.update(part_kinds)
     if "unsupported" in kinds or len(kinds) != 1:
         raise ValueError("selection.aoi must contain only points or only polygons")
@@ -98,7 +106,7 @@ def load_aoi_plan(
                     geometry, crs, crs=crs, resolution=resolution,
                     anchor=anchor, chunks=chunks,
                 )
-                if kind == "polygon"
+                if kind == AOIKind.polygon
                 else None
             )
             units.append(AOIUnit(aoi_id, component_id, kind, geometry, geometry_wgs84, grid))

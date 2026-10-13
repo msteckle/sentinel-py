@@ -10,7 +10,8 @@ from typing import Any, ClassVar, Protocol, cast, runtime_checkable
 
 from pydantic import BaseModel
 
-from sentinel_py.pipeline.artifacts import ArtifactKind, PointSampleArtifact, RasterArtifact
+from sentinel_py.enums import AOIKind, ArtifactKind, OutputFormat
+from sentinel_py.pipeline.artifacts import PointSampleArtifact, RasterArtifact
 
 
 @runtime_checkable
@@ -71,8 +72,10 @@ class BaseProcessor(ABC):
     type_name: ClassVar[str]
     config_model: ClassVar[type[BaseModel]]
     input_kind: ClassVar[ArtifactKind | None] = None
-    output_kind: ClassVar[ArtifactKind] = ArtifactKind.RASTER
-    supported_output_formats: ClassVar[frozenset[str]] = frozenset({"cog", "xarray"})
+    output_kind: ClassVar[ArtifactKind] = ArtifactKind.raster
+    supported_output_formats: ClassVar[frozenset[str]] = frozenset(
+        {OutputFormat.cog, OutputFormat.xarray}
+    )
 
     def validate(
         self,
@@ -109,7 +112,7 @@ class BaseProcessor(ABC):
                     f"invalid input(s): {', '.join(sorted(invalid))}"
                 )
         plan = getattr(context.pipeline, "aoi_plan", None)
-        point_mode = plan is not None and plan.kind == "point"
+        point_mode = plan is not None and plan.kind == AOIKind.point
         result = (
             self.execute_points(config, inputs, context)
             if point_mode else self.execute_raster(config, inputs, context)

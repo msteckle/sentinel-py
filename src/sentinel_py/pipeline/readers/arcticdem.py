@@ -7,6 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from sentinel_py.enums import SourceType
 from sentinel_py.pipeline.aoi import AOIUnit
 from sentinel_py.pipeline.readers.base import BaseReader
 
@@ -18,7 +19,7 @@ class _ArcticDEMReaderConfig(BaseModel):
 class ArcticDEMReader(BaseReader):
     """Reader adapter for a local ArcticDEM GeoTIFF collection."""
 
-    source_type = "dem.local"
+    source_type = SourceType.dem_local
     config_model = _ArcticDEMReaderConfig
 
     def parse_config(self, source_id: str, raw: dict[str, Any], base_dir: Any) -> Any:

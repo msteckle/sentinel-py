@@ -15,7 +15,7 @@ import numpy as np
 from sentinel_py import raster_io
 from sentinel_py.cache import REGISTRY, RowStore, deterministic_cache_key
 from sentinel_py.pipeline.writers import OutputWritePlan
-from sentinel_py.pipeline.artifacts import ArtifactKind
+from sentinel_py.enums import AOIKind, ArtifactKind, OutputFormat
 
 COG_WRITER_VERSION = 1
 
@@ -139,8 +139,8 @@ def _write_cog_tile(
 class COGOutputWriter:
     """Build chunk-level COG tasks and maintain output-scoped resume state."""
 
-    format_name = "cog"
-    accepted_artifact_kinds = frozenset({ArtifactKind.RASTER})
+    format_name = OutputFormat.cog
+    accepted_artifact_kinds = frozenset({ArtifactKind.raster})
 
     def build(self, artifact: Any, output: Any, pipeline: Any) -> OutputWritePlan:
         try:
@@ -150,7 +150,7 @@ class COGOutputWriter:
             raise RuntimeError("COG output requires xarray and Dask") from error
         from sentinel_py.pipeline.artifacts import RasterArtifact
         if isinstance(artifact, RasterArtifact):
-            if artifact.plan.kind != "polygon":
+            if artifact.plan.kind != AOIKind.polygon:
                 raise ValueError("COG output requires polygon AOIs")
             subplans = []
             for key, dataset in artifact.datasets.items():

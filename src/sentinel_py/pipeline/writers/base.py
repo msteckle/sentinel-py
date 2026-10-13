@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
-from sentinel_py.pipeline.artifacts import ArtifactKind
+from sentinel_py.enums import ArtifactKind, OutputFormat
 
 
 @dataclass(frozen=True)
@@ -58,7 +58,7 @@ class ArtifactOutputWriter:
 
     def __init__(self, format_name: str):
         self.format_name = format_name
-        self.accepted_artifact_kinds = frozenset({ArtifactKind.RASTER, ArtifactKind.POINT})
+        self.accepted_artifact_kinds = frozenset({ArtifactKind.raster, ArtifactKind.point})
 
     def build(self, artifact: Any, output: Any, pipeline: Any) -> OutputWritePlan:
         del artifact, pipeline
@@ -107,6 +107,6 @@ def get_default_writer_registry() -> OutputWriterRegistry:
         registry = OutputWriterRegistry()
         registry.register(COGOutputWriter())
         registry.register(ParquetOutputWriter())
-        registry.register(ArtifactOutputWriter("xarray"))
+        registry.register(ArtifactOutputWriter(OutputFormat.xarray))
         _DEFAULT_WRITERS = registry
     return _DEFAULT_WRITERS

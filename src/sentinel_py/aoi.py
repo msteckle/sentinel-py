@@ -3,7 +3,7 @@ from __future__ import annotations
 import itertools
 import logging
 from pathlib import Path
-from typing import Literal, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import geopandas as gpd
 import numpy as np
@@ -11,6 +11,8 @@ import pandas as pd
 import shapely
 from shapely.geometry import GeometryCollection, MultiPolygon, Polygon, box
 from shapely.geometry.base import BaseGeometry
+
+from sentinel_py.enums import GridClipOpts
 
 GeometryLike = Union[BaseGeometry, gpd.GeoSeries, gpd.GeoDataFrame, str, Path]
 
@@ -353,7 +355,7 @@ def overlay_latlon_grid(
     *,
     crs: str = "EPSG:4326",
     fill_holes: bool = True,
-    clip: Optional[Literal["intersect", "within", "all"]] = "all",
+    clip: Optional[GridClipOpts | str] = GridClipOpts.all,
     output: Union[str, Path, None] = None,
 ) -> gpd.GeoDataFrame:
     """
@@ -428,14 +430,15 @@ def overlay_latlon_grid(
 
     # handle clip mode: intersect, within, or all
     if clip:
-        if clip == "intersect":
+        try:
+            clip = GridClipOpts(clip)
+        except ValueError:
+            raise ValueError(f"Invalid clip mode: {clip=}") from None
+        if clip == GridClipOpts.intersect:
             grid = grid[grid.intersects(aoi_union)].copy()
-        elif clip == "within":
+        elif clip == GridClipOpts.within:
             grid = grid[grid.within(aoi_union)].copy()
-        elif clip == "all":
-            pass  # keep all cells in bounding box
-        else:
-            raise ValueError(f"Invalid clip mode: {clip=}")
+        # GridClipOpts.all keeps every cell in the bounding box
 
     # optionally, make sure output directory exists and write to GeoJSON
     if output is not None:

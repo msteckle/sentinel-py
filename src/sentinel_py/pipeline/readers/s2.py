@@ -29,7 +29,7 @@ from shapely.geometry.base import BaseGeometry
 from sentinel_py import raster_io
 from sentinel_py.cache import REGISTRY
 from sentinel_py.aoi import GeometryLike, aoi_as_geom
-from sentinel_py.enums import S2_BAND_IDS
+from sentinel_py.enums import S2_BAND_IDS, SourceType
 from sentinel_py.pipeline.aoi import AOIUnit, point_grid
 from sentinel_py.pipeline.grid import ChunkShape, GridSpec, GridWindow
 from sentinel_py.pipeline.lazy import (
@@ -823,7 +823,7 @@ class _S2ReaderConfig(BaseModel):
 class S2Reader(BaseReader):
     """Reader adapter for downloaded Sentinel-2 L2A SAFE products."""
 
-    source_type = "s2.l2a.local"
+    source_type = SourceType.s2_l2a_local
     config_model = _S2ReaderConfig
 
     def parse_config(self, source_id: str, raw: dict[str, Any], base_dir: Any) -> Any:

@@ -21,7 +21,7 @@ from shapely.geometry import Polygon
 
 from sentinel_py.cache import REGISTRY, write_parquet_atomic
 from sentinel_py.download.s1_orbits import parse_scene_name
-from sentinel_py.enums import ASFOrbitDirection, S1OrbitPolicy
+from sentinel_py.enums import ASFOrbitDirection, S1OrbitPolicy, SourceType
 from sentinel_py.pipeline.readers.base import BaseReader
 
 
@@ -306,7 +306,7 @@ class S1Reader(BaseReader):
     source configuration and provides the scene catalog.
     """
 
-    source_type = "s1.grd.local"
+    source_type = SourceType.s1_grd_local
     config_model = _S1ReaderConfig
 
     def parse_config(self, source_id: str, raw: dict[str, Any], base_dir: Any) -> Any:

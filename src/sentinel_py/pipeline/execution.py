@@ -6,6 +6,7 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
+from sentinel_py.enums import ExecutionMethod
 from sentinel_py.pipeline.config import ExecutionConfig
 
 
@@ -80,7 +81,7 @@ def _dask_client(execution: ExecutionConfig):
             "Dask execution is not installed. Install the processing dependencies."
         ) from error
 
-    if execution.method == "local":
+    if execution.method == ExecutionMethod.local:
         cluster = LocalCluster(
             n_workers=execution.workers,
             threads_per_worker=execution.threads_per_worker,
@@ -88,7 +89,7 @@ def _dask_client(execution: ExecutionConfig):
             dashboard_address=None,
         )
         return Client(cluster), cluster
-    if execution.method == "dask":
+    if execution.method == ExecutionMethod.dask:
         return Client(execution.scheduler_address), None
 
     try:

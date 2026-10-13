@@ -1,4 +1,4 @@
-from enum import Enum
+from enum import Enum, StrEnum
 
 
 # General CVs --------------------------------------------------------------------------
@@ -23,6 +23,46 @@ class GridClipOpts(str, Enum):
     intersect = "intersect"
     within = "within"
     all = "all"
+
+
+# Pipeline CVs -------------------------------------------------------------------------
+# These are StrEnum so members format as their value in f-strings, logs, and cache keys.
+class ArtifactKind(StrEnum):
+    """Materialization shape exposed by a pipeline node."""
+
+    raster = "raster"
+    point = "point"
+
+
+class AOIKind(StrEnum):
+    """Planning geometry kind of an AOI feature in a pipeline run."""
+
+    polygon = "polygon"
+    point = "point"
+
+
+class ExecutionMethod(StrEnum):
+    """Execution backends supported by the pipeline ``execution`` section."""
+
+    local = "local"
+    dask = "dask"
+    slurm = "slurm"
+
+
+class OutputFormat(StrEnum):
+    """Output writer formats supported by the pipeline ``outputs`` section."""
+
+    cog = "cog"
+    xarray = "xarray"
+    parquet = "parquet"
+
+
+class SourceType(StrEnum):
+    """Reader source types accepted by the pipeline ``sources`` section."""
+
+    s2_l2a_local = "s2.l2a.local"
+    s1_grd_local = "s1.grd.local"
+    dem_local = "dem.local"
 
 
 # Sentinel-1 CVs -----------------------------------------------------------------------

@@ -10,6 +10,7 @@ from typing import Any, ClassVar, Protocol, runtime_checkable
 
 from pydantic import BaseModel
 
+from sentinel_py.cache import deterministic_cache_key
 from sentinel_py.enums import AOIKind, ArtifactKind, OutputFormat
 from sentinel_py.pipeline.artifacts import PointSampleArtifact, RasterArtifact
 from sentinel_py.pipeline.base import Registry
@@ -60,6 +61,32 @@ class Processor(Protocol):
         context: ProcessorContext,
     ) -> Any:
         """Execute the node and return its artifact for downstream nodes."""
+
+
+def make_recipe_id(type_name: str, version: int, **params: Any) -> str:
+    """Return the short recipe identifier of one processor's output.
+
+    The identifier names the processing recipe (processor, its output version, and
+    every result-affecting parameter) and feeds output cache keys, so anything that
+    changes the produced values must be passed in ``params``. Chained processors
+    include the upstream recipe as ``source_recipe``.
+
+    Parameters
+    ----------
+    type_name : str
+        Processor ``type_name``.
+    version : int
+        Processor output version; bump it when results change.
+    **params
+        Result-affecting parameters (JSON-serializable).
+
+    Returns
+    -------
+    str
+        First 12 hex characters of the deterministic key of the full recipe.
+    """
+    payload = {"processor": type_name, "version": version, **params}
+    return deterministic_cache_key(payload)[:12]
 
 
 def mask_nodata(values: Any, nodata: Any) -> Any:

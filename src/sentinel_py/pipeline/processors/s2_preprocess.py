@@ -8,13 +8,14 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pyproj import CRS
 
-from sentinel_py.cache import REGISTRY, deterministic_cache_key
+from sentinel_py.cache import REGISTRY
 from sentinel_py.enums import S2_NODATA, S2Bands, SourceType
 from sentinel_py.pipeline.grid import grid_for_unit
 from sentinel_py.pipeline.processors.base import (
     BaseProcessor,
     ProcessorConfig,
     ProcessorContext,
+    make_recipe_id,
 )
 
 DEFAULT_BANDS = ("B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12")
@@ -163,12 +164,15 @@ class S2PreprocessProcessor(BaseProcessor):
             dataset.attrs.update(
                 pipeline=str(pipeline.path), processor=self.type_name,
                 node=context.node.node_id, time_representation="acquisition",
-                recipe_id=deterministic_cache_key({
-                    "processor": self.type_name, "version": self.version,
-                    "bands": config.bands,
-                    "mask_classes": config.mask_classes, "nodata": config.nodata,
-                    "crs": grid.crs, "transform": tuple(grid.affine[:6]),
-                })[:12],
+                recipe_id=make_recipe_id(
+                    self.type_name,
+                    self.version,
+                    bands=config.bands,
+                    mask_classes=config.mask_classes,
+                    nodata=config.nodata,
+                    crs=grid.crs,
+                    transform=tuple(grid.affine[:6]),
+                ),
             )
             datasets[(unit.aoi_id, unit.component_id)] = dataset
         context.logger.info("Building lazy node=%s AOI units=%d", context.node.node_id, len(datasets))

@@ -18,12 +18,14 @@ from sentinel_py.pipeline.processors.base import (
     BaseProcessor,
     ProcessorConfig,
     ProcessorContext,
+    make_recipe_id,
 )
 
-# Version 3 aligns native source windows to a stable halo/chunk lattice. It
-# intentionally invalidates COG resume keys from extent-dependent terrain derivatives
-# produced by earlier versions.
-PROCESSOR_VERSION = 3
+# Version 3 aligned native source windows to a stable halo/chunk lattice, which
+# invalidated COG resume keys from extent-dependent terrain derivatives. Version 4
+# moves ``recipe_id`` onto ``make_recipe_id`` (processor name now hashed), so
+# existing DEM COG tiles are regenerated once.
+PROCESSOR_VERSION = 4
 
 
 ########################################################################################
@@ -439,9 +441,9 @@ class DEMProcessor(BaseProcessor):
                     "nodata": -9999.0,
                     "processor": self.type_name,
                     "time_representation": "static",
-                    "recipe_id": deterministic_cache_key(
-                        {"version": self.version, **config.model_dump()}
-                    )[:12],
+                    "recipe_id": make_recipe_id(
+                        self.type_name, self.version, **config.model_dump()
+                    ),
                 },
             )
             dataset["reflectance"].attrs["nodata"] = -9999.0

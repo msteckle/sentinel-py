@@ -14,6 +14,7 @@ from sentinel_py.cache import deterministic_cache_key
 from sentinel_py.enums import S2_NODATA
 from sentinel_py.pipeline.processors.base import (
     BaseProcessor,
+    make_recipe_id,
     mask_nodata,
     ProcessorConfig,
     ProcessorContext,
@@ -268,15 +269,13 @@ class S2CompositeProcessor(BaseProcessor):
             aggregation=config.aggregation,
             period=config.period,
             time_representation="composite",
-            recipe_id=deterministic_cache_key(
-                {
-                    "processor": self.type_name,
-                    "version": self.version,
-                    "period": config.period,
-                    "aggregation": config.aggregation,
-                    "source_recipe": source.attrs.get("recipe_id"),
-                }
-            )[:12],
+            recipe_id=make_recipe_id(
+                self.type_name,
+                self.version,
+                period=config.period,
+                aggregation=config.aggregation,
+                source_recipe=source.attrs.get("recipe_id"),
+            ),
         )
         context.logger.info(
             "Built composite node=%s bins=%d aggregation=%s period=%s",

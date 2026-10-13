@@ -12,6 +12,7 @@ from sentinel_py.cache import deterministic_cache_key
 from sentinel_py.enums import S2_NODATA
 from sentinel_py.pipeline.processors.base import (
     BaseProcessor,
+    make_recipe_id,
     mask_nodata,
     ProcessorConfig,
     ProcessorContext,
@@ -578,14 +579,12 @@ def _append_indices(source: Any, config: S2IndexNodeConfig) -> Any:
     result["reflectance"] = combined
 
     # Generate ID for the processed dataset based on the input and configuration
-    recipe_id = deterministic_cache_key(
-        {
-            "processor": "s2.index",
-            "version": PROCESSOR_VERSION,
-            "indices": config.indices,
-            "source_recipe": source.attrs.get("recipe_id"),
-        }
-    )[:12]
+    recipe_id = make_recipe_id(
+        "s2.index",
+        PROCESSOR_VERSION,
+        indices=config.indices,
+        source_recipe=source.attrs.get("recipe_id"),
+    )
 
     # Assign the generated recipe ID to the result dataset
     if "source_fingerprint" in source.coords:

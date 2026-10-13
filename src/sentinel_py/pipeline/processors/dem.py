@@ -19,6 +19,16 @@ from sentinel_py.pipeline.processors.base import (
     ProcessorContext,
 )
 
+# Version 3 aligns native source windows to a stable halo/chunk lattice. It
+# intentionally invalidates COG resume keys from extent-dependent terrain derivatives
+# produced by earlier versions.
+PROCESSOR_VERSION = 3
+
+
+########################################################################################
+# DEM terrain feature calculations
+########################################################################################
+
 
 class DEMFeature:
     """Base class and registry for extensible DEM-derived bands."""
@@ -27,6 +37,7 @@ class DEMFeature:
     name: ClassVar[str]
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Validate and register every concrete DEM feature subclass."""
         super().__init_subclass__(**kwargs)
         name = cls.__dict__.get("name")
         if not isinstance(name, str) or not name.strip():
@@ -90,6 +101,7 @@ class ElevationFeature(DEMFeature):
 
     @classmethod
     def calculate(cls, elevation: np.ndarray, **kwargs: Any) -> np.ndarray:
+        """Return the unpadded elevation window as float32."""
         del kwargs
         return elevation[1:-1, 1:-1].astype(np.float32, copy=False)
 
@@ -101,6 +113,7 @@ class SlopeFeature(DEMFeature):
 
     @classmethod
     def calculate(cls, elevation: np.ndarray, **kwargs: Any) -> np.ndarray:
+        """Return slope in degrees for the unpadded window (NaN where invalid)."""
         dx, dy = _gradients(
             elevation,
             kwargs["x_resolution"],
@@ -118,6 +131,7 @@ class AspectFeature(DEMFeature):
 
     @classmethod
     def calculate(cls, elevation: np.ndarray, **kwargs: Any) -> np.ndarray:
+        """Return aspect in degrees (NaN where flat or invalid)."""
         dx, dy = _gradients(
             elevation,
             kwargs["x_resolution"],
@@ -138,6 +152,7 @@ class HillshadeFeature(DEMFeature):
 
     @classmethod
     def calculate(cls, elevation: np.ndarray, **kwargs: Any) -> np.ndarray:
+        """Return 0-255 hillshade from the configured sun azimuth and altitude."""
         dx, dy = _gradients(
             elevation,
             kwargs["x_resolution"],
@@ -156,6 +171,11 @@ class HillshadeFeature(DEMFeature):
         return np.where(_valid_derivative_inputs(elevation), result, np.nan)
 
 
+########################################################################################
+# Node configuration
+########################################################################################
+
+
 class DEMNodeConfig(BaseModel):
     """Validated parameters for a ``dem`` node."""
 
@@ -170,6 +190,7 @@ class DEMNodeConfig(BaseModel):
     @field_validator("features", mode="before")
     @classmethod
     def validate_features(cls, value: Any) -> tuple[str, ...]:
+        """Normalize feature names and reject unknown or duplicate features."""
         if not isinstance(value, (list, tuple)):
             raise TypeError("features must be a list")
         names = tuple(str(item).strip().lower() for item in value)
@@ -185,9 +206,15 @@ class DEMNodeConfig(BaseModel):
     @field_validator("algorithm", mode="before")
     @classmethod
     def validate_algorithm(cls, value: Any) -> str:
+        """Restrict the gradient algorithm to Horn or ZevenbergenThorne."""
         if not isinstance(value, str) or value not in {"Horn", "ZevenbergenThorne"}:
             raise ValueError("algorithm must be Horn or ZevenbergenThorne")
         return value
+
+
+########################################################################################
+# Native-grid chunk calculation
+########################################################################################
 
 
 def _native_feature_chunk(
@@ -287,15 +314,17 @@ def _native_feature_chunk(
     return np.stack(bands)
 
 
+########################################################################################
+# Processor class for DEM terrain features
+########################################################################################
+
+
 class DEMProcessor(BaseProcessor):
     """Build a lazy, canonical-grid DEM terrain feature cube."""
 
     type_name = "dem"
     config_model = DEMNodeConfig
-    # Version 3 aligns native source windows to a stable halo/chunk lattice.
-    # It intentionally invalidates COG resume keys from extent-dependent terrain
-    # derivatives produced by earlier versions.
-    version = 3
+    version = PROCESSOR_VERSION
 
     def validate(
         self,
@@ -307,6 +336,11 @@ class DEMProcessor(BaseProcessor):
         outputs: tuple[Any, ...],
         output_grid: Any,
     ) -> None:
+        """Validate the DEM source reference, canonical grid, and output formats."""
+        super().validate(
+            config, node_id=node_id, inputs=inputs, sources=sources,
+            outputs=outputs, output_grid=output_grid,
+        )
         if not isinstance(config, DEMNodeConfig):
             raise TypeError(f"{node_id} has an invalid dem configuration")
         if inputs:
@@ -316,8 +350,6 @@ class DEMProcessor(BaseProcessor):
             raise ValueError(f"dem.source must reference a {SourceType.dem_local} source")
         if output_grid.chunks is None:
             raise ValueError("dem requires a canonical output grid")
-        if any(output.format not in {"cog", "xarray", "parquet"} for output in outputs):
-            raise ValueError("dem requires named COG or xarray outputs")
 
     def execute_raster(
         self,
@@ -325,6 +357,7 @@ class DEMProcessor(BaseProcessor):
         inputs: Mapping[str, Any],
         context: ProcessorContext,
     ) -> Any:
+        """Build a lazy canonical-grid terrain-feature cube for every AOI unit."""
         if not isinstance(config, DEMNodeConfig) or inputs:
             raise TypeError("Invalid dem configuration or inputs")
         try:
@@ -422,24 +455,21 @@ class DEMProcessor(BaseProcessor):
         import pandas as pd
 
         from sentinel_py.pipeline.artifacts import PointSampleArtifact
+        from sentinel_py.pipeline.readers.base import point_row
 
         raster = self.execute_raster(config, inputs, context)
         records: list[dict[str, Any]] = []
         for key, dataset in raster.datasets.items():
             unit = raster.plan.by_key[key]
             values = dataset.reflectance.compute().values[0, :, 0, 0]
-            record = {
-                "aoi_id": unit.aoi_id,
-                "component_id": unit.component_id,
-                "point_index": int(unit.component_id.rsplit("-", 1)[-1]),
-                "longitude": float(unit.geometry_wgs84.x),
-                "latitude": float(unit.geometry_wgs84.y),
-                "time": "1970-01-01",
-                "product_id": "dem",
-                "granule_id": "dem",
-                "time_representation": "static",
-                "source_fingerprint": str(dataset.source_fingerprint.values[0]),
-            }
+            record = point_row(
+                unit,
+                time="1970-01-01",
+                product_id="dem",
+                granule_id="dem",
+                time_representation="static",
+                source_fingerprint=str(dataset.source_fingerprint.values[0]),
+            )
             record.update(
                 {
                     feature: value.item()

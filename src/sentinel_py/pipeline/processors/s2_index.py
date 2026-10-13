@@ -9,6 +9,7 @@ import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from sentinel_py.cache import deterministic_cache_key
+from sentinel_py.enums import S2_NODATA
 from sentinel_py.pipeline.processors.base import (
     BaseProcessor,
     ProcessorConfig,
@@ -127,6 +128,7 @@ class NDGI(SpectralIndex):
 
     @classmethod
     def formula(cls, values: Any) -> Any:
+        """Calculate NDGI from reflectance with a ``band`` dimension."""
         red = values.sel(band="B04")
         green = values.sel(band="B03")
         nir = values.sel(band="B08")
@@ -146,6 +148,7 @@ class NDWI1(SpectralIndex):
 
     @classmethod
     def formula(cls, values: Any) -> Any:
+        """Calculate NDWI1 from reflectance with a ``band`` dimension."""
         nir = values.sel(band="B08")
         swir1 = values.sel(band="B11")
         return _safe_divide(nir - swir1, nir + swir1)
@@ -162,6 +165,7 @@ class NDWI2(SpectralIndex):
 
     @classmethod
     def formula(cls, values: Any) -> Any:
+        """Calculate NDWI2 from reflectance with a ``band`` dimension."""
         nir = values.sel(band="B08")
         swir2 = values.sel(band="B12")
         return _safe_divide(nir - swir2, nir + swir2)
@@ -178,6 +182,7 @@ class MSAVI(SpectralIndex):
 
     @classmethod
     def formula(cls, values: Any) -> Any:
+        """Calculate MSAVI from reflectance with a ``band`` dimension."""
         nir = values.sel(band="B08")
         red = values.sel(band="B04")
         discriminant = (2 * nir + 1) ** 2 - 8 * (nir - red)
@@ -196,6 +201,7 @@ class VARI(SpectralIndex):
 
     @classmethod
     def formula(cls, values: Any) -> Any:
+        """Calculate VARI from reflectance with a ``band`` dimension."""
         red = values.sel(band="B04")
         green = values.sel(band="B03")
         blue = values.sel(band="B02")
@@ -213,6 +219,7 @@ class RVI(SpectralIndex):
 
     @classmethod
     def formula(cls, values: Any) -> Any:
+        """Calculate RVI from reflectance with a ``band`` dimension."""
         nir = values.sel(band="B08")
         red = values.sel(band="B04")
         return _safe_divide(nir, red)
@@ -228,6 +235,7 @@ class OSAVI(SpectralIndex):
 
     @classmethod
     def formula(cls, values: Any) -> Any:
+        """Calculate OSAVI from reflectance with a ``band`` dimension."""
         nir = values.sel(band="B08")
         red = values.sel(band="B04")
         return _safe_divide(1.16 * (nir - red), nir + red + 0.16)
@@ -244,6 +252,7 @@ class TGI(SpectralIndex):
 
     @classmethod
     def formula(cls, values: Any) -> Any:
+        """Calculate TGI from reflectance with a ``band`` dimension."""
         red = values.sel(band="B04")
         green = values.sel(band="B03")
         blue = values.sel(band="B02")
@@ -260,6 +269,7 @@ class GLI(SpectralIndex):
 
     @classmethod
     def formula(cls, values: Any) -> Any:
+        """Calculate GLI from reflectance with a ``band`` dimension."""
         red = values.sel(band="B04")
         green = values.sel(band="B03")
         blue = values.sel(band="B02")
@@ -276,6 +286,7 @@ class NGRDI(SpectralIndex):
 
     @classmethod
     def formula(cls, values: Any) -> Any:
+        """Calculate NGRDI from reflectance with a ``band`` dimension."""
         red = values.sel(band="B04")
         green = values.sel(band="B03")
         return _safe_divide(green - red, green + red)
@@ -291,6 +302,7 @@ class CIG(SpectralIndex):
 
     @classmethod
     def formula(cls, values: Any) -> Any:
+        """Calculate CIG from reflectance with a ``band`` dimension."""
         nir = values.sel(band="B08")
         green = values.sel(band="B03")
         return _safe_divide(nir, green) - 1
@@ -306,6 +318,7 @@ class GNDVI(SpectralIndex):
 
     @classmethod
     def formula(cls, values: Any) -> Any:
+        """Calculate GNDVI from reflectance with a ``band`` dimension."""
         nir = values.sel(band="B08")
         green = values.sel(band="B03")
         return _safe_divide(nir - green, nir + green)
@@ -321,6 +334,7 @@ class CVI(SpectralIndex):
 
     @classmethod
     def formula(cls, values: Any) -> Any:
+        """Calculate CVI from reflectance with a ``band`` dimension."""
         nir = values.sel(band="B08")
         red = values.sel(band="B04")
         green = values.sel(band="B03")
@@ -337,6 +351,7 @@ class MTVI2(SpectralIndex):
 
     @classmethod
     def formula(cls, values: Any) -> Any:
+        """Calculate MTVI2 from reflectance with a ``band`` dimension."""
         nir = values.sel(band="B08")
         red = values.sel(band="B04")
         green = values.sel(band="B03")
@@ -359,6 +374,7 @@ class TCARI(SpectralIndex):
 
     @classmethod
     def formula(cls, values: Any) -> Any:
+        """Calculate TCARI from reflectance with a ``band`` dimension."""
         re1 = values.sel(band="B05")
         red = values.sel(band="B04")
         green = values.sel(band="B03")
@@ -376,6 +392,7 @@ class TCI(SpectralIndex):
 
     @classmethod
     def formula(cls, values: Any) -> Any:
+        """Calculate TCI from reflectance with a ``band`` dimension."""
         re1 = values.sel(band="B05")
         red = values.sel(band="B04")
         green = values.sel(band="B03")
@@ -394,6 +411,7 @@ class NARI(SpectralIndex):
 
     @classmethod
     def formula(cls, values: Any) -> Any:
+        """Calculate NARI from reflectance with a ``band`` dimension."""
         re1 = values.sel(band="B05")
         green = values.sel(band="B03")
         return _safe_divide(re1 - green, re1 + green)
@@ -409,6 +427,7 @@ class TCAPB(SpectralIndex):
 
     @classmethod
     def formula(cls, values: Any) -> Any:
+        """Calculate TCAPB from reflectance with a ``band`` dimension."""
         blue = values.sel(band="B02")
         green = values.sel(band="B03")
         red = values.sel(band="B04")
@@ -435,6 +454,7 @@ class TCAPG(SpectralIndex):
 
     @classmethod
     def formula(cls, values: Any) -> Any:
+        """Calculate TCAPG from reflectance with a ``band`` dimension."""
         blue = values.sel(band="B02")
         green = values.sel(band="B03")
         red = values.sel(band="B04")
@@ -461,6 +481,7 @@ class TCAPW(SpectralIndex):
 
     @classmethod
     def formula(cls, values: Any) -> Any:
+        """Calculate TCAPW from reflectance with a ``band`` dimension."""
         blue = values.sel(band="B02")
         green = values.sel(band="B03")
         red = values.sel(band="B04")
@@ -609,13 +630,13 @@ class S2IndexProcessor(BaseProcessor):
         output_grid: Any,
     ) -> None:
         """Validate the graph edge and supported output formats."""
-        del sources, output_grid
+        super().validate(
+            config, node_id=node_id, inputs=inputs, sources=sources,
+            outputs=outputs, output_grid=output_grid,
+        )
         if not isinstance(config, S2IndexNodeConfig):
             raise TypeError(f"{node_id} has an invalid s2.index configuration")
-        if len(inputs) != 1:
-            raise ValueError("s2.index requires exactly one upstream input")
-        if any(output.format not in {"cog", "xarray", "parquet"} for output in outputs):
-            raise ValueError("s2.index requires COG, xarray, or Parquet outputs")
+        self.single_input(inputs)
 
     def execute_raster(
         self,
@@ -626,15 +647,13 @@ class S2IndexProcessor(BaseProcessor):
         """Build lazy, per-timestep index calculations without reading pixels."""
         if not isinstance(config, S2IndexNodeConfig):
             raise TypeError("Invalid s2.index configuration")
-        if len(inputs) != 1:
-            raise ValueError("s2.index requires exactly one upstream input")
 
         try:
             import xarray as xr
         except ImportError as error:
             raise RuntimeError("Index processing requires xarray") from error
 
-        source = next(iter(inputs.values()))
+        source = self.single_input(inputs)
         from sentinel_py.pipeline.artifacts import RasterArtifact
 
         if isinstance(source, RasterArtifact):
@@ -680,7 +699,7 @@ class S2IndexProcessor(BaseProcessor):
                     "s2.index input is missing bands: " + ", ".join(missing)
                 )
             values = {
-                band: rows[band].astype(np.float32).where(rows[band] != 65535)
+                band: rows[band].astype(np.float32).where(rows[band] != S2_NODATA)
                 for band in index.bands
             }
             if "quantification_value" in rows:

@@ -203,7 +203,26 @@ class ExecutionConfig:
     interface: str | None = None
 
     @classmethod
-    def from_mapping(cls, raw: Any, base_dir: Path):
+    def from_mapping(cls, raw: Any, base_dir: Path) -> ExecutionConfig:
+        """Parse and validate the ``execution`` section of a pipeline YAML.
+
+        Parameters
+        ----------
+        raw : Any
+            Raw ``execution`` mapping from the YAML document.
+        base_dir : pathlib.Path
+            Directory used to resolve a relative ``local_directory``.
+
+        Returns
+        -------
+        ExecutionConfig
+            Validated execution settings for the selected method.
+
+        Raises
+        ------
+        PipelineConfigError
+            If a value is missing, unknown, or not valid for the chosen method.
+        """
 
         # Extract the execution configuration from the raw mapping and validate its keys
         value = _mapping(raw, "execution")
@@ -418,7 +437,26 @@ class SelectionConfig:
     end_period: tuple[int, int]
 
     @classmethod
-    def from_mapping(cls, raw: Any, base_dir: Path):
+    def from_mapping(cls, raw: Any, base_dir: Path) -> SelectionConfig:
+        """Parse and validate the ``selection`` section of a pipeline YAML.
+
+        Parameters
+        ----------
+        raw : Any
+            Raw ``selection`` mapping from the YAML document.
+        base_dir : pathlib.Path
+            Directory used to resolve a relative AOI path.
+
+        Returns
+        -------
+        SelectionConfig
+            Validated AOI, year, and season selection.
+
+        Raises
+        ------
+        PipelineConfigError
+            If a value is missing or invalid.
+        """
 
         # Extract the "selection" section from the raw mapping and validate its keys
         value = _mapping(raw, "selection")
@@ -513,7 +551,26 @@ class OutputGridConfig:
         )
 
     @classmethod
-    def from_mapping(cls, raw: Any, selection: SelectionConfig):
+    def from_mapping(cls, raw: Any, selection: SelectionConfig) -> OutputGridConfig:
+        """Parse and validate the ``output_grid`` section of a pipeline YAML.
+
+        Parameters
+        ----------
+        raw : Any
+            Raw ``output_grid`` mapping from the YAML document.
+        selection : SelectionConfig
+            Selection section; the AOI determines the canonical grid extent.
+
+        Returns
+        -------
+        OutputGridConfig
+            Validated output grid request.
+
+        Raises
+        ------
+        PipelineConfigError
+            If a value is missing, inconsistent with the selection, or invalid.
+        """
 
         # Extract and validate the output grid configuration from the raw mapping
         value = _mapping(raw, "output_grid")
@@ -970,6 +1027,7 @@ class PipelineConfig:
         ordered: list[NodeConfig] = []
 
         def visit(node: NodeConfig) -> None:
+            """Depth-first visit that detects cycles and orders dependencies first."""
             current = state.get(node.node_id, 0)
             if current == 2:
                 return

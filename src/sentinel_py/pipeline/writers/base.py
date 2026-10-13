@@ -31,6 +31,7 @@ class OutputExecutionResult:
 
     @property
     def failed(self) -> bool:
+        """Return whether any task result reports ``status == "failed"``."""
         return any(
             getattr(result, "status", None) == "failed" for result in self.results
         )
@@ -58,10 +59,12 @@ class ArtifactOutputWriter:
     """Expose an artifact without requesting Dask computation or persistence."""
 
     def __init__(self, format_name: str):
+        """Create a pass-through writer registered under ``format_name``."""
         self.format_name = format_name
         self.accepted_artifact_kinds = frozenset({ArtifactKind.raster, ArtifactKind.point})
 
     def build(self, artifact: Any, output: Any, pipeline: Any) -> OutputWritePlan:
+        """Return an empty plan; the lazy artifact is handed to the caller as is."""
         del artifact, pipeline
         return OutputWritePlan(output)
 
@@ -70,6 +73,7 @@ class ArtifactOutputWriter:
         plan: OutputWritePlan,
         computed: tuple[Any, ...],
     ) -> tuple[Any, ...]:
+        """Return the (empty) computed results unchanged."""
         del plan
         return computed
 

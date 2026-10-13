@@ -284,6 +284,9 @@ class S2DownloadAssets(str, Enum):
     wvp = "WVP"
 
 
+# Canonical uint16 nodata sentinel used by Sentinel-2 preprocessing outputs.
+S2_NODATA = 65535
+
 # ESA band_id values used by BOA_ADD_OFFSET elements in Level-2A metadata.
 S2_BAND_IDS = {
     "B01": "0",

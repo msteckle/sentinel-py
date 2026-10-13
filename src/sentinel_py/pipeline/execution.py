@@ -144,6 +144,7 @@ def compute_dask_tasks(
         if task_progress_callback is not None:
 
             def update_progress(completed: int, total: int) -> None:
+                """Offset worker progress by tasks already completed from resume."""
                 task_progress_callback(
                     initial_completed_tasks + completed,
                     initial_completed_tasks + total,

@@ -40,12 +40,14 @@ class COGWriteResult:
 
     @property
     def state_row(self) -> dict[str, Any]:
+        """Return the JSON/Parquet-friendly resume-state row for this result."""
         value = asdict(self)
         value["output_path"] = str(self.output_path)
         return value
 
 
 def cog_state_path(output_dir: Path) -> Path:
+    """Return the per-output-directory COG resume-state location."""
     return REGISTRY["cog_outputs"].path(output_dir)
 
 
@@ -68,6 +70,12 @@ def _write_cog_tile(
 ) -> COGWriteResult:
     """Write one array chunk atomically and return data instead of worker logs."""
     temporary = output_path.with_name(f".{output_path.name}.{uuid.uuid4().hex}.tmp.tif")
+    identity = {
+        "task_id": task_id, "output_id": output_id, "product_id": product_id,
+        "granule_id": granule_id, "variable": variable, "row_index": row_index,
+        "column_index": column_index, "output_path": output_path,
+        "cache_key": cache_key,
+    }
     try:
         import rasterio
         from affine import Affine
@@ -102,35 +110,19 @@ def _write_cog_tile(
             destination.descriptions = descriptions
         os.replace(temporary, output_path)
         return COGWriteResult(
-            task_id,
-            output_id,
-            product_id,
-            granule_id,
-            variable,
-            row_index,
-            column_index,
-            output_path,
-            cache_key,
-            "written",
-            output_path.stat().st_size,
-            None,
-            datetime.now(UTC).isoformat(),
+            **identity,
+            status="written",
+            bytes_written=output_path.stat().st_size,
+            error=None,
+            completed_at=datetime.now(UTC).isoformat(),
         )
     except Exception as error:
         return COGWriteResult(
-            task_id,
-            output_id,
-            product_id,
-            granule_id,
-            variable,
-            row_index,
-            column_index,
-            output_path,
-            cache_key,
-            "failed",
-            0,
-            f"{type(error).__name__}: {error}",
-            datetime.now(UTC).isoformat(),
+            **identity,
+            status="failed",
+            bytes_written=0,
+            error=f"{type(error).__name__}: {error}",
+            completed_at=datetime.now(UTC).isoformat(),
         )
     finally:
         temporary.unlink(missing_ok=True)
@@ -143,6 +135,22 @@ class COGOutputWriter:
     accepted_artifact_kinds = frozenset({ArtifactKind.raster})
 
     def build(self, artifact: Any, output: Any, pipeline: Any) -> OutputWritePlan:
+        """Plan chunk-level COG write tasks, skipping tiles already completed.
+
+        Parameters
+        ----------
+        artifact : RasterArtifact
+            Lazy per-AOI datasets to materialize.
+        output : OutputConfig
+            Named output supplying the destination directory.
+        pipeline : PipelineConfig
+            Pipeline configuration used for naming and grid context.
+
+        Returns
+        -------
+        OutputWritePlan
+            Delayed tile tasks plus results reused from the resume state.
+        """
         try:
             import xarray as xr
             from dask import delayed
@@ -247,19 +255,19 @@ class COGOutputWriter:
                         ):
                             completed.append(
                                 COGWriteResult(
-                                    task_id,
-                                    output.output_id,
-                                    product_id,
-                                    granule_id,
-                                    variable,
-                                    row_index,
-                                    column_index,
-                                    output_path,
-                                    cache_key,
-                                    "skipped",
-                                    output_path.stat().st_size,
-                                    None,
-                                    datetime.now(UTC).isoformat(),
+                                    task_id=task_id,
+                                    output_id=output.output_id,
+                                    product_id=product_id,
+                                    granule_id=granule_id,
+                                    variable=variable,
+                                    row_index=row_index,
+                                    column_index=column_index,
+                                    output_path=output_path,
+                                    cache_key=cache_key,
+                                    status="skipped",
+                                    bytes_written=output_path.stat().st_size,
+                                    error=None,
+                                    completed_at=datetime.now(UTC).isoformat(),
                                 )
                             )
                         else:
@@ -350,6 +358,7 @@ class COGOutputWriter:
         plan: OutputWritePlan,
         computed: tuple[Any, ...],
     ) -> tuple[COGWriteResult, ...]:
+        """Persist resume state for completed tiles and return all results."""
         if "subplans" in plan.metadata:
             results = []
             offset = 0

@@ -40,7 +40,7 @@ from sentinel_py.pipeline.grid import (
     select_resampling,
     warp_to_window,
 )
-from sentinel_py.pipeline.readers.base import BaseReader, apply_polygon_mask
+from sentinel_py.pipeline.readers.base import BaseReader, apply_polygon_mask, point_row
 
 S2_ACQUISITION_PATTERN = re.compile(r"_MSIL2A_(\d{8}T\d{6})_")
 S2_TILE_PATTERN = re.compile(r"_(T\d{2}[A-Z]{3})_")
@@ -749,19 +749,15 @@ def _read_scene_point(
                       chunks=ChunkShape(y=1, x=1))
     scene = _scene_source(granule, bands, mask_classes, nodata)
     values = _read_scene_chunk(scene, grid, next(grid.iter_windows()))[:, 0, 0]
-    row = {
-        "aoi_id": unit.aoi_id,
-        "component_id": unit.component_id,
-        "point_index": int(unit.component_id.rsplit("-", 1)[-1]),
-        "longitude": float(unit.geometry_wgs84.x),
-        "latitude": float(unit.geometry_wgs84.y),
-        "time": granule.acquisition_time,
-        "product_id": granule.product_id,
-        "granule_id": granule.granule_id,
-        "time_representation": "acquisition",
-        "source_fingerprint": _source_fingerprint(scene),
-        "quantification_value": scene.quantification_value,
-    }
+    row = point_row(
+        unit,
+        time=granule.acquisition_time,
+        product_id=granule.product_id,
+        granule_id=granule.granule_id,
+        time_representation="acquisition",
+        source_fingerprint=_source_fingerprint(scene),
+    )
+    row["quantification_value"] = scene.quantification_value
     row.update({band: value.item() for band, value in zip(bands, values)})
     return row
 

@@ -302,7 +302,7 @@ class S1Reader(BaseReader):
     """Reader adapter for ASF-downloaded Sentinel-1 GRD ZIP archives.
 
     Sentinel-1 GRD archives are not read lazily. They are preprocessed scene by
-    scene by SNAP (the ``snap_gpt`` processor), so this reader only validates the
+    scene by SNAP (an external ``gpt`` step), so this reader only validates the
     source configuration and provides the scene catalog.
     """
 

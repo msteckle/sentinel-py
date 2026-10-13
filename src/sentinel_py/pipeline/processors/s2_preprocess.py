@@ -1,3 +1,5 @@
+"""Lazy Sentinel-2 L2A preprocessing onto the canonical output grid."""
+
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -7,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pyproj import CRS
 
 from sentinel_py.cache import REGISTRY, deterministic_cache_key
-from sentinel_py.enums import OutputFormat, S2Bands, SourceType
+from sentinel_py.enums import S2_NODATA, S2Bands, SourceType
 from sentinel_py.pipeline.grid import point_grid
 from sentinel_py.pipeline.processors.base import (
     BaseProcessor,
@@ -18,12 +20,14 @@ from sentinel_py.pipeline.processors.base import (
 DEFAULT_BANDS = ("B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12")
 DEFAULT_MASK_CLASSES = (0, 1, 3, 8, 9, 10, 11)
 
-########################################################################################
-# s2.preprocess
-########################################################################################
+# Bump when preprocessing output changes so cached recipes and COG resume keys are
+# invalidated. Included in ``recipe_id``.
+PROCESSOR_VERSION = 1
 
 
-# Pydantic validation model for s2.preprocess parameters -------------------------------
+########################################################################################
+# Node configuration
+########################################################################################
 
 
 class S2PreprocessNodeConfig(BaseModel):
@@ -34,11 +38,12 @@ class S2PreprocessNodeConfig(BaseModel):
     source: str = Field(min_length=1)
     bands: tuple[str, ...] = DEFAULT_BANDS
     mask_classes: tuple[int, ...] = DEFAULT_MASK_CLASSES
-    nodata: int = Field(default=65535, ge=0, le=65535)
+    nodata: int = Field(default=S2_NODATA, ge=0, le=S2_NODATA)
 
     @field_validator("bands", mode="before")
     @classmethod
     def validate_bands(cls, value: Any) -> tuple[str, ...]:
+        """Normalize band names and require supported Sentinel-2 spectral bands."""
         if not isinstance(value, (list, tuple)):
             raise TypeError("bands must be a list")
         bands = tuple(dict.fromkeys(str(item).upper() for item in value))
@@ -50,6 +55,7 @@ class S2PreprocessNodeConfig(BaseModel):
     @field_validator("mask_classes", mode="before")
     @classmethod
     def validate_mask_classes(cls, value: Any) -> tuple[int, ...]:
+        """Require unique SCL class integers in the range 0 through 11."""
         if not isinstance(value, (list, tuple)):
             raise TypeError("mask_classes must be a list")
         if any(isinstance(item, bool) or not isinstance(item, int) for item in value):
@@ -60,7 +66,9 @@ class S2PreprocessNodeConfig(BaseModel):
         return classes
 
 
-# Processor implementation for s2.preprocess -------------------------------------------
+########################################################################################
+# Processor class for s2.preprocess
+########################################################################################
 
 
 class S2PreprocessProcessor(BaseProcessor):
@@ -68,6 +76,7 @@ class S2PreprocessProcessor(BaseProcessor):
 
     type_name = "s2.preprocess"
     config_model = S2PreprocessNodeConfig
+    version = PROCESSOR_VERSION
 
     def validate(
         self,
@@ -79,6 +88,11 @@ class S2PreprocessProcessor(BaseProcessor):
         outputs: tuple[Any, ...],
         output_grid: Any,
     ) -> None:
+        """Validate the source reference, canonical metre grid, and output formats."""
+        super().validate(
+            config, node_id=node_id, inputs=inputs, sources=sources,
+            outputs=outputs, output_grid=output_grid,
+        )
 
         # Ensure the configuration is of the correct type
         if not isinstance(config, S2PreprocessNodeConfig):
@@ -107,19 +121,14 @@ class S2PreprocessProcessor(BaseProcessor):
                 "canonical s2.preprocess currently requires a projected metre CRS"
             )
         # Ensure the nodata value is set correctly
-        if config.nodata != 65535:
-            raise ValueError("canonical s2.preprocess currently requires nodata 65535")
+        if config.nodata != S2_NODATA:
+            raise ValueError(
+                f"canonical s2.preprocess currently requires nodata {S2_NODATA}"
+            )
         # Ensure the output pixels are square
         if output_grid.resolution[0] != output_grid.resolution[1]:
             raise ValueError(
                 "canonical s2.preprocess currently requires square output pixels"
-            )
-        # Ensure the outputs are one of the existing formats we have
-        if outputs and any(
-            output.format not in {"cog", "xarray", "parquet"} for output in outputs
-        ):
-            raise ValueError(
-                "canonical s2.preprocess requires named COG or xarray outputs"
             )
 
     def execute_raster(
@@ -128,6 +137,7 @@ class S2PreprocessProcessor(BaseProcessor):
         inputs: Mapping[str, Any],
         context: ProcessorContext,
     ) -> Any:
+        """Build a lazy, canonical-grid Sentinel-2 dataset for every AOI unit."""
         # Validate the configuration and inputs before proceeding
         if not isinstance(config, S2PreprocessNodeConfig):
             raise TypeError("Invalid s2.preprocess configuration")
@@ -159,7 +169,8 @@ class S2PreprocessProcessor(BaseProcessor):
                 pipeline=str(pipeline.path), processor=self.type_name,
                 node=context.node.node_id, time_representation="acquisition",
                 recipe_id=deterministic_cache_key({
-                    "processor": self.type_name, "bands": config.bands,
+                    "processor": self.type_name, "version": self.version,
+                    "bands": config.bands,
                     "mask_classes": config.mask_classes, "nodata": config.nodata,
                     "crs": grid.crs, "transform": tuple(grid.affine[:6]),
                 })[:12],

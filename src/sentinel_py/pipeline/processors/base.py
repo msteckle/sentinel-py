@@ -74,9 +74,8 @@ class BaseProcessor(ABC):
     config_model: ClassVar[type[BaseModel]]
     input_kind: ClassVar[ArtifactKind | None] = None
     output_kind: ClassVar[ArtifactKind] = ArtifactKind.raster
-    supported_output_formats: ClassVar[frozenset[str]] = frozenset(
-        {OutputFormat.cog, OutputFormat.xarray}
-    )
+    supported_output_formats: ClassVar[frozenset[str]] = frozenset(OutputFormat)
+    version: ClassVar[int] = 1
 
     def validate(
         self,
@@ -96,6 +95,28 @@ class BaseProcessor(ABC):
                 f"{self.type_name} does not support output format(s): "
                 + ", ".join(sorted(unsupported))
             )
+
+    def single_input(self, inputs: Mapping[str, Any]) -> Any:
+        """Return the only upstream input of a single-input processor.
+
+        Parameters
+        ----------
+        inputs : Mapping[str, Any]
+            Upstream node references or artifacts keyed by input name.
+
+        Returns
+        -------
+        Any
+            The single value in ``inputs``.
+
+        Raises
+        ------
+        ValueError
+            If ``inputs`` does not contain exactly one entry.
+        """
+        if len(inputs) != 1:
+            raise ValueError(f"{self.type_name} requires exactly one upstream input")
+        return next(iter(inputs.values()))
 
     def execute(
         self,

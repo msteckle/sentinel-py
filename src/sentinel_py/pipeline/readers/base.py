@@ -179,6 +179,49 @@ def point_sample_requests(
     return tuple(requests)
 
 
+def point_row(
+    unit: AOIUnit,
+    *,
+    time: Any,
+    product_id: str,
+    granule_id: str,
+    time_representation: str,
+    source_fingerprint: str,
+) -> dict[str, Any]:
+    """Build the identity and provenance columns shared by every point row.
+
+    Parameters
+    ----------
+    unit : AOIUnit
+        Point AOI unit; its ``component_id`` must end in ``-<point index>``.
+    time : Any
+        Observation time (or a placeholder for static sources).
+    product_id, granule_id : str
+        Source product and granule identifiers.
+    time_representation : str
+        ``"acquisition"``, ``"static"``, or ``"composite"``.
+    source_fingerprint : str
+        Fingerprint of the source data that produced the row.
+
+    Returns
+    -------
+    dict[str, Any]
+        Row with identity, geometry, and provenance columns; callers add values.
+    """
+    return {
+        "aoi_id": unit.aoi_id,
+        "component_id": unit.component_id,
+        "point_index": int(unit.component_id.rsplit("-", 1)[-1]),
+        "longitude": float(unit.geometry_wgs84.x),
+        "latitude": float(unit.geometry_wgs84.y),
+        "time": time,
+        "product_id": product_id,
+        "granule_id": granule_id,
+        "time_representation": time_representation,
+        "source_fingerprint": source_fingerprint,
+    }
+
+
 def point_sample_cache_path(reader_name: str, cache_key: str) -> Path:
     """Return the shared, reader-namespaced cache location for point rows."""
     return (

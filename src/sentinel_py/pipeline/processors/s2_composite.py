@@ -11,6 +11,7 @@ import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from sentinel_py.cache import deterministic_cache_key
+from sentinel_py.enums import S2_NODATA
 from sentinel_py.pipeline.processors.base import (
     BaseProcessor,
     ProcessorConfig,
@@ -18,6 +19,14 @@ from sentinel_py.pipeline.processors.base import (
 )
 
 _PERIOD_PATTERN = re.compile(r"^(?P<count>[1-9][0-9]*)(?P<unit>D|W|M|Y)$")
+
+# Bump when composite output changes so cached COG resume keys are invalidated.
+PROCESSOR_VERSION = 2
+
+
+########################################################################################
+# Node configuration
+########################################################################################
 
 
 class S2CompositeNodeConfig(BaseModel):
@@ -43,6 +52,11 @@ class S2CompositeNodeConfig(BaseModel):
                 "'1M', or '1Y'"
             )
         return "all" if normalized == "ALL" else normalized
+
+
+########################################################################################
+# Seasonal grouping helpers
+########################################################################################
 
 
 def _canonical_date(value: np.datetime64, *, year: int = 2000) -> np.datetime64:
@@ -120,13 +134,18 @@ def _composite_name(source: Any, selection: Any, aggregation: str) -> str:
     )
 
 
+########################################################################################
+# Processor class for seasonal Sentinel-2 composites
+########################################################################################
+
+
 class S2CompositeProcessor(BaseProcessor):
     """Aggregate an upstream lazy Sentinel-2 cube into seasonal composites."""
 
     type_name = "composite"
     config_model = S2CompositeNodeConfig
     input_kind = None
-    version = 2
+    version = PROCESSOR_VERSION
 
     def validate(
         self,
@@ -139,13 +158,13 @@ class S2CompositeProcessor(BaseProcessor):
         output_grid: Any,
     ) -> None:
         """Validate the composite's upstream dependency and output formats."""
-        del sources, output_grid
+        super().validate(
+            config, node_id=node_id, inputs=inputs, sources=sources,
+            outputs=outputs, output_grid=output_grid,
+        )
         if not isinstance(config, S2CompositeNodeConfig):
             raise TypeError(f"{node_id} has an invalid composite configuration")
-        if len(inputs) != 1:
-            raise ValueError("composite requires exactly one upstream input")
-        if any(output.format not in {"cog", "xarray", "parquet"} for output in outputs):
-            raise ValueError("composite requires named COG or xarray outputs")
+        self.single_input(inputs)
 
     def execute_raster(
         self,
@@ -156,15 +175,13 @@ class S2CompositeProcessor(BaseProcessor):
         """Build lazy aggregate reductions without loading the source cube."""
         if not isinstance(config, S2CompositeNodeConfig):
             raise TypeError("Invalid composite configuration")
-        if len(inputs) != 1:
-            raise ValueError("composite requires exactly one upstream input")
 
         try:
             import xarray as xr
         except ImportError as error:
             raise RuntimeError("Composite processing requires xarray") from error
 
-        source = next(iter(inputs.values()))
+        source = self.single_input(inputs)
         from sentinel_py.pipeline.artifacts import RasterArtifact
         if isinstance(source, RasterArtifact):
             datasets = {
@@ -297,7 +314,7 @@ class S2CompositeProcessor(BaseProcessor):
             # S2 source rows may carry 0 (no-data) or 65535 (saturated) from
             # older caches; neither may participate in a point composite.
             for column in value_columns:
-                rows[column] = rows[column].replace((0, 65535), np.nan)
+                rows[column] = rows[column].replace((0, S2_NODATA), np.nan)
             grouped = rows.groupby(group_columns, dropna=False, sort=False)
             aggregate = getattr(grouped[value_columns], {"mean": "mean", "median": "median", "maximum": "max"}[config.aggregation])().reset_index()
             aggregate["time"] = f"{context.pipeline.selection.start_period[0]:02d}-{context.pipeline.selection.start_period[1]:02d}"

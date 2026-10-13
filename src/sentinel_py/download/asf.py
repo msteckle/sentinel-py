@@ -1,5 +1,7 @@
 """Sentinel-1 query and download from ASF with persistent, size-verified state."""
 
+from __future__ import annotations
+
 import hashlib
 import logging
 import netrc
@@ -111,6 +113,43 @@ def _is_retryable_download_error(error: Exception) -> bool:
     return isinstance(error, IOError) and str(error).startswith(
         ("size mismatch", "MD5 mismatch")
     )
+
+
+def _feature_to_row(feature: dict) -> dict:
+    """Convert one ASF GeoJSON search feature into a manifest row.
+
+    Parameters
+    ----------
+    feature : dict
+        Feature from ``ASFSearchResults.geojson()["features"]``.
+
+    Returns
+    -------
+    dict
+        Row with the ``ASF_MANIFEST_COLUMNS`` keys; ``sizeMB`` is derived from the
+        byte count when present.
+    """
+    prop = feature["properties"]
+    expected_size = prop.get("bytes")
+    expected_size = int(expected_size) if expected_size is not None else None
+    size_mb = (
+        expected_size / (1024 * 1024)
+        if expected_size is not None
+        else prop.get("sizeMB")
+    )
+    return {
+        "granule": prop.get("fileName"),
+        "url": prop.get("url"),
+        "beamMode": prop.get("beamMode"),
+        "flightDirection": prop.get("flightDirection"),
+        "polarization": prop.get("polarization"),
+        "relativeOrbit": prop.get("pathNumber") or prop.get("relativeOrbit"),
+        "startTime": prop.get("startTime"),
+        "stopTime": prop.get("stopTime"),
+        "expected_size": expected_size,
+        "sizeMB": size_mb,
+        "md5sum": prop.get("md5sum"),
+    }
 
 
 def get_predominant_flightdir(manifest: pd.DataFrame) -> str | None:
@@ -267,36 +306,12 @@ def query_asf(
         raise
 
     # Convert the results to a GeoJSON and then to a pandas DataFrame
-    rows = []
     features = [
         feature
         for results in result_batches
         for feature in results.geojson()["features"]
     ]
-    for feat in features:
-        prop = feat["properties"]
-        expected_size = prop.get("bytes")
-        expected_size = int(expected_size) if expected_size is not None else None
-        size_mb = (
-            expected_size / (1024 * 1024)
-            if expected_size is not None
-            else prop.get("sizeMB")
-        )
-        rows.append(
-            {
-                "granule": prop.get("fileName"),
-                "url": prop.get("url"),
-                "beamMode": prop.get("beamMode"),
-                "flightDirection": prop.get("flightDirection"),
-                "polarization": prop.get("polarization"),
-                "relativeOrbit": prop.get("pathNumber") or prop.get("relativeOrbit"),
-                "startTime": prop.get("startTime"),
-                "stopTime": prop.get("stopTime"),
-                "expected_size": expected_size,
-                "sizeMB": size_mb,
-                "md5sum": prop.get("md5sum"),
-            }
-        )
+    rows = [_feature_to_row(feature) for feature in features]
     df = pd.DataFrame(rows, columns=ASF_MANIFEST_COLUMNS)
 
     # Remove duplicates, sort by granule name, and reset the index
@@ -416,6 +431,69 @@ def product_filename(product: dict) -> str:
         str(product["url"]),
         None if granule is None or pd.isna(granule) else str(granule),
     )
+
+
+def _existing_file_is_valid(
+    target: Path,
+    *,
+    filename: str,
+    expected_size: int | None,
+    expected_md5: str | None,
+    cached: dict,
+) -> tuple[bool, int, int]:
+    """Decide whether an existing local product can be skipped.
+
+    A file is valid when its size matches the manifest and its checksum matches
+    (reusing a prior verified fingerprint to avoid re-hashing); with no manifest size
+    or checksum, a previously recorded complete state with the same size is trusted.
+
+    Parameters
+    ----------
+    target : pathlib.Path
+        Existing local file.
+    filename : str
+        Product file name, used to validate the cached fingerprint.
+    expected_size, expected_md5 : optional
+        Manifest size in bytes and MD5 digest.
+    cached : dict
+        Previous state row for this URL (may be empty).
+
+    Returns
+    -------
+    tuple[bool, int, int]
+        ``(is_valid, actual_size, local_mtime_ns)``.
+    """
+    stat = target.stat()
+    actual = stat.st_size
+    local_mtime_ns = stat.st_mtime_ns
+    expected_matches = expected_size is not None and actual == expected_size
+    fingerprint_matches = expected_md5 is not None and _verified_fingerprint_matches(
+        cached,
+        filename=filename,
+        actual_size=actual,
+        local_mtime_ns=local_mtime_ns,
+        expected_md5=expected_md5,
+    )
+    checksum_matches = expected_md5 is None or fingerprint_matches
+    if (
+        expected_md5 is not None
+        and not fingerprint_matches
+        and (expected_size is None or actual == expected_size)
+    ):
+        checksum_matches = _file_md5(target) == expected_md5
+    cached_matches = (
+        expected_size is None
+        and expected_md5 is None
+        and cached.get("status") == DownloadStatus.complete
+        and _optional_int(cached.get("local_actual_size")) == actual
+    )
+    checksum_only_matches = expected_size is None and expected_md5 is not None
+    verified = (
+        (expected_matches and checksum_matches)
+        or (checksum_only_matches and checksum_matches)
+        or cached_matches
+    )
+    return bool(verified), actual, local_mtime_ns
 
 
 def _state_row(
@@ -574,39 +652,14 @@ def download_asf(
 
         try:
             if target.is_file():
-                target_stat = target.stat()
-                actual = target_stat.st_size
-                local_mtime_ns = target_stat.st_mtime_ns
-                expected_matches = expected is not None and actual == expected
-                fingerprint_matches = (
-                    expected_md5 is not None
-                    and _verified_fingerprint_matches(
-                        cached,
-                        filename=filename,
-                        actual_size=actual,
-                        local_mtime_ns=local_mtime_ns,
-                        expected_md5=expected_md5,
-                    )
+                verified, actual, local_mtime_ns = _existing_file_is_valid(
+                    target,
+                    filename=filename,
+                    expected_size=expected,
+                    expected_md5=expected_md5,
+                    cached=cached,
                 )
-                checksum_matches = expected_md5 is None or fingerprint_matches
-                if (
-                    expected_md5 is not None
-                    and not fingerprint_matches
-                    and (expected is None or actual == expected)
-                ):
-                    checksum_matches = _file_md5(target) == expected_md5
-                cached_matches = (
-                    expected is None
-                    and expected_md5 is None
-                    and cached.get("status") == DownloadStatus.complete
-                    and _optional_int(cached.get("local_actual_size")) == actual
-                )
-                checksum_only_matches = expected is None and expected_md5 is not None
-                if (
-                    (expected_matches and checksum_matches)
-                    or (checksum_only_matches and checksum_matches)
-                    or cached_matches
-                ):
+                if verified:
                     logger.debug("SKIPPED %s: existing file verified", filename)
                     return _state_row(
                         product,

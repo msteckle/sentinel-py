@@ -1,5 +1,7 @@
 """Sentinel-1/2 query and download from CDSE with cached asset discovery."""
 
+from __future__ import annotations
+
 import calendar
 import logging
 import os
@@ -24,15 +26,12 @@ from phidown.search import CopernicusDataSearcher
 
 from sentinel_py.cache import (
     REGISTRY,
+    QueryCache,
     RowStore,
-    cache_directory,
     deterministic_cache_key,
     find_latest_cache_file,
     legacy_provider_cache_root,
-    mark_cache_used,
     merge_parquet_cache,
-    write_json_atomic,
-    write_parquet_atomic,
 )
 from sentinel_py.download.base import make_progress, part_path, retry_call
 from sentinel_py.enums import DownloadStatus, Mission
@@ -247,15 +246,6 @@ def query_cache_key(
     return deterministic_cache_key(payload)
 
 
-def save_query_as_json(query_dir: Path, **kwargs) -> None:
-    """
-    Save query parameters as a human-readable JSON inside the query cache directory.
-    """
-    info = {k: str(v) if isinstance(v, (Path, date)) else v for k, v in kwargs.items()}
-    info["created"] = datetime.now().isoformat()
-    write_json_atomic(query_dir / "query_info.json", info)
-
-
 def find_latest_scenes_cache(cache_root: Path) -> Path | None:
     """
     Find the most recently used scenes.parquet across all query cache directories.
@@ -420,14 +410,13 @@ def query_cdse(
             count=count,
         ),
     )
-    query_dir = cache_directory(cache_dir, cache_key)
-    scenes_cache = query_dir / "scenes.parquet"
+    query_cache = QueryCache.open(cache_dir, cache_key, "scenes.parquet")
+    scenes_cache = query_cache.table_path
 
     # If cached products exist, don't bother querying
-    if scenes_cache.exists():
+    if query_cache.exists():
         logger.info(f"Loading cached products from {scenes_cache}")
-        mark_cache_used(scenes_cache)
-        cached = pd.read_parquet(scenes_cache)
+        cached = query_cache.load()
         update_cdse_scene_catalog(cache_dir, cached)
         cached.attrs["cache_path"] = str(scenes_cache)
         return cached
@@ -562,10 +551,7 @@ def query_cdse(
 
     # Save scenes.parquet and query_info.json within query-specific cache directory
     try:
-        write_parquet_atomic(scenes, scenes_cache, index=False)
-        catalog_path = update_cdse_scene_catalog(cache_dir, scenes)
-        save_query_as_json(
-            query_dir,
+        query_info = dict(
             collection=collection,
             product=product,
             years=years,
@@ -590,6 +576,13 @@ def query_cdse(
             query_id=cache_key,
             num_scenes=len(scenes),
         )
+        query_info = {
+            key: str(value) if isinstance(value, (Path, date)) else value
+            for key, value in query_info.items()
+        }
+        query_info["created"] = datetime.now().isoformat()
+        query_cache.save(scenes, query_info)
+        catalog_path = update_cdse_scene_catalog(cache_dir, scenes)
         logger.info(f"Cached scenes to {scenes_cache}")
         logger.info(f"Updated shared CDSE scene catalog at {catalog_path}")
     except Exception as e:

@@ -4,17 +4,9 @@ import datetime as dt
 from pathlib import Path
 from typing import Annotated
 
-import pandas as pd
 import typer
 
-from sentinel_py.cache import (
-    DEFAULT_PGC_CACHE_DIR,
-    cache_directory,
-    deterministic_cache_key,
-    mark_cache_used,
-    write_json_atomic,
-    write_parquet_atomic,
-)
+from sentinel_py.cache import DEFAULT_PGC_CACHE_DIR, QueryCache
 from sentinel_py.cli.options import (
     LogOpt,
     VerboseOpt,
@@ -75,12 +67,10 @@ def query(
         "max_results": max_results,
         "cache_version": 1,
     }
-    query_dir = cache_directory(cache_dir, deterministic_cache_key(payload))
-    manifest_path = query_dir / "manifest.parquet"
-    info_path = query_dir / "query_info.json"
-    if manifest_path.exists():
-        manifest = pd.read_parquet(manifest_path)
-        mark_cache_used(manifest_path)
+    query_cache = QueryCache.for_payload(cache_dir, payload, "manifest.parquet")
+    manifest_path = query_cache.table_path
+    if query_cache.exists():
+        manifest = query_cache.load()
         typer.echo(f"Loaded cached PGC query: {manifest_path}")
     else:
         with make_progress(eta=False) as progress:
@@ -98,9 +88,8 @@ def query(
                 )
             except (RuntimeError, ValueError) as error:
                 raise typer.BadParameter(str(error)) from error
-        write_parquet_atomic(manifest, manifest_path, index=False)
-        write_json_atomic(
-            info_path,
+        query_cache.save(
+            manifest,
             {
                 **payload,
                 "aoi": str(aoi),

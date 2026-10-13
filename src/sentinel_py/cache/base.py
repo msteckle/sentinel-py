@@ -10,6 +10,7 @@ import stat
 import uuid
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from fcntl import LOCK_EX, LOCK_UN, flock
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -150,6 +151,71 @@ def write_parquet_atomic(
         dataframe.to_parquet(temporary, index=index)
     if read_only:
         path.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+
+
+@dataclass(frozen=True)
+class QueryCache:
+    """One keyed query-cache directory holding a result table and its info JSON.
+
+    Every provider query follows the same flow: derive a key from the query
+    parameters, reuse the cached table if it exists (marking it recently used), and
+    otherwise run the query and persist the table plus a human-readable
+    ``query_info.json``.
+
+    Attributes
+    ----------
+    directory : pathlib.Path
+        Query directory ``<cache_root>/<key>``.
+    table_name : str
+        File name of the result table inside ``directory``
+        (``"manifest.parquet"`` or ``"scenes.parquet"``).
+    """
+
+    directory: Path
+    table_name: str
+
+    @classmethod
+    def open(cls, cache_root: Path, key: str, table_name: str) -> QueryCache:
+        """Open (creating and migrating legacy caches) the directory for ``key``."""
+        return cls(cache_directory(cache_root, key), table_name)
+
+    @classmethod
+    def for_payload(
+        cls, cache_root: Path, payload: dict[str, Any], table_name: str
+    ) -> QueryCache:
+        """Open the directory keyed by ``deterministic_cache_key(payload)``."""
+        return cls.open(cache_root, deterministic_cache_key(payload), table_name)
+
+    @property
+    def table_path(self) -> Path:
+        """Path of the cached result table."""
+        return self.directory / self.table_name
+
+    @property
+    def info_path(self) -> Path:
+        """Path of the human-readable query description."""
+        return self.directory / "query_info.json"
+
+    def exists(self) -> bool:
+        """Return whether a result table is already cached."""
+        return self.table_path.exists()
+
+    def load(self) -> pd.DataFrame:
+        """Read the cached table and mark it recently used."""
+        table = pd.read_parquet(self.table_path)
+        mark_cache_used(self.table_path)
+        return table
+
+    def load_info(self) -> dict[str, Any]:
+        """Return the cached ``query_info.json`` contents, or ``{}`` if absent."""
+        if not self.info_path.exists():
+            return {}
+        return json.loads(self.info_path.read_text())
+
+    def save(self, table: pd.DataFrame, info: dict[str, Any]) -> None:
+        """Atomically persist the result table and its query description."""
+        write_parquet_atomic(table, self.table_path, index=False)
+        write_json_atomic(self.info_path, info)
 
 
 def merge_state_rows(

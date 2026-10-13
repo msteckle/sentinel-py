@@ -4,6 +4,7 @@ import json
 import pandas as pd
 
 from sentinel_py.cache import (
+    QueryCache,
     deterministic_cache_key,
     merge_state_rows,
     write_json_atomic,
@@ -42,3 +43,28 @@ def test_atomic_cache_writes_and_state_merge(tmp_path):
         {"url": "one", "status": "complete"}
     ]
     assert not list((tmp_path / "cache").glob("*.tmp"))
+
+
+def test_query_cache_round_trips_table_and_info(tmp_path):
+    payload = {"provider": "TEST", "years": [2023]}
+    cache = QueryCache.for_payload(tmp_path, payload, "manifest.parquet")
+
+    assert not cache.exists()
+    assert cache.load_info() == {}
+
+    table = pd.DataFrame([{"url": "one"}, {"url": "two"}])
+    cache.save(table, {"num_products": 2, "when": "now"})
+
+    reopened = QueryCache.for_payload(tmp_path, payload, "manifest.parquet")
+    assert reopened.directory == cache.directory
+    assert reopened.exists()
+    assert reopened.load()["url"].tolist() == ["one", "two"]
+    assert reopened.load_info()["num_products"] == 2
+    assert reopened.info_path.name == "query_info.json"
+
+
+def test_query_cache_keys_differ_by_payload(tmp_path):
+    first = QueryCache.for_payload(tmp_path, {"a": 1}, "manifest.parquet")
+    second = QueryCache.for_payload(tmp_path, {"a": 2}, "manifest.parquet")
+
+    assert first.directory != second.directory

@@ -4,6 +4,7 @@ Everything historically importable from ``sentinel_py.cache`` is re-exported her
 """
 
 from sentinel_py.cache.base import (
+    QueryCache,
     DEFAULT_ASF_CACHE_DIR,
     DEFAULT_CACHE_DIR,
     DEFAULT_CDSE_CACHE_DIR,
@@ -34,6 +35,7 @@ __all__ = [
     "DEFAULT_PGC_CACHE_DIR",
     "DEFAULT_PIPELINE_CACHE_DIR",
     "REGISTRY",
+    "QueryCache",
     "SENTINEL_PY_HOME",
     "SENTINEL_PY_HOME_ENV",
     "CacheNamespace",

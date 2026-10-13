@@ -28,7 +28,7 @@ from shapely import wkt
 from shapely.geometry import base as shapely_base
 from shapely.geometry import shape
 
-from sentinel_py.cache import merge_state_rows, write_parquet_atomic
+from sentinel_py.cache import REGISTRY, merge_state_rows, write_parquet_atomic
 
 PGC_CATALOG_URL = "https://stac.pgc.umn.edu/api/v1/"
 PGC_COLLECTION = "arcticdem-mosaics-v4.1-10m"
@@ -354,7 +354,7 @@ def download_arcticdem(
     logger = logger or logging.getLogger(__name__)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    state_file = state_file or out_dir / ".sentinel-py" / "pgc_downloads.parquet"
+    state_file = state_file or REGISTRY["pgc_downloads"].path(out_dir)
     state = (
         pd.read_parquet(state_file)
         if state_file.exists()

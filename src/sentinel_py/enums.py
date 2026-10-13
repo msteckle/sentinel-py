@@ -359,3 +359,20 @@ def validate_sensor_mode(collection: CDSECollections, sensor_mode: str) -> str:
 
 def default_bands(collection: CDSECollections) -> list[str]:
     return COLLECTION_DEFAULTS.get(collection, [])
+
+
+class CacheKind(str, Enum):
+    """Invalidation behavior of a registered cache namespace."""
+
+    immutable = "immutable"
+    mutable = "mutable"
+    derived = "derived"
+    stat_validated = "stat_validated"
+
+
+class CacheLocation(str, Enum):
+    """Where a registered cache namespace lives relative to its root."""
+
+    home = "home"
+    data_dir = "data_dir"
+    output_dir = "output_dir"

@@ -6,7 +6,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pyproj import CRS
 
-from sentinel_py.cache import deterministic_cache_key
+from sentinel_py.cache import REGISTRY, deterministic_cache_key
 from sentinel_py.enums import S2Bands
 from sentinel_py.pipeline.processors.base import (
     BaseProcessor,
@@ -198,7 +198,7 @@ class S2PreprocessProcessor(BaseProcessor):
             resolution=pipeline.output_grid.resolution,
             anchor=pipeline.output_grid.anchor,
         )
-        source_state = source.data_dir / ".sentinel-py" / "cdse_downloads.parquet"
+        source_state = REGISTRY["cdse_downloads"].path(source.data_dir)
         fingerprint = (
             (str(source_state), source_state.stat().st_size, source_state.stat().st_mtime_ns)
             if source_state.exists() else (str(source.data_dir), source.data_dir.stat().st_mtime_ns)

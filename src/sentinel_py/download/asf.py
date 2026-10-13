@@ -27,7 +27,7 @@ from rich.progress import (
 from shapely import wkt
 from shapely.geometry.polygon import orient
 
-from sentinel_py.cache import merge_state_rows, write_parquet_atomic
+from sentinel_py.cache import REGISTRY, merge_state_rows, write_parquet_atomic
 
 # Sentinel-1-specific values documented by ASF rather than the full generic
 # asf_search constant catalog, which also includes values for other missions:
@@ -544,7 +544,7 @@ def download_asf(
             messages=["No ASF URLs to download."],
         )
 
-    state_file = state_file or out_dir / ".sentinel-py" / "asf_downloads.parquet"
+    state_file = state_file or REGISTRY["asf_downloads"].path(out_dir)
     if state_file.exists():
         state = pd.read_parquet(state_file)
         logger.info("Loaded ASF download state from %s", state_file)

@@ -1,4 +1,4 @@
-"""Shared paths and helpers for reusable caches and persistent processing state."""
+"""Cache locations and low-level primitives: keys, atomic writes, locks, merges."""
 
 from __future__ import annotations
 

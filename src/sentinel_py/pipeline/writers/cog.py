@@ -15,6 +15,7 @@ import pandas as pd
 
 from sentinel_py import raster_io
 from sentinel_py.cache import (
+    REGISTRY,
     deterministic_cache_key,
     merge_state_rows,
     write_parquet_atomic,
@@ -23,7 +24,6 @@ from sentinel_py.pipeline.writers import OutputWritePlan
 from sentinel_py.pipeline.artifacts import ArtifactKind
 
 COG_WRITER_VERSION = 1
-COG_STATE_NAME = "cog_outputs.parquet"
 
 
 @dataclass(frozen=True)
@@ -52,7 +52,7 @@ class COGWriteResult:
 
 
 def cog_state_path(output_dir: Path) -> Path:
-    return Path(output_dir) / ".sentinel-py" / COG_STATE_NAME
+    return REGISTRY["cog_outputs"].path(output_dir)
 
 
 def _write_cog_tile(

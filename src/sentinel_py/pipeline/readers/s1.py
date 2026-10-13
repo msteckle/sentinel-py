@@ -19,7 +19,7 @@ import pandas as pd
 from pydantic import BaseModel
 from shapely.geometry import Polygon
 
-from sentinel_py.cache import write_parquet_atomic
+from sentinel_py.cache import REGISTRY, write_parquet_atomic
 from sentinel_py.download.s1_orbits import ORBIT_STATE_RELPATH, parse_scene_name
 from sentinel_py.enums import ASFOrbitDirection, S1OrbitPolicy
 from sentinel_py.pipeline.readers.base import BaseReader
@@ -29,7 +29,7 @@ from sentinel_py.pipeline.readers.base import BaseReader
 # Scene manifest parsing
 ########################################################################################
 
-CATALOG_RELPATH = Path(".sentinel-py") / "s1_catalog.parquet"
+CATALOG_RELPATH = Path(REGISTRY["s1_catalog"].relpath)
 CATALOG_VERSION = 1
 CATALOG_COLUMNS = [
     "scene",

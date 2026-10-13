@@ -30,7 +30,7 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
-from sentinel_py.cache import merge_state_rows, write_parquet_atomic
+from sentinel_py.cache import REGISTRY, merge_state_rows, write_parquet_atomic
 from sentinel_py.enums import S1OrbitPolicy
 
 # ASF mirrors the ESA/Copernicus POD orbit archive over plain HTTP without
@@ -40,7 +40,7 @@ ORBIT_BASE_URLS = {
     "RESORB": "https://s1qc.asf.alaska.edu/aux_resorb/",
 }
 ORBIT_DIRNAME = "orbits"
-ORBIT_STATE_RELPATH = Path(".sentinel-py") / "s1_orbits.parquet"
+ORBIT_STATE_RELPATH = Path(REGISTRY["s1_orbits"].relpath)
 ORBIT_STATE_COLUMNS = [
     "scene",
     "platform",

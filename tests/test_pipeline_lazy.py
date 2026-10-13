@@ -6,8 +6,10 @@ import numpy as np
 import pytest
 from affine import Affine
 
-from sentinel_py.pipeline.grid import ChunkShape, GridSpec, GridWindow
-from sentinel_py.pipeline.lazy import (
+from sentinel_py.pipeline.grid import (
+    ChunkShape,
+    GridSpec,
+    GridWindow,
     native_pixel_window,
     select_resampling,
     warp_to_window,

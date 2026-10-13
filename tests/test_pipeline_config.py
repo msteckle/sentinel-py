@@ -86,8 +86,8 @@ def test_load_pipeline_resolves_paths_and_node(tmp_path: Path):
     assert config.execution.method == "local"
     assert config.execution.workers == 2
     assert config.selection.years == (2023, 2024)
-    assert config.source.data_dir == (tmp_path / "raw").resolve()
-    assert config.output.path == (tmp_path / "output").resolve()
+    assert config.sources["s2"].data_dir == (tmp_path / "raw").resolve()
+    assert config.outputs["result"].path == (tmp_path / "output").resolve()
     assert [node.node_id for node in config.ordered_nodes] == ["preprocess"]
     assert config.outputs["result"].node == "preprocess"
 
@@ -99,7 +99,7 @@ def test_s2_preprocessor_accepts_canonical_cog_grid(tmp_path: Path):
 
     assert config.aoi_plan is not None
     assert config.aoi_plan.units[0].grid is not None
-    assert config.output.format == "cog"
+    assert config.outputs["result"].format == "cog"
 
 
 def test_s2_preprocessor_rejects_retired_native_grid(tmp_path: Path):

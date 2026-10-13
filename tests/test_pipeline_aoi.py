@@ -8,8 +8,7 @@ import pandas as pd
 import pytest
 from shapely.geometry import MultiPolygon, Point, box
 
-from sentinel_py.pipeline.aoi import load_aoi_plan, point_grid
-from sentinel_py.pipeline.grid import ChunkShape
+from sentinel_py.pipeline.grid import ChunkShape, load_aoi_plan, point_grid
 from sentinel_py.pipeline.artifacts import PointSampleArtifact
 from sentinel_py.pipeline.writers.parquet import ParquetOutputWriter
 

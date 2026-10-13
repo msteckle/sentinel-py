@@ -18,7 +18,7 @@ import typer
 from shapely.geometry.base import BaseGeometry
 
 from sentinel_py.aoi import atomic_aoi_geometries
-from sentinel_py.cache import find_latest_cache_file
+from sentinel_py.cache import DEFAULT_CACHE_DIR, find_latest_cache_file
 from sentinel_py.log import DEFAULT_LOG_DIR
 
 ########################################################################################
@@ -84,6 +84,32 @@ YesOpt = Annotated[
         "-y",
         help="Skip the interactive download confirmation.",
         rich_help_panel=PANEL_DOWNLOAD,
+    ),
+]
+
+
+CacheRootOpt = Annotated[
+    Path,
+    typer.Option(
+        help=(
+            "sentinel-py cache root containing the asf, cdse, pgc and pipeline "
+            f"caches. Defaults to {DEFAULT_CACHE_DIR}."
+        ),
+        file_okay=False,
+        rich_help_panel=PANEL_UTILS,
+    ),
+]
+DataDirOpt = Annotated[
+    list[Path] | None,
+    typer.Option(
+        "--data-dir",
+        help=(
+            "Data or output directory whose .sentinel-py sidecar state to include. "
+            "Only <PATH>/.sentinel-py is examined. May be repeated."
+        ),
+        exists=True,
+        file_okay=False,
+        rich_help_panel=PANEL_UTILS,
     ),
 ]
 

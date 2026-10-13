@@ -6,6 +6,7 @@ from typing import Annotated
 import typer
 
 from .asf import app as asf_app
+from .cache import app as cache_app
 from .cdse import app as cdse_app
 from .pgc import app as pgc_app
 from .run import run
@@ -23,6 +24,9 @@ app.add_typer(
 )
 app.add_typer(
     cdse_app, name="cdse", help="Commands for querying and downloading from CDSE."
+)
+app.add_typer(
+    cache_app, name="cache", help="Inspect, compact, and prune the sentinel-py caches."
 )
 app.add_typer(
     pgc_app, name="pgc", help="Commands for querying and downloading ArcticDEM from PGC."

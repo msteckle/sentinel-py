@@ -41,6 +41,3 @@ class PointSampleArtifact:
     plan: Any
     kind: ArtifactKind = ArtifactKind.POINT
 
-    def copy_rows(self, rows: pd.DataFrame) -> "PointSampleArtifact":
-        """Return a new point artifact after a tabular processor transformation."""
-        return PointSampleArtifact(rows, self.plan)

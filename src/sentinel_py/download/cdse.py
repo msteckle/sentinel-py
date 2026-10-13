@@ -90,9 +90,7 @@ SCENE_CACHE_COLUMNS = [
     "query_id",
 ]
 S2_METADATA_ASSETS = {"MTD_MSIL2A", "MTD_MSIL1C", "MTD_TL"}
-CDSE_ASSET_CACHE_NAME = REGISTRY["cdse_assets"].relpath
 CDSE_LEGACY_ASSET_CACHE_NAME = "all_downloaded_images.parquet"
-CDSE_SCENE_CATALOG_NAME = REGISTRY["cdse_scene_catalog"].relpath
 
 ########################################################################################
 # Variable helpers
@@ -197,14 +195,6 @@ def query_cache_key(
     return deterministic_cache_key(payload)
 
 
-def query_cache_dir(cache_root: Path, cache_key: str) -> Path:
-    """
-    Get or create the cache directory for a query given a parent directory and cache
-    key.
-    """
-    return cache_directory(cache_root, cache_key)
-
-
 def save_query_as_json(query_dir: Path, **kwargs) -> None:
     """
     Save query parameters as a human-readable JSON inside the query cache directory.
@@ -221,14 +211,9 @@ def find_latest_scenes_cache(cache_root: Path) -> Path | None:
     return find_latest_cache_file(cache_root, "scenes.parquet")
 
 
-def cdse_asset_cache_path(cache_root: Path) -> Path:
-    """Return the shared CDSE remote-asset cache path."""
-    return Path(cache_root) / CDSE_ASSET_CACHE_NAME
-
-
 def cdse_scene_catalog_path(cache_root: Path) -> Path:
     """Return the deduplicated CDSE scene catalog path."""
-    return Path(cache_root) / CDSE_SCENE_CATALOG_NAME
+    return REGISTRY["cdse_scene_catalog"].path(cache_root)
 
 
 def _cdse_asset_store(cache_root: Path) -> RowStore:
@@ -258,12 +243,6 @@ def _cdse_asset_store(cache_root: Path) -> RowStore:
             read_only=True,
         )
     return store
-
-
-def _read_cdse_asset_cache(cache_root: Path) -> tuple[pd.DataFrame, Path]:
-    """Read the shared asset cache (base file plus parts) and return its path."""
-    store = _cdse_asset_store(cache_root)
-    return store.read(), store.path
 
 
 def _cdse_cache_root(scenes_cache: Path, cache_dir: Path | None) -> Path:
@@ -387,7 +366,7 @@ def query_cdse(
         top=top,
         count=count,
     )
-    query_dir = query_cache_dir(cache_dir, cache_key)
+    query_dir = cache_directory(cache_dir, cache_key)
     scenes_cache = query_dir / "scenes.parquet"
 
     # If cached products exist, don't bother querying
@@ -596,10 +575,6 @@ class ResolvedBand:
     resolution: int
     fallback_used: bool = False
     original_resolution: int | None = None
-
-    @property
-    def resolution_dir(self) -> str:
-        return f"R{self.resolution}m"
 
     def __repr__(self) -> str:
         if self.fallback_used:

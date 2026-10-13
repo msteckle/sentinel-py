@@ -108,16 +108,10 @@ def test_version_mismatch_is_rejected(tmp_path: Path):
 
 
 def test_registry_paths_match_module_constants(tmp_path: Path):
-    from sentinel_py.download.cdse import (
-        CDSE_ASSET_CACHE_NAME,
-        CDSE_SCENE_CATALOG_NAME,
-    )
     from sentinel_py.download.s1_orbits import ORBIT_STATE_RELPATH
     from sentinel_py.pipeline.readers.s1 import CATALOG_RELPATH
     from sentinel_py.pipeline.writers.cog import cog_state_path
 
-    assert CDSE_ASSET_CACHE_NAME == REGISTRY["cdse_assets"].relpath
-    assert CDSE_SCENE_CATALOG_NAME == REGISTRY["cdse_scene_catalog"].relpath
     assert ORBIT_STATE_RELPATH == Path(REGISTRY["s1_orbits"].relpath)
     assert CATALOG_RELPATH == Path(REGISTRY["s1_catalog"].relpath)
     assert cog_state_path(tmp_path) == REGISTRY["cog_outputs"].path(tmp_path)

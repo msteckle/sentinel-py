@@ -6,9 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from sentinel_py.cache.base import (
-    DEFAULT_ASF_CACHE_DIR,
     DEFAULT_CDSE_CACHE_DIR,
-    DEFAULT_PGC_CACHE_DIR,
     DEFAULT_PIPELINE_CACHE_DIR,
 )
 from sentinel_py.cache.rowstore import RowStore
@@ -150,10 +148,3 @@ _ENTRIES = (
 )
 
 REGISTRY: dict[str, CacheNamespace] = {entry.name: entry for entry in _ENTRIES}
-
-# Provider roots that hold keyed query directories rather than named files.
-QUERY_ROOTS: dict[str, Path] = {
-    "asf": DEFAULT_ASF_CACHE_DIR,
-    "cdse": DEFAULT_CDSE_CACHE_DIR,
-    "pgc": DEFAULT_PGC_CACHE_DIR,
-}

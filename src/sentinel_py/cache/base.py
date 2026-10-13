@@ -145,22 +145,6 @@ def write_parquet_atomic(
         temporary.unlink(missing_ok=True)
 
 
-def write_csv_atomic(
-    dataframe: pd.DataFrame,
-    path: Path,
-    *,
-    index: bool = False,
-) -> None:
-    """Atomically replace a CSV file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = _temporary_sibling(path)
-    try:
-        dataframe.to_csv(temporary, index=index)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
 def merge_state_rows(
     existing: pd.DataFrame,
     new_rows: Iterable[dict[str, Any]],

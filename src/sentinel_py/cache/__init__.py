@@ -18,12 +18,10 @@ from sentinel_py.cache.base import (
     mark_cache_used,
     merge_parquet_cache,
     merge_state_rows,
-    write_csv_atomic,
     write_json_atomic,
     write_parquet_atomic,
 )
 from sentinel_py.cache.registry import (
-    QUERY_ROOTS,
     REGISTRY,
     CacheNamespace,
 )
@@ -35,7 +33,6 @@ __all__ = [
     "DEFAULT_CDSE_CACHE_DIR",
     "DEFAULT_PGC_CACHE_DIR",
     "DEFAULT_PIPELINE_CACHE_DIR",
-    "QUERY_ROOTS",
     "REGISTRY",
     "SENTINEL_PY_HOME",
     "SENTINEL_PY_HOME_ENV",
@@ -50,7 +47,6 @@ __all__ = [
     "mark_cache_used",
     "merge_parquet_cache",
     "merge_state_rows",
-    "write_csv_atomic",
     "write_json_atomic",
     "write_parquet_atomic",
 ]

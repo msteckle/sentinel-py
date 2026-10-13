@@ -598,39 +598,6 @@ class S2SourceConfig:
     data_dir: Path
     source_type: str = "s2.l2a.local"
 
-    @classmethod
-    def from_mapping(cls, raw: Any, base_dir: Path):
-        # Parse the sources section of the pipeline configuration
-        values = _mapping(raw, "sources")
-        if not values:
-            raise PipelineConfigError("sources must define at least one source")
-
-        # Loop through each source defined in the configuration
-        sources: dict[str, S2SourceConfig] = {}
-        for raw_id, raw_source in values.items():
-            # Ensure the source identifier is valid and extract the mapping
-            source_id = _identifier(raw_id, "source identifiers")
-            value = _mapping(raw_source, f"sources.{source_id}")
-            _only_keys(value, {"type", "data_dir"}, f"sources.{source_id}")
-
-            # Extract and validate the source type and data directory
-            source_type = _required(value, "type", f"sources.{source_id}")
-            if source_type != "s2.l2a.local":
-                raise PipelineConfigError(
-                    f"sources.{source_id}.type must be s2.l2a.local"
-                )
-            data_dir = _resolve_path(
-                _required(value, "data_dir", f"sources.{source_id}"),
-                base_dir,
-                f"sources.{source_id}.data_dir",
-            )
-            if not data_dir.is_dir():
-                raise PipelineConfigError(
-                    f"S2 source directory does not exist: {data_dir}"
-                )
-            sources[source_id] = S2SourceConfig(source_id, data_dir, source_type)
-        return sources
-
 
 @dataclass(frozen=True)
 class DEMSourceConfig:

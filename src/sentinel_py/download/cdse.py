@@ -1,6 +1,7 @@
 import calendar
 import logging
 import os
+import random
 import re
 import shutil
 import signal
@@ -28,6 +29,8 @@ from rich.progress import (
 )
 
 from sentinel_py.cache import (
+    REGISTRY,
+    RowStore,
     cache_directory,
     deterministic_cache_key,
     find_latest_cache_file,
@@ -38,7 +41,10 @@ from sentinel_py.cache import (
     write_json_atomic,
     write_parquet_atomic,
 )
-from sentinel_py.download.preflight import DownloadStorageSummary
+from sentinel_py.download.preflight import (
+    DownloadStorageSummary,
+    extrapolate_total,
+)
 
 # fix some phidown limitations
 _phidown_search.REQUEST_TIMEOUT_SECONDS = 120
@@ -74,6 +80,8 @@ COARSER_FALLBACK_BANDS = {"SCL"}
 
 # Columns used to uniquely identify an image in the downloaded images cache
 IMAGE_KEY_COLS = ["safedir", "img_path_in_safedir"]
+# Scenes listed by the storage preflight; larger manifests are extrapolated.
+DEFAULT_ESTIMATE_SAMPLE_SIZE = 200
 SCENE_CACHE_COLUMNS = [
     "Id",
     "Name",
@@ -83,9 +91,9 @@ SCENE_CACHE_COLUMNS = [
     "query_id",
 ]
 S2_METADATA_ASSETS = {"MTD_MSIL2A", "MTD_MSIL1C", "MTD_TL"}
-CDSE_ASSET_CACHE_NAME = "assets.parquet"
+CDSE_ASSET_CACHE_NAME = REGISTRY["cdse_assets"].relpath
 CDSE_LEGACY_ASSET_CACHE_NAME = "all_downloaded_images.parquet"
-CDSE_SCENE_CATALOG_NAME = "catalog.parquet"
+CDSE_SCENE_CATALOG_NAME = REGISTRY["cdse_scene_catalog"].relpath
 
 ########################################################################################
 # Variable helpers
@@ -221,25 +229,39 @@ def cdse_scene_catalog_path(cache_root: Path) -> Path:
     return Path(cache_root) / CDSE_SCENE_CATALOG_NAME
 
 
-def _read_cdse_asset_cache(cache_root: Path) -> tuple[pd.DataFrame, Path]:
-    """Read the shared asset cache, migrating its legacy filename when needed."""
-    path = cdse_asset_cache_path(cache_root)
+def _cdse_asset_store(cache_root: Path) -> RowStore:
+    """Open the shared asset cache, migrating its legacy filename when needed.
+
+    Parameters
+    ----------
+    cache_root : pathlib.Path
+        CDSE provider cache root.
+
+    Returns
+    -------
+    sentinel_py.cache.RowStore
+        Store whose reads include every flushed part. All writers must append
+        through this store so newer rows always override older ones.
+    """
+    store = REGISTRY["cdse_assets"].store(cache_root, read_only=True)
     legacy_path = Path(cache_root) / CDSE_LEGACY_ASSET_CACHE_NAME
     legacy_root = legacy_provider_cache_root(cache_root)
     if not legacy_path.is_file() and legacy_root is not None:
         legacy_path = legacy_root / CDSE_LEGACY_ASSET_CACHE_NAME
-    if path.is_file():
-        return pd.read_parquet(path), path
-    if legacy_path.is_file():
-        cached = pd.read_parquet(legacy_path)
-        migrated = merge_parquet_cache(
-            path,
-            cached,
+    if not store.path.is_file() and legacy_path.is_file():
+        merge_parquet_cache(
+            store.path,
+            pd.read_parquet(legacy_path),
             key_columns=IMAGE_KEY_COLS,
             read_only=True,
         )
-        return migrated, path
-    return pd.DataFrame(), path
+    return store
+
+
+def _read_cdse_asset_cache(cache_root: Path) -> tuple[pd.DataFrame, Path]:
+    """Read the shared asset cache (base file plus parts) and return its path."""
+    store = _cdse_asset_store(cache_root)
+    return store.read(), store.path
 
 
 def _cdse_cache_root(scenes_cache: Path, cache_dir: Path | None) -> Path:
@@ -1301,17 +1323,26 @@ def prepare_cdse_download(
     parallel_scenes: int = 2,
     logger: logging.Logger | None = None,
     cache_dir: Path | None = None,
+    sample_size: int = DEFAULT_ESTIMATE_SAMPLE_SIZE,
 ) -> DownloadStorageSummary:
-    """Build a metadata-only download plan and calculate its storage requirements.
+    """Estimate the storage required by a download from a sample of scenes.
 
     The CDSE query manifest identifies scenes, but it does not contain the sizes of
-    the individual bands and metadata files selected by the download command. This
-    preflight therefore reuses previously resolved asset metadata when possible and
-    lists only missing assets in CDSE S3. It caches those listings, compares their
-    expected sizes with files already present in ``output_dir``, and returns the
-    resulting storage summary. ``cache_dir`` identifies the shared CDSE cache root;
+    the individual bands and metadata files selected by the download command.
+    Listing every scene in S3 only to report a size is slow for large manifests, so
+    this preflight lists a deterministic random sample of ``sample_size`` scenes
+    (reusing the shared asset cache), compares their expected sizes with files
+    already present in ``output_dir``, and extrapolates the totals with a 95%
+    confidence interval. Manifests no larger than ``sample_size`` are resolved
+    exactly. Sampled listings are checkpointed to the shared cache, so they are not
+    repeated by the download. ``cache_dir`` identifies the shared CDSE cache root;
     when omitted by lower-level callers, it is inferred from ``scenes_cache``. This
     function does not download image or metadata content.
+
+    Parameters
+    ----------
+    sample_size : int, default 200
+        Number of scenes to list. The same manifest always yields the same sample.
     """
     logger = logger or logging.getLogger(__name__)
 
@@ -1325,14 +1356,46 @@ def prepare_cdse_download(
             f"{required_cols - set(scenes.columns)}"
         )
 
+    # Choose the scenes to resolve. The sample is deterministic for a given manifest,
+    # so reruns reuse the listings that were cached for it.
+    total_scenes = len(scenes)
+    sample_size = max(1, int(sample_size))
+    if total_scenes > sample_size:
+        names = sorted(scenes["Name"].astype(str))
+        seed = int(
+            deterministic_cache_key(
+                {"count": total_scenes, "first": names[0], "last": names[-1]}
+            ),
+            16,
+        )
+        chosen = sorted(random.Random(seed).sample(range(total_scenes), sample_size))
+        sampled_scenes = scenes.iloc[chosen]
+    else:
+        sampled_scenes = scenes
+    logger.info(
+        "Estimating storage from %d of %d scene(s)", len(sampled_scenes), total_scenes
+    )
+
     # 2. Load the shared remote-asset cache. Unlike the output-scoped download state,
     #    this cache records which S3 objects belong to each scene and their sizes, so
     #    it can be reused by different queries and output directories.
     cache_root = _cdse_cache_root(scenes_cache, cache_dir)
     update_cdse_scene_catalog(cache_root, scenes)
-    cached_images, images_file = _read_cdse_asset_cache(cache_root)
+    asset_store = _cdse_asset_store(cache_root)
+    images_file = asset_store.path
+    cached_images = asset_store.read()
     if not cached_images.empty and "local_actual_size" not in cached_images.columns:
         cached_images["local_actual_size"] = None
+
+    # Index the cache once by scene so the per-scene checks below are dictionary
+    # lookups instead of full-column scans over every cached asset row.
+    assets_by_scene: dict[str, pd.DataFrame] = {}
+    if not cached_images.empty and "safedir" in cached_images.columns:
+        wanted_scenes = set(sampled_scenes["Name"].astype(str))
+        in_query = cached_images[cached_images["safedir"].isin(wanted_scenes)]
+        assets_by_scene = {
+            str(name): frame for name, frame in in_query.groupby("safedir", sort=False)
+        }
 
     # 3. Convert the requested Sentinel-2 bands to resolutions that actually exist in
     #    CDSE. For example, a requested resolution may need the repository's documented
@@ -1344,10 +1407,8 @@ def prepare_cdse_download(
 
     def _selected_cached_assets(scene_name: str) -> list[dict] | None:
         """Return a complete cached asset selection, or None if S3 must be listed."""
-        if cached_images.empty or "safedir" not in cached_images.columns:
-            return None
-        scene_assets = cached_images[cached_images["safedir"] == scene_name]
-        if scene_assets.empty:
+        scene_assets = assets_by_scene.get(scene_name)
+        if scene_assets is None or scene_assets.empty:
             return None
 
         if mission.upper() == "S2" and resolved_bands is not None:
@@ -1376,16 +1437,14 @@ def prepare_cdse_download(
 
             # Ignore other bands that may have been resolved by an earlier command;
             # only the assets belonging to this request contribute to its size.
-            selected = scene_assets[
-                scene_assets.apply(
-                    lambda row: (
-                        (str(row["band_name"]), int(row.get("resolution_m") or 0))
-                        in requested_keys
-                        or str(row["band_name"]) in metadata_names
-                    ),
-                    axis=1,
+            keep = [
+                key in requested_keys or key[0] in metadata_names
+                for key in zip(
+                    scene_assets["band_name"].astype(str),
+                    scene_assets["resolution_m"].fillna(0).astype(int),
                 )
             ]
+            selected = scene_assets[keep]
         else:
             # Sentinel-1 assets have no band-resolution pairing or SAFE metadata
             # requirement, so names alone determine whether the cache is complete.
@@ -1402,7 +1461,7 @@ def prepare_cdse_download(
     #    by the cache and scenes that still require metadata-only S3 listings.
     selected_by_scene: dict[str, list[dict]] = {}
     rows_to_resolve: list[pd.Series] = []
-    for _, row in scenes.iterrows():
+    for _, row in sampled_scenes.iterrows():
         scene_name = str(row["Name"])
         selected = _selected_cached_assets(scene_name)
         if selected is None:
@@ -1438,62 +1497,80 @@ def prepare_cdse_download(
 
     # 5. Resolve uncached scenes concurrently. The returned rows contain S3 paths and
     #    reported sizes only; the actual file-transfer functions are not called here.
-    newly_resolved: list[dict] = []
+    #    Rows are checkpointed to the shared cache in batches as scenes complete, so an
+    #    interrupted preflight resumes from where it stopped instead of starting over.
+    resolved_rows = 0
     if rows_to_resolve:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-        ) as progress:
+        with (
+            asset_store.writer(batch_rows=2000, flush_seconds=60.0) as writer,
+            Progress(
+                SpinnerColumn(),
+                TextColumn("[bold blue]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+            ) as progress,
+        ):
             task_id = progress.add_task(
                 "Resolving assets for storage estimate",
                 total=len(rows_to_resolve),
             )
             with ThreadPoolExecutor(max_workers=parallel_scenes) as pool:
                 futures = [pool.submit(_resolve, row) for row in rows_to_resolve]
-                for future in as_completed(futures):
-                    scene_name, images = future.result()
-                    selected_by_scene[scene_name] = images
-                    newly_resolved.extend(images)
-                    progress.update(task_id, advance=1)
-
-    # 6. Persist newly discovered remote metadata. A cancelled download can therefore
-    #    reuse this preflight work the next time it is invoked.
-    if newly_resolved:
-        merge_parquet_cache(
-            images_file,
-            pd.DataFrame(newly_resolved),
-            key_columns=IMAGE_KEY_COLS,
-            read_only=True,
-        )
+                try:
+                    for future in as_completed(futures):
+                        scene_name, images = future.result()
+                        selected_by_scene[scene_name] = images
+                        # One call per scene keeps a scene's rows in the same part.
+                        writer.add(images)
+                        resolved_rows += len(images)
+                        progress.update(task_id, advance=1)
+                except BaseException:
+                    # Do not wait for the remaining queued listings after an error
+                    # or interrupt; completed scenes are flushed by the writer.
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    raise
         logger.info(
-            "Cached %d resolved CDSE asset row(s) in %s",
-            len(newly_resolved),
-            images_file,
+            "Cached %d resolved CDSE asset row(s) in %s", resolved_rows, images_file
         )
 
-    # 7. Sum the final dataset footprint and the additional bytes currently needed.
-    #    _scene_storage_bytes stats local files, so correctly sized existing assets do
-    #    not count toward additional storage. Unknown S3 sizes are reported separately.
-    known_total = 0
-    known_additional = 0
-    unknown = 0
+    # 7. Measure each sampled scene's final footprint and the additional bytes still
+    #    needed. _scene_storage_bytes stats local files, so correctly sized existing
+    #    assets do not count toward additional storage. Unknown S3 sizes are reported
+    #    separately. Totals are exact for the whole manifest or extrapolated.
+    footprints: list[float] = []
+    additionals: list[float] = []
     asset_count = 0
-    for scene_name in scenes["Name"].astype(str):
+    unknown = 0
+    for scene_name in sampled_scenes["Name"].astype(str):
         images = selected_by_scene.get(scene_name, [])
         asset_count += len(images)
         footprint, additional = _scene_storage_bytes(scene_name, images, output_dir)
-        known_total += footprint
-        known_additional += additional
+        footprints.append(footprint)
+        additionals.append(additional)
         unknown += sum(int(image.get("s3_expected_size") or 0) <= 0 for image in images)
 
+    sampled = len(sampled_scenes)
+    if sampled >= total_scenes:
+        return DownloadStorageSummary(
+            asset_count=asset_count,
+            known_total_bytes=int(sum(footprints)),
+            known_additional_bytes=int(sum(additionals)),
+            unknown_size_assets=unknown,
+        )
+
+    total_bytes, total_ci = extrapolate_total(footprints, total_scenes)
+    additional_bytes, additional_ci = extrapolate_total(additionals, total_scenes)
     return DownloadStorageSummary(
-        asset_count=asset_count,
-        known_total_bytes=known_total,
-        known_additional_bytes=known_additional,
+        asset_count=round(asset_count * total_scenes / sampled),
+        known_total_bytes=int(total_bytes),
+        known_additional_bytes=int(additional_bytes),
         unknown_size_assets=unknown,
+        is_estimate=True,
+        sampled_scenes=sampled,
+        total_scenes=total_scenes,
+        total_ci95_bytes=int(total_ci),
+        additional_ci95_bytes=int(additional_ci),
     )
 
 
@@ -1563,8 +1640,10 @@ def resolve_and_download(
     # scoped to output_dir so two storage roots cannot accidentally share local state.
     cache_root = _cdse_cache_root(scenes_cache, cache_dir)
     update_cdse_scene_catalog(cache_root, scenes)
-    cached_images, images_file = _read_cdse_asset_cache(cache_root)
-    downloads_file = output_dir / ".sentinel-py" / "cdse_downloads.parquet"
+    asset_store = _cdse_asset_store(cache_root)
+    images_file = asset_store.path
+    cached_images = asset_store.read()
+    downloads_file = REGISTRY["cdse_downloads"].path(output_dir)
     logger.info(f"Looking for images cache at: {images_file}")
     if not cached_images.empty:
         # ensure local_actual_size column exists for back-compat with older caches
@@ -1578,6 +1657,11 @@ def resolve_and_download(
             )
         )
         cached_scene_names = set(cached_images["safedir"].unique())
+        # Per-scene asset-name sets, built once, for the metadata completeness check.
+        scene_asset_names_by_scene = {
+            str(name): set(frame.astype(str))
+            for name, frame in cached_images.groupby("safedir", sort=False)["band_name"]
+        }
         logger.info(
             "Found %d scenes (%d rows) in %s",
             len(cached_scene_names),
@@ -1590,6 +1674,7 @@ def resolve_and_download(
         logger.info(f"No images cache at {images_file}")
         cached_keys = set()
         cached_scene_names = set()
+        scene_asset_names_by_scene = {}
 
     local_downloads = (
         pd.read_parquet(downloads_file) if downloads_file.exists() else pd.DataFrame()
@@ -1617,12 +1702,7 @@ def resolve_and_download(
         # Require metadata assets for S2 scenes, otherwise the scene is not fully cached
         if mission.upper() == "S2":
             metadata_name = "MTD_MSIL1C" if "MSIL1C" in name.upper() else "MTD_MSIL2A"
-            scene_asset_names = set(
-                cached_images.loc[
-                    cached_images["safedir"] == name,
-                    "band_name",
-                ].astype(str)
-            )
+            scene_asset_names = scene_asset_names_by_scene.get(name, set())
             if (
                 metadata_name not in scene_asset_names
                 or "MTD_TL" not in scene_asset_names
@@ -1679,13 +1759,8 @@ def resolve_and_download(
             rows_to_write = list(pending_image_rows)
             pending_image_rows.clear()
 
-        # Merge against the latest shared cache while holding its interprocess lock.
-        merge_parquet_cache(
-            images_file,
-            pd.DataFrame(rows_to_write),
-            key_columns=IMAGE_KEY_COLS,
-            read_only=True,
-        )
+        # Append one immutable part; newer rows override older ones when read.
+        asset_store.append(rows_to_write)
         completed_rows = [
             row for row in rows_to_write if row.get("download_status") == "complete"
         ]
@@ -1963,6 +2038,9 @@ def resolve_and_download(
 
             # flush any remaining updates from the cached-scenes pass
             _flush_images(force=True)
+
+    # Fold this run's checkpoint parts back into the base asset file.
+    asset_store.compact()
 
     # Summary --------------------------------------------------------------------------
     total_ok = sum(len(r.succeeded) for r in all_results)

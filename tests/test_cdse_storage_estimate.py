@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from sentinel_py.download.cdse import (
     StorageEstimator,
@@ -179,3 +180,98 @@ def test_prepare_cdse_download_resolves_sizes_without_downloading(
     assert summary.known_additional_bytes == 15
     assert summary.unknown_size_assets == 0
     assert (tmp_path / "cache" / "assets.parquet").exists()
+
+
+def _scene_images(scene_name: str, size: int) -> list[dict]:
+    base = {"safedir": scene_name, "s3_path": "/t", "local_actual_size": None}
+    return [
+        {**base, "band_name": "B04", "resolution_m": 20,
+         "img_path_in_safedir": "B04.jp2", "s3_expected_size": size,
+         "asset_type": "image"},
+        {**base, "band_name": "MTD_MSIL2A", "resolution_m": 0,
+         "img_path_in_safedir": "MTD_MSIL2A.xml", "s3_expected_size": 10,
+         "asset_type": "metadata"},
+        {**base, "band_name": "MTD_TL", "resolution_m": 0,
+         "img_path_in_safedir": "GRANULE/MTD_TL.xml", "s3_expected_size": 5,
+         "asset_type": "metadata"},
+    ]
+
+
+def test_extrapolate_total_is_exact_for_full_sample_and_has_error_bar():
+    from sentinel_py.download.preflight import extrapolate_total
+
+    assert extrapolate_total([10.0, 10.0, 10.0], 3) == (30.0, 0.0)
+    assert extrapolate_total([], 10) == (0.0, 0.0)
+
+    total, half_width = extrapolate_total([8.0, 10.0, 12.0, 10.0], 100)
+    assert total == pytest.approx(1000.0)
+    assert 0 < half_width < 200
+
+    constant_total, constant_ci = extrapolate_total([5.0] * 20, 1000)
+    assert constant_total == pytest.approx(5000.0)
+    assert constant_ci == 0.0
+
+
+def test_prepare_cdse_download_lists_only_a_deterministic_sample(
+    tmp_path: Path, monkeypatch
+):
+    scenes_cache = tmp_path / "cache" / "query" / "scenes.parquet"
+    scenes_cache.parent.mkdir(parents=True)
+    names = [f"S2A_SCENE{n:03d}_MSIL2A.SAFE" for n in range(50)]
+    pd.DataFrame({"Name": names, "S3Path": [f"/eodata/{n}" for n in names]}).to_parquet(
+        scenes_cache, index=False
+    )
+    listed: list[str] = []
+
+    def fake_find(scene_name, *args, **kwargs):
+        listed.append(scene_name)
+        return _scene_images(scene_name, 100)
+
+    monkeypatch.setattr("sentinel_py.download.cdse._find_s2_scene_images", fake_find)
+    kwargs = dict(
+        scenes_cache=scenes_cache, mission="S2", bands=["B04"], resolution=20,
+        output_dir=tmp_path / "downloads", config_file=str(tmp_path / ".s5cfg"),
+        sample_size=10,
+    )
+
+    summary = prepare_cdse_download(**kwargs)
+
+    assert len(listed) == 10
+    assert summary.is_estimate
+    assert (summary.sampled_scenes, summary.total_scenes) == (10, 50)
+    assert summary.asset_count == 150  # 3 assets per scene, extrapolated to 50
+    assert summary.known_total_bytes == 50 * 115
+    assert summary.total_ci95_bytes == 0  # identical scenes: no sampling variance
+
+    # The same manifest chooses the same sample, which is now served from cache.
+    first_sample = set(listed)
+    listed.clear()
+    again = prepare_cdse_download(**kwargs)
+    assert listed == []
+    assert again == summary
+    assert len(first_sample) == 10
+
+
+def test_estimate_always_prompts_but_exact_complete_download_does_not(monkeypatch):
+    from sentinel_py.download.preflight import (
+        DownloadStorageSummary,
+        confirm_download,
+    )
+
+    prompts = []
+    monkeypatch.setattr(
+        "sentinel_py.download.preflight.typer.confirm",
+        lambda *a, **k: prompts.append(1) or True,
+    )
+
+    confirm_download(
+        assume_yes=False, storage=DownloadStorageSummary(10, 100, 0)
+    )
+    assert prompts == []
+
+    confirm_download(
+        assume_yes=False,
+        storage=DownloadStorageSummary(10, 100, 0, is_estimate=True,
+                                       sampled_scenes=5, total_scenes=50),
+    )
+    assert prompts == [1]

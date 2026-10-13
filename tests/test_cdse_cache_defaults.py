@@ -347,3 +347,37 @@ def test_cdse_download_parses_supplied_parameters_before_downloading(
     assert type(calls["mission"]) is str
     assert all(type(band) is str for band in calls["bands"])
     assert type(calls["resolution"]) is int
+
+
+def test_cdse_download_can_skip_storage_estimate(tmp_path: Path, monkeypatch):
+    config = tmp_path / ".s5cfg"
+    _write_s5_config(config)
+    query_cache = tmp_path / "scenes.parquet"
+    pd.DataFrame(
+        {"Name": ["S2A_ONE.SAFE"], "S3Path": ["/eodata/one"]}
+    ).to_parquet(query_cache, index=False)
+    prepared = []
+    downloaded = {}
+
+    monkeypatch.setattr(
+        "sentinel_py.download.cdse.prepare_cdse_download",
+        lambda **kwargs: prepared.append(kwargs),
+    )
+    monkeypatch.setattr(
+        "sentinel_py.download.cdse.resolve_and_download",
+        lambda **kwargs: downloaded.update(kwargs),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "cdse", "download", "--mission", "S2", "--bands", "B04",
+            "--outdir", str(tmp_path), "--res", "20", "--config", str(config),
+            "--query", str(query_cache), "--skip-storage-estimate", "--yes",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    assert prepared == []
+    assert downloaded["scenes_cache"] == query_cache
+    assert "Skipping the storage estimate" in result.stdout

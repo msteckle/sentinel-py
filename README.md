@@ -251,12 +251,7 @@ sentinel-py asf download \
   --retries 3
 ```
 
-Before transferring files, both ASF and CDSE download commands print the selected
-manifest, resolved asset count, known final dataset size, known additional storage
-needed after accounting for valid local files, and the number of assets with unknown
-sizes. They then use a standard `Continue with download? [y/N]` confirmation. CDSE
-resolves and caches the requested S3 asset metadata before displaying this summary;
-that preflight does not download image data. Pass `--yes` (or `-y`) only for an
+Before transferring files, ASF and CDSE download commands print the selected manifest, an asset count, the final dataset size, the additional storage needed after accounting for valid local files, and the number of assets with unknown sizes. They then use a standard `Continue with download? [y/N]` confirmation. CDSE does not list every scene in S3 for this summary: it lists a deterministic random sample of scenes (`--estimate-sample-size`, default 200), extrapolates the totals with a 95% confidence interval, and caches the listings so the download reuses them; manifests no larger than the sample are resolved exactly, and the preflight never downloads image data. An estimate always asks for confirmation. Use `--skip-storage-estimate` to skip the listing entirely (scenes are then resolved as they download). Pass `--yes` (or `-y`) only for an
 intentional noninteractive run, such as a batch script:
 
 ```bash

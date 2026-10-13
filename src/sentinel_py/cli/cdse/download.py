@@ -6,7 +6,7 @@ from typing import Annotated
 import pandas as pd
 import typer
 
-from sentinel_py.cache import DEFAULT_CDSE_CACHE_DIR
+from sentinel_py.cache import DEFAULT_CDSE_CACHE_DIR, REGISTRY
 from sentinel_py.download.preflight import confirm_download, echo_storage_summary
 from sentinel_py.enums import S2DownloadAssets, S2Res
 from sentinel_py.log import DEFAULT_LOG_DIR, get_logger
@@ -143,6 +143,30 @@ def download(
             rich_help_panel="Optional Download Configurations",
         ),
     ] = 4,
+    estimate_sample_size: Annotated[
+        int,
+        typer.Option(
+            help=(
+                "Number of scenes listed to estimate the download size. Larger "
+                "manifests are extrapolated from this random sample; manifests no "
+                "larger than the sample are resolved exactly."
+            ),
+            min=1,
+            rich_help_panel="Optional Download Configurations",
+        ),
+    ] = 200,
+    skip_storage_estimate: Annotated[
+        bool,
+        typer.Option(
+            "--skip-storage-estimate",
+            help=(
+                "Do not list any scenes before downloading. The download still "
+                "resolves each scene as it runs, and still asks for confirmation "
+                "unless --yes is given."
+            ),
+            rich_help_panel="Optional Download Configurations",
+        ),
+    ] = False,
     yes: Annotated[
         bool,
         typer.Option(
@@ -231,27 +255,33 @@ def download(
         f"Found {scene_count} scenes: "
         f"{requested_images_per_scene} requested {image_label} per scene"
     )
-    storage = prepare_cdse_download(
-        scenes_cache=query,
-        mission=mission_value,
-        bands=band_values,
-        resolution=resolution_value,
-        output_dir=outdir,
-        config_file=str(config),
-        parallel_scenes=parallel_scenes,
-        logger=logger,
-        cache_dir=cache_dir,
-    )
-    echo_storage_summary(storage)
-    logger.info(
-        "CDSE download preflight: manifest=%s assets=%d known_total_bytes=%d "
-        "known_additional_bytes=%d unknown_size_assets=%d",
-        query,
-        storage.asset_count,
-        storage.known_total_bytes,
-        storage.known_additional_bytes,
-        storage.unknown_size_assets,
-    )
+    storage = None
+    if skip_storage_estimate:
+        typer.echo("Skipping the storage estimate; scenes are resolved while downloading.")
+    else:
+        storage = prepare_cdse_download(
+            scenes_cache=query,
+            mission=mission_value,
+            bands=band_values,
+            resolution=resolution_value,
+            output_dir=outdir,
+            config_file=str(config),
+            parallel_scenes=parallel_scenes,
+            logger=logger,
+            cache_dir=cache_dir,
+            sample_size=estimate_sample_size,
+        )
+        echo_storage_summary(storage)
+        logger.info(
+            "CDSE download preflight: manifest=%s estimate=%s assets=%d "
+            "known_total_bytes=%d known_additional_bytes=%d unknown_size_assets=%d",
+            query,
+            storage.is_estimate,
+            storage.asset_count,
+            storage.known_total_bytes,
+            storage.known_additional_bytes,
+            storage.unknown_size_assets,
+        )
     confirm_download(assume_yes=yes, storage=storage)
 
     started = time.time()
@@ -274,7 +304,7 @@ def download(
     downloaded = sum(len(result.succeeded) for result in (results or []))
     skipped = sum(len(result.skipped) for result in (results or []))
     failed = sum(len(result.failed) for result in (results or []))
-    status_file = outdir / ".sentinel-py" / "cdse_downloads.parquet"
+    status_file = REGISTRY["cdse_downloads"].path(outdir)
 
     typer.echo("Summary:")
     typer.echo(f"  Download started: {started_text}")

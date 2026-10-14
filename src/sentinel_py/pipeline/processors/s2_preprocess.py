@@ -234,11 +234,12 @@ class S2PreprocessProcessor(BaseProcessor):
         reported = -1
 
         def report(completed: int, total: int) -> None:
-            """Make pre-writer source work visible on the normal console."""
+            """Log source sampling progress at roughly 10% intervals."""
             nonlocal reported
-            if completed in {0, total} or completed - reported >= 25:
+            step = max(1, -(-total // 10))
+            if completed in {0, total} or completed - reported >= step:
                 reported = completed
-                context.logger.warning(
+                context.logger.info(
                     "Sampling Sentinel-2 point scene/windows: %d/%d", completed, total
                 )
 

@@ -88,6 +88,11 @@ SCENE_CACHE_COLUMNS = [
 CDSE_LEGACY_ASSET_CACHE_NAME = "all_downloaded_images.parquet"
 DEFAULT_S5CMD_CONFIG = ".s5cfg"
 CDSE_ENDPOINT_URL = "https://eodata.dataspace.copernicus.eu"
+# s5cmd defaults (256 workers; 5 x 50 MiB multipart buffers per ``cp``) can use
+# hundreds of MiB per process. Each of our s5cmd calls handles one object or one
+# listing, so a single worker and small parts keep login-node memory bounded.
+S5CMD_NUMWORKERS = 1
+S5CMD_CP_FLAGS = "--concurrency 2 --part-size 16"
 
 
 def s2_metadata_name(scene_name: str) -> str:
@@ -821,6 +826,7 @@ def _list_scene_assets(
     output = run_s5cmd_with_config(
         f'ls "{pattern}"',
         config_file=config_file,
+        max_workers=S5CMD_NUMWORKERS,
     )
     # Assets are items of (size, path relative to SAFE product) for each listed S3 obj
     assets: list[tuple[int, str]] = []
@@ -1042,7 +1048,9 @@ def _find_s1_scene_images(
         pattern = f"s3://eodata{s3_path}/measurement/*-{pol.lower()}-*.tiff"
         cmd = f'ls "{pattern}"'
         try:
-            output = run_s5cmd_with_config(cmd, config_file=config_file)
+            output = run_s5cmd_with_config(
+                cmd, config_file=config_file, max_workers=S5CMD_NUMWORKERS
+            )
         except FileNotFoundError as e:
             raise _s5cmd_unavailable(config_file) from e
         except Exception:
@@ -1102,9 +1110,10 @@ def download_s3_file(
         temporary.unlink(missing_ok=True)
         try:
             run_s5cmd_with_config(
-                f'cp "{s3_uri}" "{temporary}"',
+                f'cp {S5CMD_CP_FLAGS} "{s3_uri}" "{temporary}"',
                 config_file=config_file,
                 endpoint_url=endpoint_url,
+                max_workers=S5CMD_NUMWORKERS,
             )
         except subprocess.CalledProcessError as error:
             if error.returncode in {-signal.SIGINT, -signal.SIGTERM}:

@@ -105,6 +105,11 @@ class OrbitStagingSummary:
     failed: int = 0
     messages: list[str] = field(default_factory=list)
 
+    @property
+    def scene_count(self) -> int:
+        """Return how many GRD/SLC scenes were considered by this invocation."""
+        return self.staged + self.reused + len(self.missing) + self.failed
+
 
 def _utc(value: str) -> datetime:
     """Parse an orbit-listing timestamp as a UTC datetime."""

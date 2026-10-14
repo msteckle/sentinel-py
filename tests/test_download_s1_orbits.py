@@ -202,6 +202,11 @@ def test_download_cli_stages_orbits_and_honors_none(tmp_path: Path, monkeypatch)
         return OrbitStagingSummary(staged=1, messages=["Orbit staging: 1 scene(s)"])
 
     monkeypatch.setattr("sentinel_py.cli.asf.download.stage_orbits", fake_stage)
+    egm_calls = []
+    monkeypatch.setattr(
+        "sentinel_py.cli.asf.download.stage_egm96",
+        lambda outdir, **kwargs: egm_calls.append(outdir) or outdir / "egm96.zip",
+    )
     base = [
         "asf", "download", "--outdir", str(tmp_path / "out"), "--cache-dir",
         str(cache_dir), "--config", str(config), "--yes", "--log", str(tmp_path / "log"),
@@ -210,10 +215,14 @@ def test_download_cli_stages_orbits_and_honors_none(tmp_path: Path, monkeypatch)
     assert result.exit_code == 0, result.stderr
     assert calls == [(tmp_path / "out", S1OrbitPolicy.precise_or_restituted)]
     assert "Orbit staging: 1 scene(s)" in result.stdout
+    # The EGM96 grid SNAP needs is staged beside the orbits in the same command.
+    assert egm_calls == [tmp_path / "out"]
+    assert "EGM96 grid:" in result.stdout
 
     calls.clear()
+    egm_calls.clear()
     result = CliRunner().invoke(app, [*base, "--orbits", "none"])
-    assert result.exit_code == 0 and calls == []
+    assert result.exit_code == 0 and calls == [] and egm_calls == []
 
 
 SECOND_SCENE = "S1A_IW_GRDH_1SDV_20240901T164404_20240901T164429_055699_06C000_ABCD"

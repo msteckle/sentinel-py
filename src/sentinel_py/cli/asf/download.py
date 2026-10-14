@@ -3,6 +3,7 @@
 from pathlib import Path
 from typing import Annotated
 
+import requests
 import typer
 
 from sentinel_py.cache import DEFAULT_ASF_CACHE_DIR
@@ -28,6 +29,7 @@ from sentinel_py.download.preflight import (
     manifest_storage_summary,
 )
 from sentinel_py.download.s1_orbits import stage_orbits
+from sentinel_py.download.snap_auxdata import stage_egm96
 from sentinel_py.enums import S1OrbitPolicy
 from sentinel_py.log import get_logger
 
@@ -200,6 +202,17 @@ def download(
             for message in orbit_summary.messages:
                 typer.echo(f"  {message}")
             orbit_failed = orbit_summary.failed
+            # SNAP terrain correction also needs the EGM96 grid; stage it only
+            # when this manifest contains scenes that will be processed by SNAP.
+            if orbit_summary.scene_count:
+                try:
+                    egm96 = stage_egm96(outdir, retries=retries, logger=logger)
+                except (OSError, requests.RequestException) as error:
+                    logger.error("EGM96 staging failed: %s", error)
+                    typer.echo(f"EGM96 staging failed: {error}", err=True)
+                    orbit_failed += 1
+                else:
+                    typer.echo(f"  EGM96 grid:       {egm96}")
             if orbit_summary.missing:
                 typer.echo(
                     f"{len(orbit_summary.missing)} scene(s) have no published "

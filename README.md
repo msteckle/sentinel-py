@@ -269,7 +269,8 @@ nodes without network access. `--orbits` selects `precise`, `restituted`,
 after acquisition, so recent scenes fall back to restituted orbits and are upgraded
 when the command is rerun. Scene-to-orbit assignments are stored in
 `<outdir>/.sentinel-py/s1_orbits.parquet`. Orbit files come from ASF's public mirror
-and need no credentials.
+and need no credentials. The same step stages the EGM96 geoid grid that SNAP terrain correction
+fetches at run time, at `<outdir>/auxdata/dem/egm96/ww15mgh_b.zip`.
 
 ASF download state is stored at
 `<outdir>/.sentinel-py/asf_downloads.parquet`. Existing files are checked against the

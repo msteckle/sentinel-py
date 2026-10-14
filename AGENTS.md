@@ -25,7 +25,7 @@ Find the right home before writing code. Source is under `src/sentinel_py`; test
 | `aoi.py` | AOI file parsing, batching, GeoJSON conversion, lat/lon grids, `atomic_aoi_geometries`. |
 | `log.py` | `get_logger`; persistent file logging plus Rich console output. |
 | `cache/` | Cache primitives: `base.py` (keys, atomic writes, `QueryCache`), `rowstore.py` (`RowStore`, `RowWriter`), `registry.py` (`REGISTRY` of named namespaces), `maintenance.py` (inspect, compact, and prune; backs `sentinel-py cache`). |
-| `download/` | Provider query and download: `asf.py`, `cdse.py`, `pgc.py`, `s1_orbits.py`, shared `base.py` and `preflight.py`. |
+| `download/` | Provider query and download: `asf.py`, `cdse.py`, `pgc.py`, `s1_orbits.py`, `snap_auxdata.py`, shared `base.py` and `preflight.py`. |
 | `cli/` | Typer commands. `main.py` only assembles the app; one module per subcommand; shared options in `options.py`. |
 | `pipeline/config.py` | YAML parsing and validation into frozen dataclasses. No execution, no I/O beyond reading config. |
 | `pipeline/grid.py` | Output grids, AOI planning (`AOIUnit`, `AOIPlan`), lazy window/warp primitives, `RASTERIO_LOCK`. |

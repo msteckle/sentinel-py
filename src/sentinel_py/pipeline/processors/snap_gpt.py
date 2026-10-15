@@ -543,6 +543,7 @@ class SnapGPTProcessor(BaseProcessor):
                 row["flight_direction"] = scene_row.flight_direction
                 row["relative_orbit"] = int(scene_row.relative_orbit)
                 row["orbit_type"] = str(scene_row.orbit_type)
+                row["units"] = "linear"
                 row.update(
                     {pol: float(v) for pol, v in zip(config.polarizations, values, strict=True)}
                 )

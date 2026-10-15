@@ -107,6 +107,53 @@ def mask_nodata(values: Any, nodata: Any) -> Any:
     return values if nodata is None else values.where(values != nodata)
 
 
+def select_cube_variable(source: Any, requested: str | None, *, owner: str) -> str:
+    """Choose the ``(time, band, ...)`` variable a processor operates on.
+
+    Parameters
+    ----------
+    source : xarray.Dataset
+        Upstream cube.
+    requested : str, optional
+        The node's ``variable`` key. When omitted, ``reflectance`` is preferred and
+        otherwise the cube's only banded variable is used.
+    owner : str
+        Processor type name used in error messages.
+
+    Returns
+    -------
+    str
+        Name of the selected variable.
+
+    Raises
+    ------
+    TypeError
+        If the requested variable is missing or not banded over time, or the choice
+        is ambiguous.
+    """
+    banded = [
+        str(name)
+        for name, data in source.data_vars.items()
+        if data.dims[:2] == ("time", "band")
+    ]
+    if requested is not None:
+        if requested not in banded:
+            raise TypeError(
+                f"{owner} variable {requested!r} must be a (time, band, ...) "
+                f"variable of the input; available: {', '.join(banded) or 'none'}"
+            )
+        return requested
+    if "reflectance" in banded:
+        return "reflectance"
+    if len(banded) == 1:
+        return banded[0]
+    raise TypeError(
+        f"{owner} input must have a reflectance variable or exactly one "
+        "(time, band, ...) variable, or the node must set 'variable'; found: "
+        + (", ".join(banded) or "none")
+    )
+
+
 class BaseProcessor(ABC):
     """Formulaic processor base for raster and point artifact implementations.
 

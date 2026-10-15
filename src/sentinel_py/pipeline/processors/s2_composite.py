@@ -27,6 +27,7 @@ from sentinel_py.pipeline.processors.base import (
     mask_nodata,
     ProcessorConfig,
     ProcessorContext,
+    select_cube_variable,
 )
 
 _PERIOD_PATTERN = re.compile(r"^(?P<count>[1-9][0-9]*)(?P<unit>D|W|M|Y)$")
@@ -126,50 +127,6 @@ def _seasonal_groups(
     return tuple(groups)
 
 
-def _cube_variable(source: Any, requested: str | None) -> str:
-    """Choose the ``(time, band, y, x)`` variable a composite aggregates.
-
-    Parameters
-    ----------
-    source : xarray.Dataset
-        Upstream cube.
-    requested : str, optional
-        The node's ``variable``; when omitted ``reflectance`` is preferred and
-        otherwise the cube's only banded variable is used.
-
-    Returns
-    -------
-    str
-        Name of the variable to aggregate.
-
-    Raises
-    ------
-    TypeError
-        If the variable is missing, not banded over time, or ambiguous.
-    """
-    banded = [
-        str(name)
-        for name, data in source.data_vars.items()
-        if data.dims[:2] == ("time", "band")
-    ]
-    if requested is not None:
-        if requested not in banded:
-            raise TypeError(
-                f"composite variable {requested!r} must be a (time, band, ...) "
-                f"variable of the input; available: {', '.join(banded) or 'none'}"
-            )
-        return requested
-    if "reflectance" in banded:
-        return "reflectance"
-    if len(banded) == 1:
-        return banded[0]
-    raise TypeError(
-        "composite input must have a reflectance variable or exactly one "
-        "(time, band, ...) variable, or the node must set 'variable'; found: "
-        + (", ".join(banded) or "none")
-    )
-
-
 def _composite_name(source: Any, selection: Any, aggregation: str) -> str:
     """Build the stable product name used by composite output writers."""
     years = selection.years
@@ -247,7 +204,7 @@ class S2CompositeProcessor(BaseProcessor):
             )
         if not isinstance(source, xr.Dataset):
             raise TypeError("composite input must be an xarray Dataset")
-        variable = _cube_variable(source, config.variable)
+        variable = select_cube_variable(source, config.variable, owner="composite")
         if source.sizes.get("time", 0) == 0:
             raise ValueError("composite input contains no time steps")
 

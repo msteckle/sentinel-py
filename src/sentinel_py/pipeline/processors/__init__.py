@@ -13,6 +13,7 @@ from sentinel_py.pipeline.processors.s2_index import (
     SpectralIndex,
 )
 from sentinel_py.pipeline.processors.s2_preprocess import S2PreprocessProcessor
+from sentinel_py.pipeline.processors.db import ToDBProcessor
 from sentinel_py.pipeline.processors.dem import DEMProcessor
 from sentinel_py.pipeline.processors.snap_gpt import SnapGPTProcessor
 
@@ -24,6 +25,7 @@ def register_builtin_processors(registry: ProcessorRegistry) -> None:
     registry.register(S2IndexProcessor())
     registry.register(DEMProcessor())
     registry.register(SnapGPTProcessor())
+    registry.register(ToDBProcessor())
 
 
 __all__ = [
@@ -39,4 +41,5 @@ __all__ = [
     "register_builtin_processors",
     "DEMProcessor",
     "SnapGPTProcessor",
+    "ToDBProcessor",
 ]

@@ -64,6 +64,13 @@ class OutputFormat(StrEnum):
     parquet = "parquet"
 
 
+class CogEncodingDtype(StrEnum):
+    """Integer storage types accepted by the COG output ``encoding`` option."""
+
+    int16 = "int16"
+    uint16 = "uint16"
+
+
 class SourceType(StrEnum):
     """Reader source types accepted by the pipeline ``sources`` section."""
 

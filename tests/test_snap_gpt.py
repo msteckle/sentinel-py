@@ -188,3 +188,35 @@ def test_backscatter_flows_through_composite_into_cog_tiles(tmp_path: Path):
         assert tile.dtypes == ("float32", "float32")
         assert tile.read(1).mean() == pytest.approx(0.1, rel=1e-5)
         assert tile.read(2).mean() == pytest.approx(0.05, rel=1e-5)
+
+
+def test_backscatter_db_packed_to_int16_cog(tmp_path: Path):
+    import rasterio
+
+    project = write_s1_project(tmp_path)
+    text = project.read_text().replace(
+        "outputs:\n  result:\n    from: sigma0\n    path: output\n    format: xarray",
+        "  - id: seasonal\n    type: composite\n    inputs: {data: sigma0}\n"
+        "    period: all\n    aggregation: median\n"
+        "  - id: sigma0_db\n    type: to_db\n    inputs: {data: seasonal}\n"
+        "outputs:\n  result:\n    from: sigma0_db\n    path: output\n    format: cog\n"
+        "    encoding: {dtype: int16, scale: 0.01}",
+    )
+    assert "to_db" in text
+    project.write_text(text)
+
+    result = _run(project)
+
+    written = result.output_results["result"].results
+    assert written and all(r.status == "written" for r in written)
+    assert {r.variable for r in written} == {"backscatter_db"}
+    tiles = sorted((tmp_path / "output").rglob("backscatter_db.r*.c*.tif"))
+    assert tiles
+    with rasterio.open(tiles[0]) as tile:
+        assert tile.dtypes == ("int16", "int16")
+        assert tile.descriptions == ("VV", "VH")
+        assert tile.scales == (0.01, 0.01)
+        assert tile.nodata == -32768
+        vv, vh = tile.read(1) * 0.01, tile.read(2) * 0.01
+        assert vv.mean() == pytest.approx(-10.0, abs=0.01)  # 0.1 linear
+        assert vh.mean() == pytest.approx(-13.01, abs=0.01)  # 0.05 linear

@@ -87,7 +87,9 @@ POINT_SAMPLE_CACHE_VERSION = 1
 # consumers must not treat the attributes as values, nor apply Sentinel-2 integer
 # sentinels (0 / 65535) to floating-point backscatter.
 S1_POINT_POLARIZATIONS = frozenset({"VV", "VH", "HH", "HV"})
-S1_POINT_ATTRIBUTE_COLUMNS = frozenset({"flight_direction", "relative_orbit", "orbit_type"})
+S1_POINT_ATTRIBUTE_COLUMNS = frozenset(
+    {"flight_direction", "relative_orbit", "orbit_type", "units"}
+)
 
 
 class BaseReader(ABC):

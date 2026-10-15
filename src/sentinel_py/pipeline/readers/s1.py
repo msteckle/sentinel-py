@@ -237,6 +237,9 @@ def select_scenes(
     end: str | pd.Timestamp | None = None,
     geometry_wgs84: Any | None = None,
     flight_direction: str = "BOTH",
+    years: tuple[int, ...] | None = None,
+    speriod: tuple[int, int] = (1, 1),
+    eperiod: tuple[int, int] = (12, 31),
 ) -> pd.DataFrame:
     """Filter a catalog by time, footprint intersection, and pass direction.
 
@@ -252,10 +255,25 @@ def select_scenes(
         ``BOTH``, ``ASCENDING``, ``DESCENDING`` or ``PREDOMINANT``. Predominant is
         evaluated after the time and spatial filters; ties select ``ASCENDING``,
         matching the ASF query command.
+    years : tuple[int, ...], optional
+        Keep scenes acquired in these years.
+    speriod, eperiod : tuple[int, int]
+        Inclusive ``(month, day)`` season applied to the acquisition start, in every
+        selected year (the same seasonal slot the Sentinel-2 reader uses).
     """
     from shapely import wkt
 
     selected = catalog
+    if not selected.empty and (years is not None or (speriod, eperiod) != ((1, 1), (12, 31))):
+        acquired = pd.to_datetime(selected["start_time"], utc=True)
+        keep = pd.Series(True, index=selected.index)
+        if years is not None:
+            keep &= acquired.dt.year.isin(years)
+        month_day = list(zip(acquired.dt.month, acquired.dt.day, strict=True))
+        keep &= pd.Series(
+            [speriod <= pair <= eperiod for pair in month_day], index=selected.index
+        )
+        selected = selected[keep]
     if start is not None:
         selected = selected[
             pd.to_datetime(selected["stop_time"], utc=True) >= pd.Timestamp(start, tz="UTC")

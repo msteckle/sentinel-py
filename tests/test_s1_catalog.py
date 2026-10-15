@@ -1,10 +1,10 @@
-import zipfile
 from pathlib import Path
 
 import pandas as pd
 import pytest
 from shapely.geometry import Point
 
+from helpers import write_s1_zip as _write_zip
 from sentinel_py.download.s1_orbits import ORBIT_STATE_RELPATH
 from sentinel_py.pipeline.config import PipelineConfigError, S1SourceConfig
 from sentinel_py.pipeline.readers.base import get_default_reader_registry
@@ -15,47 +15,8 @@ from sentinel_py.pipeline.readers.s1 import (
     select_scenes,
 )
 
-MANIFEST = """<?xml version="1.0" encoding="UTF-8"?>
-<xfdu:XFDU xmlns:xfdu="urn:ccsds:schema:xfdu:1"
-  xmlns:safe="http://www.esa.int/safe/sentinel-1.0"
-  xmlns:s1="http://www.esa.int/safe/sentinel-1.0/sentinel-1"
-  xmlns:s1sarl1="http://www.esa.int/safe/sentinel-1.0/sentinel-1/sar/level-1"
-  xmlns:gml="http://www.opengis.net/gml">
- <metadataSection><metadataObject><metadataWrap><xmlData>
-  <safe:orbitReference>
-   <safe:relativeOrbitNumber type="start">102</safe:relativeOrbitNumber>
-   <s1:orbitProperties><s1:pass>{direction}</s1:pass></s1:orbitProperties>
-  </safe:orbitReference>
-  <safe:frameSet><safe:frame>
-   <safe:footPrint srsName="http://www.opengis.net/gml/srs/epsg.xml#4326">
-    <gml:coordinates>{coords}</gml:coordinates>
-   </safe:footPrint>
-  </safe:frame></safe:frameSet>
-  <s1sarl1:standAloneProductInformation>
-   <s1sarl1:productType>GRD</s1sarl1:productType>
-   <s1sarl1:transmitterReceiverPolarisation>VV</s1sarl1:transmitterReceiverPolarisation>
-   <s1sarl1:transmitterReceiverPolarisation>VH</s1sarl1:transmitterReceiverPolarisation>
-  </s1sarl1:standAloneProductInformation>
- </xmlData></metadataWrap></metadataObject></metadataSection>
-</xfdu:XFDU>
-"""
-# lat,lon pairs around lon -150..-148, lat 67..69
-COORDS = "67,-150 69,-150 69,-148 67,-148"
 
 
-def _write_zip(
-    directory: Path,
-    scene: str,
-    direction: str = "ASCENDING",
-    coords: str = COORDS,
-) -> Path:
-    path = directory / f"{scene}.zip"
-    with zipfile.ZipFile(path, "w") as archive:
-        archive.writestr(
-            f"{scene}.SAFE/manifest.safe",
-            MANIFEST.format(direction=direction, coords=coords),
-        )
-    return path
 
 
 SCENE_A = "S1A_IW_GRDH_1SDV_20240601T164404_20240601T164429_054000_069000_AAAA"

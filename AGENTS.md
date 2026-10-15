@@ -31,6 +31,7 @@ Find the right home before writing code. Source is under `src/sentinel_py`; test
 | `pipeline/grid.py` | Output grids, AOI planning (`AOIUnit`, `AOIPlan`), lazy window/warp primitives, `RASTERIO_LOCK`. |
 | `pipeline/artifacts.py` | `RasterArtifact` and `PointSampleArtifact`. |
 | `pipeline/base.py` | The generic `Registry` shared by processors, readers, and writers. |
+| `pipeline/snap.py` | SNAP `gpt` execution for Sentinel-1: gpt/version resolution, per-scene jobs, DEM clipping, offline SNAP user directory, cached per-scene outputs; graphs live in `pipeline/snap_graphs/`. |
 | `pipeline/processors/` | Semantic transformations; `base.py` holds `BaseProcessor`, `make_recipe_id`, `mask_nodata`. |
 | `pipeline/readers/` | Source adapters; `base.py` holds `BaseReader` and point-sampling helpers. |
 | `pipeline/writers/` | Output writers; `base.py` holds `BaseOutputWriter` and the writer registry. |

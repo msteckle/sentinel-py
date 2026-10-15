@@ -1,0 +1,87 @@
+<graph id="grd_sigma0">
+  <version>1.0</version>
+  <!--
+    Sentinel-1 GRD to terrain-corrected linear sigma0 on the pipeline output grid.
+    Every ${variable} is supplied by sentinel-py (see sentinel_py.pipeline.snap).
+    Thermal-noise clipping is off so later temporal averaging stays unbiased, and
+    output stays linear power; dB conversion happens downstream.
+  -->
+  <node id="Read">
+    <operator>Read</operator>
+    <parameters><file>${input}</file></parameters>
+  </node>
+  <node id="Apply-Orbit-File">
+    <operator>Apply-Orbit-File</operator>
+    <sources><sourceProduct refid="Read"/></sources>
+    <parameters>
+      <orbitType>${orbitType}</orbitType>
+      <polyDegree>3</polyDegree>
+      <continueOnFail>false</continueOnFail>
+    </parameters>
+  </node>
+  <node id="Remove-GRD-Border-Noise">
+    <operator>Remove-GRD-Border-Noise</operator>
+    <sources><sourceProduct refid="Apply-Orbit-File"/></sources>
+    <parameters>
+      <selectedPolarisations>${polarisations}</selectedPolarisations>
+      <borderLimit>500</borderLimit>
+      <trimThreshold>0.5</trimThreshold>
+    </parameters>
+  </node>
+  <node id="ThermalNoiseRemoval">
+    <operator>ThermalNoiseRemoval</operator>
+    <sources><sourceProduct refid="Remove-GRD-Border-Noise"/></sources>
+    <parameters>
+      <selectedPolarisations>${polarisations}</selectedPolarisations>
+      <removeThermalNoise>true</removeThermalNoise>
+      <clipNegativeValues>false</clipNegativeValues>
+    </parameters>
+  </node>
+  <node id="Calibration">
+    <operator>Calibration</operator>
+    <sources><sourceProduct refid="ThermalNoiseRemoval"/></sources>
+    <parameters>
+      <selectedPolarisations>${polarisations}</selectedPolarisations>
+      <outputSigmaBand>true</outputSigmaBand>
+      <outputImageScaleInDb>false</outputImageScaleInDb>
+    </parameters>
+  </node>
+  <node id="Subset">
+    <operator>Subset</operator>
+    <sources><sourceProduct refid="Calibration"/></sources>
+    <parameters>
+      <geoRegion>${geoRegion}</geoRegion>
+      <copyMetadata>true</copyMetadata>
+      <subSamplingX>1</subSamplingX>
+      <subSamplingY>1</subSamplingY>
+    </parameters>
+  </node>
+  <node id="Terrain-Correction">
+    <operator>Terrain-Correction</operator>
+    <sources><sourceProduct refid="Subset"/></sources>
+    <parameters>
+      <sourceBands>${sourceBands}</sourceBands>
+      <demName>External DEM</demName>
+      <externalDEMFile>${demFile}</externalDEMFile>
+      <externalDEMNoDataValue>${demNoData}</externalDEMNoDataValue>
+      <externalDEMApplyEGM>${demApplyEGM}</externalDEMApplyEGM>
+      <demResamplingMethod>BILINEAR_INTERPOLATION</demResamplingMethod>
+      <imgResamplingMethod>BILINEAR_INTERPOLATION</imgResamplingMethod>
+      <pixelSpacingInMeter>${pixelSpacing}</pixelSpacingInMeter>
+      <mapProjection>${mapProjection}</mapProjection>
+      <alignToStandardGrid>true</alignToStandardGrid>
+      <standardGridOriginX>${gridOriginX}</standardGridOriginX>
+      <standardGridOriginY>${gridOriginY}</standardGridOriginY>
+      <nodataValueAtSea>false</nodataValueAtSea>
+      <saveSelectedSourceBand>true</saveSelectedSourceBand>
+    </parameters>
+  </node>
+  <node id="Write">
+    <operator>Write</operator>
+    <sources><sourceProduct refid="Terrain-Correction"/></sources>
+    <parameters>
+      <file>${output}</file>
+      <formatName>GeoTIFF</formatName>
+    </parameters>
+  </node>
+</graph>

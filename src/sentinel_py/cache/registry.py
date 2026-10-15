@@ -155,6 +155,13 @@ _ENTRIES = (
         key_columns=("scene",),
     ),
     CacheNamespace(
+        "snap_outputs",
+        CacheKind.derived,
+        CacheLocation.data_dir,
+        f"{SIDECAR_DIR}/snap_outputs",
+        "Per-scene SNAP terrain-corrected GeoTIFFs, logs, and run manifests.",
+    ),
+    CacheNamespace(
         "cog_outputs",
         CacheKind.derived,
         CacheLocation.output_dir,

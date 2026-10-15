@@ -138,6 +138,28 @@ outputs:
 
 The COG writer tiles every `(time, band, y, x)` or `(time, y, x)` variable of the dataset as `<variable>.r<row>.c<column>.tif`. Integer variables use their integer nodata sentinel (Sentinel-2 reflectance DN uses 65535) and floating-point variables use NaN. Tile names, task IDs, and cache keys for Sentinel-2 outputs are unchanged, so existing resume state remains valid.
 
+## Decibel conversion and integer packing
+
+The built-in `to_db` processor converts a linear-power cube to decibels, `10 * log10(x)`, lazily and chunk by chunk. Zero, negative, and missing values become NaN rather than `-inf`. The input variable is chosen like `composite`: `reflectance` if present, otherwise the cube's only `(time, band, y, x)` variable, or the node's `variable`. The output replaces it with a float32 variable named `<variable>_db` (for example `backscatter_db`) carrying `units: dB` and NaN nodata, so COG files are self-describing and linear and dB data cannot be mixed up. Integer inputs such as reflectance DN, and data that is already in dB, are rejected. Point rows have their `VV`, `VH`, `HH`, and `HV` columns converted in place and a `units` column set to `dB`.
+
+Convert after compositing: a mean must be taken in linear power, while a median gives the same result in either order. Texture statistics such as GLCM should be computed on dB, whose distribution is far more even than linear backscatter.
+
+```yaml
+nodes:
+  - id: sigma0_db
+    type: to_db
+    inputs: {data: summer_backscatter}
+
+outputs:
+  s1_summer_db:
+    from: sigma0_db
+    path: ../output/s1_summer_db
+    format: cog
+    encoding: {dtype: int16, scale: 0.01}
+```
+
+A COG output may set `encoding` to store floating-point variables as `int16` or `uint16` with GDAL scale and offset tags, so readers such as QGIS and rasterio unpack the values automatically. A stored integer `q` means `q * scale + offset`; NaN is stored as the reserved code (`-32768` for `int16`, `65535` for `uint16`) and out-of-range values are clipped to the nearest valid code. A step of 0.01 dB (`int16` covers about ±327 dB) cut a measured Sentinel-1 COG to under half its float32 size with a worst-case error of 0.005 dB, far below speckle noise. Integer variables such as reflectance DN and SCL are never repacked. Quantize only on the final stored product, not before compositing or texture analysis. Floating-point tiles use the floating-point predictor (about 12% smaller than before); this changes only file bytes, not resume keys.
+
 ## Spectral indices
 
 The built-in ``s2.index`` processor takes exactly one upstream processing cube and appends named Sentinel-2 spectral index bands to its ``reflectance`` variable. Supported indices are ``NDGI``, ``NDWI1``, ``NDWI2``, ``MSAVI``, ``VARI``, ``RVI``, ``OSAVI``, ``TGI``, ``GLI``, ``NGRDI``, ``CIG``, ``GNDVI``, ``CVI``, ``MTVI2``, ``TCARI``, ``TCI``, ``NARI``, ``TCAPB``, ``TCAPG``, and ``TCAPW``. Calculations are lazy, operate independently for every time step, preserve the upstream spatial chunks, and use Sentinel-2 quantification metadata when a formula depends on absolute reflectance values.

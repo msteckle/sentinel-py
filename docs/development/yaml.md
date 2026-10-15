@@ -83,3 +83,16 @@ Then, users should create a classmethod that, given a raw mapping (typically par
 ## Sentinel-1 sources and the `snap_gpt` node
 
 A `sources` entry of type `s1.grd.local` points at a directory of ASF Sentinel-1 GRD ZIP files. Its keys are `data_dir` (required), `flight_direction` (`BOTH`, `ASCENDING`, `DESCENDING`, or `PREDOMINANT`, default `BOTH`), and `orbit` (`precise`, `restituted`, or `precise-or-restituted`, the acceptable staged orbit-file types). The scene catalog is built from each archive's `manifest.safe` and cached beside the data. The `snap_gpt` node and its keys are documented in `docs/development/processors.md`.
+
+## Output encoding
+
+An `outputs` entry with `format: cog` may set `encoding` to pack floating-point variables as integers: `dtype` (`int16` or `uint16`, required), `scale` (positive number, required), and `offset` (number, default `0`). The stored integer represents `value = stored * scale + offset`, and the scale and offset are written to each band's GDAL tags. NaN is stored as `-32768` (`int16`) or `65535` (`uint16`). Integer variables are unaffected, and `encoding` is rejected for other formats. Changing `encoding` rewrites existing tiles on the next run.
+
+```yaml
+outputs:
+  s1_db:
+    from: sigma0_db
+    path: ../output/s1_db
+    format: cog
+    encoding: {dtype: int16, scale: 0.01}
+```

@@ -346,3 +346,114 @@ def test_cog_requires_a_tileable_variable_with_nodata(tmp_path):
     bare = _backscatter_artifact().drop_vars("backscatter")
     with pytest.raises(ValueError, match="requires a"):
         COGOutputWriter().build(bare, output, None)
+
+
+def _encoding(dtype="int16", scale=0.01, offset=0.0):
+    return SimpleNamespace(dtype=dtype, scale=scale, offset=offset)
+
+
+def _db_artifact():
+    values = np.linspace(-30.0, 5.0, 2 * 2 * 4 * 4, dtype=np.float32).reshape(2, 2, 4, 4)
+    values[0, 0, 0, 0] = np.nan
+    artifact = _backscatter_artifact()
+    artifact["backscatter"] = (
+        ("time", "band", "y", "x"),
+        da.from_array(values, chunks=(1, 2, 2, 2)),
+        {"nodata": float("nan")},
+    )
+    return artifact, values
+
+
+def test_encoding_packs_float_tiles_with_scale_offset_and_reserved_nodata(tmp_path):
+    artifact, values = _db_artifact()
+    output = SimpleNamespace(output_id="result", path=tmp_path, encoding=_encoding())
+
+    results = _compute(COGOutputWriter().build(artifact, output, None))
+
+    assert all(result.status == WriteStatus.written for result in results)
+    tile = tmp_path / "comp" / "bin_a" / "backscatter.r0000.c0000.tif"
+    with rasterio.open(tile) as dataset:
+        assert dataset.dtypes == ("int16", "int16")
+        assert dataset.nodata == -32768
+        assert dataset.scales == (0.01, 0.01) and dataset.offsets == (0.0, 0.0)
+        stored = dataset.read(1)
+        assert stored[0, 0] == -32768  # NaN input
+        unpacked = np.where(stored == -32768, np.nan, stored * 0.01)
+        expected = values[0, 0, :2, :2]
+        np.testing.assert_allclose(unpacked[1:], expected[1:], atol=0.0051)
+        assert dataset.descriptions == ("VV", "VH")
+
+
+def test_encoding_offset_uint16_and_clipping(tmp_path):
+    values = np.array([[[[-50.0, 0.0], [60.0, np.nan]]]], dtype=np.float32)
+    artifact = _backscatter_artifact()
+    artifact = artifact.isel(time=[0], band=[0], y=[0, 1], x=[0, 1]).copy()
+    artifact["backscatter"] = (
+        ("time", "band", "y", "x"),
+        da.from_array(values, chunks=(1, 1, 2, 2)),
+        {"nodata": float("nan")},
+    )
+    artifact.attrs["transform"] = (20.0, 0.0, 1000.0, 0.0, -20.0, 5000.0)
+    output = SimpleNamespace(
+        output_id="result", path=tmp_path,
+        encoding=_encoding("uint16", scale=0.001, offset=-40.0),
+    )
+
+    _compute(COGOutputWriter().build(artifact, output, None))
+
+    with rasterio.open(next(tmp_path.rglob("backscatter.r0000.c0000.tif"))) as dataset:
+        stored = dataset.read(1)
+        assert dataset.dtypes == ("uint16",) and dataset.nodata == 65535
+        assert dataset.offsets == (-40.0,)
+        assert stored[0, 0] == 0  # -50 dB is below range: clipped to the first code
+        assert stored[0, 1] == 40_000  # (0 - -40) / 0.001
+        assert stored[1, 0] == 65534  # 60 dB above range: clipped, never nodata
+        assert stored[1, 1] == 65535  # NaN
+
+
+def test_encoding_leaves_integer_variables_alone(tmp_path):
+    output = SimpleNamespace(output_id="result", path=tmp_path, encoding=_encoding())
+    results = _compute(COGOutputWriter().build(_artifact(), output, None))
+    assert all(result.status == WriteStatus.written for result in results)
+    with rasterio.open(tmp_path / "prod_a" / "gran_a" / "scl.r0000.c0000.tif") as scl:
+        assert scl.dtypes == ("uint8",) and scl.scales == (1.0,)
+
+
+def test_encoding_enters_cache_keys_only_when_applied(tmp_path):
+    artifact, _ = _db_artifact()
+    plain = SimpleNamespace(output_id="result", path=tmp_path / "a")
+    packed = SimpleNamespace(output_id="result", path=tmp_path / "a", encoding=_encoding())
+    other = SimpleNamespace(
+        output_id="result", path=tmp_path / "a", encoding=_encoding(scale=0.05)
+    )
+    writer = COGOutputWriter()
+    plan = writer.build(artifact, plain, None)
+    written = _compute(plan)
+    writer.finalize(plan, written)
+    keys_plain = {r.task_id: r.cache_key for r in written}
+
+    # Same files, new encoding: every tile must be rewritten.
+    assert len(writer.build(artifact, packed, None).tasks) == len(keys_plain)
+    assert writer.build(artifact, plain, None).tasks == ()
+    packed_keys = {
+        r.task_id: r.cache_key for r in _compute(writer.build(artifact, packed, None))
+    }
+    other_keys = {
+        r.task_id: r.cache_key for r in _compute(writer.build(artifact, other, None))
+    }
+    assert keys_plain.keys() == packed_keys.keys()
+    assert all(keys_plain[k] != packed_keys[k] != other_keys[k] for k in keys_plain)
+
+
+def test_float_tiles_use_the_floating_point_predictor(tmp_path):
+    output = SimpleNamespace(output_id="result", path=tmp_path)
+    _compute(COGOutputWriter().build(_backscatter_artifact(), output, None))
+    tile = tmp_path / "comp" / "bin_a" / "backscatter.r0000.c0000.tif"
+    with rasterio.open(tile) as dataset:
+        assert dataset.tags(ns="IMAGE_STRUCTURE")["COMPRESSION"] == "DEFLATE"
+        assert dataset.tags(ns="IMAGE_STRUCTURE")["PREDICTOR"] == "3"
+    # Integer data keeps the horizontal predictor.
+    _compute(COGOutputWriter().build(_artifact(), output, None))
+    scl = tmp_path / "prod_a" / "gran_a" / "scl.r0000.c0000.tif"
+    with rasterio.open(scl) as dataset:
+        assert dataset.tags(ns="IMAGE_STRUCTURE")["PREDICTOR"] == "2"

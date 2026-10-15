@@ -22,6 +22,7 @@ from pydantic import BaseModel, ValidationError
 from sentinel_py.enums import (
     AOIKind,
     ArtifactKind,
+    CogEncodingDtype,
     ExecutionMethod,
     OutputFormat,
     SourceType,
@@ -684,6 +685,51 @@ def parse_sources(raw: Any, base_dir: Path) -> dict[str, SourceConfig]:
 
 
 @dataclass(frozen=True)
+class OutputEncoding:
+    """Integer packing of floating-point COG variables (GDAL scale and offset).
+
+    A stored integer ``q`` represents ``q * scale + offset``. The most negative
+    value of ``int16`` (and ``65535`` for ``uint16``) is reserved as nodata.
+
+    Arguments
+    ---------
+    dtype : str
+        ``int16`` or ``uint16`` (see :class:`~sentinel_py.enums.CogEncodingDtype`).
+    scale : float
+        Positive quantization step in the variable's units (0.01 dB for dB data).
+    offset : float
+        Value represented by a stored zero.
+    """
+
+    dtype: str
+    scale: float
+    offset: float = 0.0
+
+    @classmethod
+    def from_mapping(cls, raw: Any, location: str) -> OutputEncoding:
+        """Validate an ``encoding`` mapping from an ``outputs`` entry."""
+        value = _mapping(raw, location)
+        only_keys(value, {"dtype", "scale", "offset"}, location)
+        dtype = required(value, "dtype", location)
+        allowed = [item.value for item in CogEncodingDtype]
+        if dtype not in allowed:
+            raise PipelineConfigError(
+                f"{location}.dtype must be one of: {', '.join(allowed)}"
+            )
+        numbers = {}
+        for key, default in (("scale", None), ("offset", 0.0)):
+            number = value.get(key, default)
+            if number is None:
+                raise PipelineConfigError(f"Missing required value: {location}.{key}")
+            if isinstance(number, bool) or not isinstance(number, (int, float)):
+                raise PipelineConfigError(f"{location}.{key} must be a number")
+            numbers[key] = float(number)
+        if not numbers["scale"] > 0:
+            raise PipelineConfigError(f"{location}.scale must be greater than 0")
+        return cls(dtype, numbers["scale"], numbers["offset"])
+
+
+@dataclass(frozen=True)
 class OutputConfig:
     """Named materialization target associated with a pipeline node."""
 
@@ -691,6 +737,7 @@ class OutputConfig:
     node: str
     path: Path
     format: str
+    encoding: OutputEncoding | None = None
 
     @classmethod
     def parse_many(
@@ -710,7 +757,9 @@ class OutputConfig:
             output_id = _identifier(raw_id, "output identifiers")
             location = f"outputs.{output_id}"
             value = _mapping(raw_output, location)
-            only_keys(value, {"from", "node", "path", "format"}, location)
+            only_keys(
+                value, {"from", "node", "path", "format", "encoding"}, location
+            )
             if "from" in value and "node" in value:
                 raise PipelineConfigError(
                     f"{location} cannot define both 'from' and 'node'"
@@ -729,7 +778,17 @@ class OutputConfig:
             path = resolve_path(
                 required(value, "path", location), base_dir, f"{location}.path"
             )
-            outputs[output_id] = cls(output_id, node_id, path, output_format.lower())
+            output_format = output_format.lower()
+            encoding = None
+            if "encoding" in value:
+                if output_format != OutputFormat.cog:
+                    raise PipelineConfigError(
+                        f"{location}.encoding is only supported for cog outputs"
+                    )
+                encoding = OutputEncoding.from_mapping(
+                    value["encoding"], f"{location}.encoding"
+                )
+            outputs[output_id] = cls(output_id, node_id, path, output_format, encoding)
         return outputs
 
 

@@ -3,7 +3,9 @@
 Every data variable shaped ``(time, band, y, x)`` or ``(time, y, x)`` is written as
 chunk-level tiles named ``<variable>.r<row>.c<column>.tif``; integer variables
 (Sentinel-2 reflectance DN, SCL) and floating-point variables (Sentinel-1
-backscatter, with NaN nodata) share one resumable code path.
+backscatter, with NaN nodata) share one resumable code path. A float variable can
+also be packed to ``int16``/``uint16`` through the output's ``encoding`` (GDAL scale
+and offset tags), which roughly halves its size with a bounded quantization error.
 """
 
 from __future__ import annotations
@@ -57,6 +59,37 @@ def cog_state_path(output_dir: Path) -> Path:
     return REGISTRY["cog_outputs"].path(output_dir)
 
 
+def pack_values(
+    values: np.ndarray, dtype: str, scale: float, offset: float
+) -> tuple[np.ndarray, int]:
+    """Quantize floating-point values to integers with a reserved nodata code.
+
+    Parameters
+    ----------
+    values : numpy.ndarray
+        Floating-point values; NaN and infinities become nodata.
+    dtype : str
+        ``"int16"`` or ``"uint16"``.
+    scale, offset : float
+        Stored integer ``q`` represents ``q * scale + offset``.
+
+    Returns
+    -------
+    tuple[numpy.ndarray, int]
+        The packed array and its nodata code (the most negative ``int16`` value or
+        ``65535`` for ``uint16``). Out-of-range values are clipped to the nearest
+        representable code.
+    """
+    info = np.iinfo(dtype)
+    signed = info.min < 0
+    sentinel = int(info.min if signed else info.max)
+    low, high = (info.min + 1, info.max) if signed else (0, info.max - 1)
+    finite = np.isfinite(values)
+    scaled = np.rint((np.where(finite, values, 0.0).astype("float64") - offset) / scale)
+    packed = np.clip(scaled, low, high).astype(dtype)
+    return np.where(finite, packed, sentinel).astype(dtype), sentinel
+
+
 def _write_cog_tile(
     values: np.ndarray,
     *,
@@ -73,6 +106,7 @@ def _write_cog_tile(
     transform: tuple[float, float, float, float, float, float],
     nodata: float,
     descriptions: tuple[str, ...],
+    encoding: tuple[str, float, float] | None = None,
 ) -> COGWriteResult:
     """Write one array chunk atomically and return data instead of worker logs."""
     temporary = output_path.with_name(f".{output_path.name}.{uuid.uuid4().hex}.tmp.tif")
@@ -88,7 +122,9 @@ def _write_cog_tile(
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         array = np.asarray(values)
-        if np.issubdtype(array.dtype, np.floating):
+        if encoding is not None:
+            array, nodata = pack_values(array, *encoding)
+        elif np.issubdtype(array.dtype, np.floating):
             array = np.where(np.isfinite(array), array, nodata).astype(array.dtype)
         if array.ndim == 2:
             array = array[np.newaxis, ...]
@@ -106,7 +142,8 @@ def _write_cog_tile(
                 transform=Affine.from_gdal(*transform),
                 nodata=nodata,
                 compress="DEFLATE",
-                predictor=2,
+                # Predictor 3 is the floating-point predictor (about 12% smaller).
+                predictor=3 if np.issubdtype(array.dtype, np.floating) else 2,
                 blocksize=256,
                 overview_resampling="nearest",
                 num_threads="1",
@@ -114,6 +151,9 @@ def _write_cog_tile(
         ):
             destination.write(array)
             destination.descriptions = descriptions
+            if encoding is not None:
+                destination.scales = (float(encoding[1]),) * array.shape[0]
+                destination.offsets = (float(encoding[2]),) * array.shape[0]
         os.replace(temporary, output_path)
         return COGWriteResult(
             **identity,
@@ -343,6 +383,13 @@ class COGOutputWriter(BaseOutputWriter):
 
         data_array = arrays[name]
         has_band = "band" in data_array.dims
+        # Only floating-point variables are packed; integer data (DN, SCL) is kept.
+        requested = getattr(output, "encoding", None)
+        encoding = (
+            (requested.dtype, requested.scale, requested.offset)
+            if requested is not None and np.issubdtype(data_array.dtype, np.floating)
+            else None
+        )
         array = data_array.data[time_index]
         delayed_blocks = array.to_delayed(optimize_graph=False)
         row_offset = 0
@@ -360,18 +407,20 @@ class COGOutputWriter(BaseOutputWriter):
                     / f"{name}.r{row_index:04d}.c{column_index:04d}.tif"
                 )
                 output_path = output.path / relative
-                cache_key = deterministic_cache_key(
-                    {
-                        "writer_version": COG_WRITER_VERSION,
-                        "output_id": output.output_id,
-                        "recipe_id": recipe_id,
-                        "source_fingerprint": source_fingerprint,
-                        "variable": name,
-                        "row": row_index,
-                        "column": column_index,
-                        "shape": (height, width),
-                    }
-                )
+                key_payload = {
+                    "writer_version": COG_WRITER_VERSION,
+                    "output_id": output.output_id,
+                    "recipe_id": recipe_id,
+                    "source_fingerprint": source_fingerprint,
+                    "variable": name,
+                    "row": row_index,
+                    "column": column_index,
+                    "shape": (height, width),
+                }
+                if encoding is not None:
+                    # Added only when packing so existing resume keys stay valid.
+                    key_payload["encoding"] = list(encoding)
+                cache_key = deterministic_cache_key(key_payload)
                 task_id = deterministic_cache_key(
                     {"output_id": output.output_id, "relative_path": str(relative)}
                 )
@@ -417,6 +466,7 @@ class COGOutputWriter(BaseOutputWriter):
                             ),
                             nodata=nodata,
                             descriptions=descriptions,
+                            encoding=encoding,
                         )
                     )
                 column_offset += width

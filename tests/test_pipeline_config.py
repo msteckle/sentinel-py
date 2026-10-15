@@ -248,3 +248,61 @@ def test_point_aoi_rejects_raster_only_cog_output(tmp_path: Path):
 
     path.write_text(path.read_text().replace("format: cog", "format: parquet"))
     assert PipelineConfig.from_file(path).outputs["result"].format == "parquet"
+
+
+def _encoding_config(tmp_path, encoding: str, output_format: str = "cog"):
+    from helpers import write_s2_pipeline_yaml
+
+    path = write_s2_pipeline_yaml(tmp_path)
+    text = path.read_text().replace(
+        "    format: cog", f"    format: {output_format}\n    encoding: {encoding}"
+    )
+    path.write_text(text)
+    return path
+
+
+def test_output_encoding_is_parsed_with_default_offset(tmp_path):
+    from sentinel_py.pipeline import PipelineConfig
+
+    path = _encoding_config(tmp_path, "{dtype: int16, scale: 0.01}")
+    encoding = PipelineConfig.from_file(path).outputs["result"].encoding
+
+    assert (encoding.dtype, encoding.scale, encoding.offset) == ("int16", 0.01, 0.0)
+    assert PipelineConfig.from_file(path).outputs["result"].format == "cog"
+
+
+def test_outputs_without_encoding_are_unchanged(tmp_path):
+    from helpers import write_s2_pipeline_yaml
+
+    from sentinel_py.pipeline import PipelineConfig
+
+    config = PipelineConfig.from_file(write_s2_pipeline_yaml(tmp_path))
+    assert config.outputs["result"].encoding is None
+
+
+@pytest.mark.parametrize(
+    ("encoding", "message"),
+    [
+        ("{dtype: float16, scale: 0.01}", "dtype must be one of"),
+        ("{dtype: int16}", "Missing required value"),
+        ("{dtype: int16, scale: 0}", "greater than 0"),
+        ("{dtype: int16, scale: fast}", "must be a number"),
+        ("{dtype: int16, scale: 0.01, bits: 8}", "Unsupported key"),
+        ("int16", "must be a mapping"),
+    ],
+)
+def test_output_encoding_rejections(tmp_path, encoding, message):
+    from sentinel_py.pipeline import PipelineConfig
+    from sentinel_py.pipeline.config import PipelineConfigError
+
+    with pytest.raises(PipelineConfigError, match=message):
+        PipelineConfig.from_file(_encoding_config(tmp_path, encoding))
+
+
+def test_encoding_is_only_allowed_for_cog_outputs(tmp_path):
+    from sentinel_py.pipeline import PipelineConfig
+    from sentinel_py.pipeline.config import PipelineConfigError
+
+    path = _encoding_config(tmp_path, "{dtype: int16, scale: 0.01}", "xarray")
+    with pytest.raises(PipelineConfigError, match="only supported for cog outputs"):
+        PipelineConfig.from_file(path)

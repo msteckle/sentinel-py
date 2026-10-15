@@ -115,6 +115,29 @@ nodes:
     aggregation: maximum
 ```
 
+Composite nodes aggregate `reflectance` when it is present and otherwise the input's only `(time, band, y, x)` variable, so Sentinel-1 backscatter needs no extra key. Set `variable` to choose explicitly when a cube carries several banded variables, for example `variable: backscatter`. The output keeps the source variable's name, dtype family, and nodata convention (NaN for floating-point backscatter), and all-missing pixels stay missing. Point composites aggregate polarization columns (`VV`, `VH`, `HH`, `HV`) and drop the per-scene attribute columns (`flight_direction`, `relative_orbit`, `orbit_type`).
+
+```yaml
+nodes:
+  - id: sigma0
+    type: snap_gpt
+    source: s1
+    dem: arcticdem
+  - id: summer_backscatter
+    type: composite
+    inputs: {data: sigma0}
+    period: 15D
+    aggregation: median
+
+outputs:
+  s1_summer:
+    from: summer_backscatter
+    path: ../output/s1_summer
+    format: cog
+```
+
+The COG writer tiles every `(time, band, y, x)` or `(time, y, x)` variable of the dataset as `<variable>.r<row>.c<column>.tif`. Integer variables use their integer nodata sentinel (Sentinel-2 reflectance DN uses 65535) and floating-point variables use NaN. Tile names, task IDs, and cache keys for Sentinel-2 outputs are unchanged, so existing resume state remains valid.
+
 ## Spectral indices
 
 The built-in ``s2.index`` processor takes exactly one upstream processing cube and appends named Sentinel-2 spectral index bands to its ``reflectance`` variable. Supported indices are ``NDGI``, ``NDWI1``, ``NDWI2``, ``MSAVI``, ``VARI``, ``RVI``, ``OSAVI``, ``TGI``, ``GLI``, ``NGRDI``, ``CIG``, ``GNDVI``, ``CVI``, ``MTVI2``, ``TCARI``, ``TCI``, ``NARI``, ``TCAPB``, ``TCAPG``, and ``TCAPW``. Calculations are lazy, operate independently for every time step, preserve the upstream spatial chunks, and use Sentinel-2 quantification metadata when a formula depends on absolute reflectance values.
@@ -189,4 +212,4 @@ The built-in graph `builtin:grd_sigma0` applies the orbit file, removes GRD bord
 
 Node keys: `source`, `dem` (required); `graph` (default `builtin:grd_sigma0`), `polarizations` (default `[VV, VH]`), `dem_vertical_datum` (`ellipsoid` or `egm96`), `subset` (`aoi` or `scene`), `subset_margin_m` (2000), `dem_margin_m` (15000), `parameters`, `work_dir` (default `<s1 data_dir>/.sentinel-py/snap_outputs`), `gpt` (default `$SNAP_HOME/bin/gpt`; a bare `gpt` on `PATH` is never used), `memory_gb` (16), `threads` (4), and `timeout_s`. Each scene run is cached by a key covering the archive, orbit file, region, DEM tiles and datum, polarizations, output grid, graph hash, parameters, and SNAP version, and writes a JSON manifest with the exact `gpt` command. The DEM tiles must cover each scene's processing region, otherwise the run fails before SNAP starts.
 
-Raster AOIs run each scene as a Dask task inside the shared graph. Point AOIs run the same cached scene jobs on the client with `execution.workers` concurrent `gpt` processes and sample one pixel per scene. The COG writer and the `composite` processor currently expect a `reflectance` variable, so S1 backscatter is not yet writable as COG through them.
+Raster AOIs run each scene as a Dask task inside the shared graph. Point AOIs run the same cached scene jobs on the client with `execution.workers` concurrent `gpt` processes and sample one pixel per scene. The `composite` processor and the COG writer accept the `backscatter` variable directly, so the usual chain is `snap_gpt` then `composite` then a `cog` output (see below).

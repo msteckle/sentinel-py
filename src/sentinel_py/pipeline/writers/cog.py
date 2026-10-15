@@ -1,4 +1,10 @@
-"""Resumable atomic Cloud Optimized GeoTIFF tile output."""
+"""Resumable atomic Cloud Optimized GeoTIFF tile output.
+
+Every data variable shaped ``(time, band, y, x)`` or ``(time, y, x)`` is written as
+chunk-level tiles named ``<variable>.r<row>.c<column>.tif``; integer variables
+(Sentinel-2 reflectance DN, SCL) and floating-point variables (Sentinel-1
+backscatter, with NaN nodata) share one resumable code path.
+"""
 
 from __future__ import annotations
 
@@ -65,7 +71,7 @@ def _write_cog_tile(
     cache_key: str,
     crs: str,
     transform: tuple[float, float, float, float, float, float],
-    nodata: int,
+    nodata: float,
     descriptions: tuple[str, ...],
 ) -> COGWriteResult:
     """Write one array chunk atomically and return data instead of worker logs."""
@@ -128,29 +134,61 @@ def _write_cog_tile(
         temporary.unlink(missing_ok=True)
 
 
-def _tile_variables(artifact: Any) -> list[tuple[str, int, tuple[str, ...]]]:
+def _nodata_value(name: str, attrs: dict[str, Any]) -> int | float:
+    """Return a variable's nodata as an ``int``, or NaN for floating-point data.
+
+    Parameters
+    ----------
+    name : str
+        Variable name, used in the error message.
+    attrs : dict[str, Any]
+        Variable attributes carrying ``nodata``.
+
+    Returns
+    -------
+    int | float
+        The integer sentinel (e.g. 65535) or ``nan``.
+
+    Raises
+    ------
+    ValueError
+        If the variable has no ``nodata`` attribute.
+    """
+    if "nodata" not in attrs:
+        raise ValueError(f"COG variable {name!r} needs a 'nodata' attribute")
+    value = float(attrs["nodata"])
+    return value if np.isnan(value) else int(value)
+
+
+def _tile_variables(artifact: Any) -> list[tuple[str, int | float, tuple[str, ...]]]:
     """List the dataset variables written as COG tiles.
 
     Parameters
     ----------
     artifact : xarray.Dataset
-        Dataset with a ``reflectance`` variable and an optional ``scl`` variable.
+        Dataset whose ``(time, band, y, x)`` and ``(time, y, x)`` variables are
+        tiled. Banded variables are listed first, then dataset order is kept.
 
     Returns
     -------
-    list[tuple[str, int, tuple[str, ...]]]
+    list[tuple[str, int | float, tuple[str, ...]]]
         ``(variable name, nodata value, band descriptions)`` per tiled variable.
+        Banded variables describe their bands by the ``band`` coordinate; unbanded
+        variables use their upper-cased name (``scl`` becomes ``SCL``).
     """
-    variables = [
-        (
-            "reflectance",
-            int(artifact.reflectance.attrs["nodata"]),
-            tuple(str(value) for value in artifact.band.values),
-        )
-    ]
-    if "scl" in artifact.data_vars:
-        variables.append(("scl", int(artifact.scl.attrs["nodata"]), ("SCL",)))
-    return variables
+    banded, unbanded = [], []
+    for name, data in artifact.data_vars.items():
+        if data.dims == ("time", "band", "y", "x"):
+            target = banded
+            descriptions = tuple(str(value) for value in artifact.band.values)
+        elif data.dims == ("time", "y", "x"):
+            target = unbanded
+            descriptions = (str(name).upper(),)
+        else:
+            continue
+        nodata = _nodata_value(str(name), data.attrs)
+        target.append((str(name), nodata, descriptions))
+    return banded + unbanded
 
 
 class COGOutputWriter(BaseOutputWriter):
@@ -187,8 +225,10 @@ class COGOutputWriter(BaseOutputWriter):
             return self._build_artifact(artifact, output, pipeline)
         if not isinstance(artifact, xr.Dataset):
             raise TypeError("COG output requires an xarray Dataset artifact")
-        if "reflectance" not in artifact.data_vars:
-            raise ValueError("COG output requires a reflectance variable")
+        if not _tile_variables(artifact):
+            raise ValueError(
+                "COG output requires a (time, band, y, x) or (time, y, x) variable"
+            )
         return self._build_dataset(artifact, output)
 
     def _build_artifact(
@@ -221,15 +261,23 @@ class COGOutputWriter(BaseOutputWriter):
             for row in state.to_dict("records")
             if row.get("status") in {WriteStatus.written, WriteStatus.skipped}
         }
+        variables = _tile_variables(artifact)
         # One band chunk per tile; rechunking once keeps graph building O(variables).
-        reflectance = artifact.reflectance.chunk({"band": -1})
+        arrays = {
+            name: (
+                artifact[name].chunk({"band": -1})
+                if "band" in artifact[name].dims
+                else artifact[name]
+            )
+            for name, _, _ in variables
+        }
         tasks: list[Any] = []
         completed: list[COGWriteResult] = []
         for time_index in range(artifact.sizes["time"]):
-            for variable in _tile_variables(artifact):
+            for variable in variables:
                 self._plan_variable_tiles(
                     artifact,
-                    reflectance,
+                    arrays,
                     output,
                     time_index,
                     variable,
@@ -254,10 +302,10 @@ class COGOutputWriter(BaseOutputWriter):
     @staticmethod
     def _plan_variable_tiles(
         artifact: Any,
-        reflectance: Any,
+        arrays: dict[str, Any],
         output: Any,
         time_index: int,
-        variable: tuple[str, int, tuple[str, ...]],
+        variable: tuple[str, int | float, tuple[str, ...]],
         cached: dict[str, Any],
         tasks: list[Any],
         completed: list[COGWriteResult],
@@ -268,8 +316,9 @@ class COGOutputWriter(BaseOutputWriter):
         ----------
         artifact : xarray.Dataset
             Dataset carrying ``crs``, ``transform`` and ``recipe_id`` attributes.
-        reflectance : xarray.DataArray
-            ``artifact.reflectance`` rechunked to one chunk along ``band``.
+        arrays : dict[str, xarray.DataArray]
+            Tiled variables by name, banded ones rechunked to one chunk along
+            ``band``.
         output : OutputConfig
             Output supplying ``output_id`` and the destination ``path``.
         time_index : int
@@ -292,7 +341,8 @@ class COGOutputWriter(BaseOutputWriter):
         granule_id = str(artifact.granule_id.values[time_index])
         source_fingerprint = str(artifact.source_fingerprint.values[time_index])
 
-        data_array = reflectance if name == "reflectance" else artifact[name]
+        data_array = arrays[name]
+        has_band = "band" in data_array.dims
         array = data_array.data[time_index]
         delayed_blocks = array.to_delayed(optimize_graph=False)
         row_offset = 0
@@ -301,7 +351,7 @@ class COGOutputWriter(BaseOutputWriter):
             for column_index, width in enumerate(array.chunks[-1]):
                 block = (
                     delayed_blocks[0, row_index, column_index]
-                    if name == "reflectance"
+                    if has_band
                     else delayed_blocks[row_index, column_index]
                 )
                 relative = (

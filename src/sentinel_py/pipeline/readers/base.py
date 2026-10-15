@@ -83,6 +83,12 @@ def apply_polygon_mask(dataset: Any, unit: AOIUnit) -> Any:
 
 POINT_SAMPLE_CACHE_VERSION = 1
 
+# Sentinel-1 point rows carry polarization value columns plus per-scene attributes;
+# consumers must not treat the attributes as values, nor apply Sentinel-2 integer
+# sentinels (0 / 65535) to floating-point backscatter.
+S1_POINT_POLARIZATIONS = frozenset({"VV", "VH", "HH", "HV"})
+S1_POINT_ATTRIBUTE_COLUMNS = frozenset({"flight_direction", "relative_orbit", "orbit_type"})
+
 
 class BaseReader(ABC):
     """Formulaic source adapter for raster and point pipeline access."""

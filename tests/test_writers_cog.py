@@ -268,3 +268,81 @@ def test_cog_writer_normalizes_split_band_chunks(tmp_path):
     plan = COGOutputWriter().build(artifact, output, None)
 
     assert len(plan.tasks) == 2
+
+
+def _backscatter_artifact(nodata=float("nan")):
+    values = np.arange(2 * 2 * 4 * 4, dtype=np.float32).reshape(2, 2, 4, 4)
+    values[0, 0, 0, 0] = np.nan
+    attrs = {} if nodata is None else {"nodata": nodata}
+    return xr.Dataset(
+        {
+            "backscatter": (
+                ("time", "band", "y", "x"),
+                da.from_array(values, chunks=(1, 2, 2, 2)),
+                attrs,
+            )
+        },
+        coords={
+            "time": np.array(["2000-06-01", "2000-06-16"], dtype="datetime64[ns]"),
+            "band": ["VV", "VH"],
+            "y": [3, 2, 1, 0],
+            "x": [0, 1, 2, 3],
+            "product_id": ("time", ["comp", "comp"]),
+            "granule_id": ("time", ["bin_a", "bin_b"]),
+            "source_fingerprint": ("time", ["fp_a", "fp_b"]),
+        },
+        attrs={
+            "crs": "EPSG:3338",
+            "transform": (20.0, 0.0, 1000.0, 0.0, -20.0, 5000.0),
+            "recipe_id": "s1-recipe",
+        },
+    )
+
+
+def test_float_variable_with_nan_nodata_is_written_and_resumes(tmp_path):
+    output = SimpleNamespace(output_id="result", path=tmp_path)
+    writer = COGOutputWriter()
+    plan = writer.build(_backscatter_artifact(), output, None)
+    assert len(plan.tasks) == 8  # 2 times x 2x2 chunks, one variable
+
+    written = _compute(plan)
+    assert all(result.status == WriteStatus.written for result in written)
+    assert {result.variable for result in written} == {"backscatter"}
+    tile = tmp_path / "comp" / "bin_a" / "backscatter.r0000.c0000.tif"
+    with rasterio.open(tile) as dataset:
+        assert dataset.dtypes == ("float32", "float32")
+        assert dataset.descriptions == ("VV", "VH")
+        assert np.isnan(dataset.nodata)
+        assert np.isnan(dataset.read(1)[0, 0])
+        assert dataset.read(1)[0, 1] == 1.0
+
+    writer.finalize(plan, written)
+    rebuilt = writer.build(_backscatter_artifact(), output, None)
+    assert rebuilt.tasks == () and len(rebuilt.completed) == 8
+
+
+def test_unbanded_float_variables_are_tiled_after_banded_ones(tmp_path):
+    artifact = _backscatter_artifact()
+    artifact["quality"] = (
+        ("time", "y", "x"),
+        da.from_array(np.ones((2, 4, 4), dtype=np.float32), chunks=(1, 2, 2)),
+        {"nodata": float("nan")},
+    )
+    plan = COGOutputWriter().build(
+        artifact, SimpleNamespace(output_id="result", path=tmp_path), None
+    )
+    results = _compute(plan)
+    assert len(results) == 16
+    assert {r.variable for r in results} == {"backscatter", "quality"}
+    with rasterio.open(tmp_path / "comp" / "bin_a" / "quality.r0000.c0000.tif") as q:
+        assert q.descriptions == ("QUALITY",)
+
+
+def test_cog_requires_a_tileable_variable_with_nodata(tmp_path):
+    output = SimpleNamespace(output_id="result", path=tmp_path)
+    with pytest.raises(ValueError, match="needs a 'nodata' attribute"):
+        COGOutputWriter().build(_backscatter_artifact(nodata=None), output, None)
+
+    bare = _backscatter_artifact().drop_vars("backscatter")
+    with pytest.raises(ValueError, match="requires a"):
+        COGOutputWriter().build(bare, output, None)

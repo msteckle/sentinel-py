@@ -1,4 +1,9 @@
-"""Seasonal time-series composites for Sentinel-2 processing cubes."""
+"""Seasonal time-series composites for gridded ``(time, band, y, x)`` cubes.
+
+Built for Sentinel-2 reflectance and equally applied to Sentinel-1 backscatter: the
+aggregated variable is ``reflectance`` when present, otherwise the cube's only
+``(time, band, y, x)`` variable, or the node's ``variable``.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +17,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from sentinel_py.cache import deterministic_cache_key
 from sentinel_py.enums import S2_NODATA
+from sentinel_py.pipeline.readers.base import (
+    S1_POINT_ATTRIBUTE_COLUMNS,
+    S1_POINT_POLARIZATIONS,
+)
 from sentinel_py.pipeline.processors.base import (
     BaseProcessor,
     make_recipe_id,
@@ -38,6 +47,7 @@ class S2CompositeNodeConfig(BaseModel):
 
     period: str = Field(default="all", min_length=1)
     aggregation: Literal["mean", "median", "maximum"] = "mean"
+    variable: str | None = Field(default=None, min_length=1)
 
     @field_validator("period", mode="before")
     @classmethod
@@ -116,6 +126,50 @@ def _seasonal_groups(
     return tuple(groups)
 
 
+def _cube_variable(source: Any, requested: str | None) -> str:
+    """Choose the ``(time, band, y, x)`` variable a composite aggregates.
+
+    Parameters
+    ----------
+    source : xarray.Dataset
+        Upstream cube.
+    requested : str, optional
+        The node's ``variable``; when omitted ``reflectance`` is preferred and
+        otherwise the cube's only banded variable is used.
+
+    Returns
+    -------
+    str
+        Name of the variable to aggregate.
+
+    Raises
+    ------
+    TypeError
+        If the variable is missing, not banded over time, or ambiguous.
+    """
+    banded = [
+        str(name)
+        for name, data in source.data_vars.items()
+        if data.dims[:2] == ("time", "band")
+    ]
+    if requested is not None:
+        if requested not in banded:
+            raise TypeError(
+                f"composite variable {requested!r} must be a (time, band, ...) "
+                f"variable of the input; available: {', '.join(banded) or 'none'}"
+            )
+        return requested
+    if "reflectance" in banded:
+        return "reflectance"
+    if len(banded) == 1:
+        return banded[0]
+    raise TypeError(
+        "composite input must have a reflectance variable or exactly one "
+        "(time, band, ...) variable, or the node must set 'variable'; found: "
+        + (", ".join(banded) or "none")
+    )
+
+
 def _composite_name(source: Any, selection: Any, aggregation: str) -> str:
     """Build the stable product name used by composite output writers."""
     years = selection.years
@@ -191,10 +245,9 @@ class S2CompositeProcessor(BaseProcessor):
                     config, {"data": dataset}, context
                 )
             )
-        if not isinstance(source, xr.Dataset) or "reflectance" not in source:
-            raise TypeError(
-                "composite input must be an xarray Dataset with reflectance"
-            )
+        if not isinstance(source, xr.Dataset):
+            raise TypeError("composite input must be an xarray Dataset")
+        variable = _cube_variable(source, config.variable)
         if source.sizes.get("time", 0) == 0:
             raise ValueError("composite input contains no time steps")
 
@@ -209,8 +262,8 @@ class S2CompositeProcessor(BaseProcessor):
             raise ValueError("composite input contains no observations in the season")
         composite_name = _composite_name(source, selection, config.aggregation)
 
-        nodata = source.reflectance.attrs.get("nodata")
-        values = mask_nodata(source.reflectance, nodata)
+        nodata = source[variable].attrs.get("nodata")
+        values = mask_nodata(source[variable], nodata)
         reductions = []
         bin_labels = []
         source_fingerprints = []
@@ -252,7 +305,7 @@ class S2CompositeProcessor(BaseProcessor):
             chunking.update(y=output_grid.chunks.y, x=output_grid.chunks.x)
         result = (
             xr.concat(reductions, dim="time")
-            .to_dataset(name="reflectance")
+            .to_dataset(name=variable)
             .chunk(chunking)
         )
         result = result.assign_coords(
@@ -260,8 +313,8 @@ class S2CompositeProcessor(BaseProcessor):
             granule_id=("time", bin_labels),
             source_fingerprint=("time", source_fingerprints),
         )
-        result["reflectance"].attrs.update(source.reflectance.attrs)
-        result["reflectance"].attrs["nodata"] = nodata
+        result[variable].attrs.update(source[variable].attrs)
+        result[variable].attrs["nodata"] = nodata
         result.attrs.update(source.attrs)
         result.attrs.update(
             processor=self.type_name,
@@ -275,6 +328,9 @@ class S2CompositeProcessor(BaseProcessor):
                 period=config.period,
                 aggregation=config.aggregation,
                 source_recipe=source.attrs.get("recipe_id"),
+                # Added only for non-default variables so Sentinel-2 recipe IDs
+                # (and the COG resume state keyed by them) stay unchanged.
+                **({} if variable == "reflectance" else {"variable": variable}),
             ),
         )
         context.logger.info(
@@ -305,12 +361,15 @@ class S2CompositeProcessor(BaseProcessor):
             "aoi_id", "component_id", "point_index", "longitude", "latitude",
             "time", "product_id", "granule_id", "time_representation", "source_fingerprint",
         }
+        metadata |= S1_POINT_ATTRIBUTE_COLUMNS
         value_columns = [name for name in rows.columns if name not in metadata]
         group_columns = ["aoi_id", "component_id", "point_index", "longitude", "latitude"]
         if config.period == "all":
             # S2 source rows may carry 0 (no-data) or 65535 (saturated) from
             # older caches; neither may participate in a point composite.
             for column in value_columns:
+                if column in S1_POINT_POLARIZATIONS:
+                    continue  # floating-point backscatter already uses NaN nodata
                 rows[column] = rows[column].replace((0, S2_NODATA), np.nan)
             grouped = rows.groupby(group_columns, dropna=False, sort=False)
             aggregate = getattr(grouped[value_columns], {"mean": "mean", "median": "median", "maximum": "max"}[config.aggregation])().reset_index()

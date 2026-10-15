@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -402,7 +403,9 @@ def clip_dem(
             for source in sources:
                 source.close()
         destination.parent.mkdir(parents=True, exist_ok=True)
-        partial = destination.with_name(f".{destination.name}.part")
+        # Unique per writer: concurrent scene jobs share one clip when they share
+        # a region, and each must be able to replace the final file atomically.
+        partial = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.part")
         try:
             with rasterio.open(
                 partial,
@@ -524,7 +527,7 @@ def run_scene(job: SceneJob, logger: logging.Logger | None = None) -> str:
     # SNAP's GeoTIFF writer uses the file's base name as the product node name, which
     # rejects leading dots and similar, and appends ".tif" to other extensions; so the
     # temporary name must be a plain identifier ending in ".tif".
-    partial = output.with_name(f"{key}_partial.tif")
+    partial = output.with_name(f"{key}_partial{uuid.uuid4().hex[:8]}.tif")
     dem_key = deterministic_cache_key(
         {
             "tiles": [

@@ -161,3 +161,30 @@ def test_processor_is_registered_and_versioned():
     processor = get_default_registry().get("snap_gpt")
     assert processor.version == 1 and processor.type_name == "snap_gpt"
     assert isinstance(pd.DataFrame(), pd.DataFrame)  # keeps pandas import honest
+
+
+def test_backscatter_flows_through_composite_into_cog_tiles(tmp_path: Path):
+    import rasterio
+
+    project = write_s1_project(tmp_path)
+    text = project.read_text().replace(
+        "outputs:\n  result:\n    from: sigma0\n    path: output\n    format: xarray",
+        "  - id: seasonal\n    type: composite\n    inputs: {data: sigma0}\n"
+        "    period: all\n    aggregation: mean\n"
+        "outputs:\n  result:\n    from: seasonal\n    path: output\n    format: cog",
+    )
+    assert "format: cog" in text
+    project.write_text(text)
+
+    result = _run(project)
+
+    written = [r for r in result.output_results["result"].results]
+    assert written and all(r.status == "written" for r in written)
+    assert {r.variable for r in written} == {"backscatter"}
+    tiles = sorted((tmp_path / "output").rglob("backscatter.r*.c*.tif"))
+    assert tiles
+    with rasterio.open(tiles[0]) as tile:
+        assert tile.descriptions == ("VV", "VH")
+        assert tile.dtypes == ("float32", "float32")
+        assert tile.read(1).mean() == pytest.approx(0.1, rel=1e-5)
+        assert tile.read(2).mean() == pytest.approx(0.05, rel=1e-5)

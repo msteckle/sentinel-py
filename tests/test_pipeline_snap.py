@@ -107,7 +107,7 @@ def test_run_scene_failure_leaves_no_output_and_cleans_up(tmp_path: Path, monkey
     with pytest.raises(RuntimeError, match="simulated failure"):
         snap.run_scene(job)
     assert not job.output_path.exists()
-    assert not list(job.output_path.parent.glob("*_partial.tif"))
+    assert not list(job.output_path.parent.glob("*_partial*.tif"))
     assert not any((Path(job.work_dir) / "tmp").iterdir())
 
 

@@ -159,3 +159,34 @@ nodes:
 ```
 
 New DEM-derived bands can be added by defining and registering a ``DEMFeature`` subclass in ``sentinel_py.pipeline.processors.dem``. The processor validates feature names from the shared registry and assembles the selected bands without changing YAML dispatch. DEM raster reads run under the process-wide raster lock, like every other native GDAL call. Changing a feature's output requires bumping ``PROCESSOR_VERSION`` in ``dem.py``.
+
+## Sentinel-1 preprocessing with SNAP
+
+The built-in `snap_gpt` processor runs the external SNAP `gpt` tool once per Sentinel-1 GRD scene and AOI unit, then exposes the terrain-corrected scenes as a lazy `backscatter` variable with dimensions `(time, band, y, x)` on the canonical output grid. Install SNAP 14 first (see `docs/quickstart/install.md`), then stage orbit files and the EGM96 grid with `sentinel-py asf download` so processing never needs the network. The node sources are an `s1.grd.local` source (ASF ZIPs plus the staged orbits) and a `dem.local` source holding ArcticDEM tiles.
+
+```yaml
+sources:
+  s1:
+    type: s1.grd.local
+    data_dir: ../data/s1/raw
+    flight_direction: PREDOMINANT   # BOTH, ASCENDING, DESCENDING or PREDOMINANT
+    orbit: precise-or-restituted    # precise, restituted or precise-or-restituted
+  arcticdem:
+    type: dem.local
+    data_dir: ../data/arcticdem/10m
+
+nodes:
+  - id: sigma0
+    type: snap_gpt
+    source: s1
+    dem: arcticdem
+    polarizations: [VV, VH]
+    subset: aoi                     # aoi (AOI plus margin) or scene
+    dem_vertical_datum: ellipsoid   # ArcticDEM heights are ellipsoidal
+```
+
+The built-in graph `builtin:grd_sigma0` applies the orbit file, removes GRD border and thermal noise (without clipping negative values, so later temporal averaging is unbiased), calibrates to linear sigma0, subsets, and terrain-corrects onto the pipeline grid with the external DEM. Output stays in linear power; convert to dB after compositing. A custom graph is a SNAP graph XML file whose `${variables}` are either supplied by sentinel-py (`input`, `output`, `orbitType`, `polarisations`, `sourceBands`, `geoRegion`, `demFile`, `demNoData`, `demApplyEGM`, `mapProjection`, `pixelSpacing`, `gridOriginX`, `gridOriginY`) or listed under the node's `parameters`; unknown or unused names are rejected. SNAP's standard-grid origin is set to the grid anchor plus half a pixel so output pixels line up exactly with the canonical grid.
+
+Node keys: `source`, `dem` (required); `graph` (default `builtin:grd_sigma0`), `polarizations` (default `[VV, VH]`), `dem_vertical_datum` (`ellipsoid` or `egm96`), `subset` (`aoi` or `scene`), `subset_margin_m` (2000), `dem_margin_m` (15000), `parameters`, `work_dir` (default `<s1 data_dir>/.sentinel-py/snap_outputs`), `gpt` (default `$SNAP_HOME/bin/gpt`; a bare `gpt` on `PATH` is never used), `memory_gb` (16), `threads` (4), and `timeout_s`. Each scene run is cached by a key covering the archive, orbit file, region, DEM tiles and datum, polarizations, output grid, graph hash, parameters, and SNAP version, and writes a JSON manifest with the exact `gpt` command. The DEM tiles must cover each scene's processing region, otherwise the run fails before SNAP starts.
+
+Raster AOIs run each scene as a Dask task inside the shared graph. Point AOIs run the same cached scene jobs on the client with `execution.workers` concurrent `gpt` processes and sample one pixel per scene. The COG writer and the `composite` processor currently expect a `reflectance` variable, so S1 backscatter is not yet writable as COG through them.

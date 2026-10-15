@@ -79,3 +79,7 @@ Then, users should create a classmethod that, given a raw mapping (typically par
         # Return the validated values
         return cls(aoi=aoi, years=years, start_period=start, end_period=end)
 ```
+
+## Sentinel-1 sources and the `snap_gpt` node
+
+A `sources` entry of type `s1.grd.local` points at a directory of ASF Sentinel-1 GRD ZIP files. Its keys are `data_dir` (required), `flight_direction` (`BOTH`, `ASCENDING`, `DESCENDING`, or `PREDOMINANT`, default `BOTH`), and `orbit` (`precise`, `restituted`, or `precise-or-restituted`, the acceptable staged orbit-file types). The scene catalog is built from each archive's `manifest.safe` and cached beside the data. The `snap_gpt` node and its keys are documented in `docs/development/processors.md`.

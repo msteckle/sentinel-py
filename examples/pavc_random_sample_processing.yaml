@@ -5,7 +5,7 @@ execution:
   # dask: connect to scheduler_address
   # slurm: create workers through dask-jobqueue
   method: local
-  workers: 8
+  workers: 2
   threads_per_worker: 1
 
 selection:
@@ -26,7 +26,11 @@ sources:
   s2:
     type: s2.l2a.local
     data_dir: ../data/s2/raw
-
+  s1:
+    type: s1.grd.local
+    data_dir: ../data/s1/raw
+    flight_direction: PREDOMINANT  # don't mix ascending and descending scenes
+    orbit: precise-or-restituted
   arcticdem:
     type: dem.local
     data_dir: ../data/arcticdem/10m
@@ -41,19 +45,40 @@ nodes:
     bands: [B02, B03, B04, B05, B06, B07, B08, B8A, B11, B12]
     mask_classes: [0, 1, 3, 8, 9, 10, 11]
     nodata: 65535
-
   # 2. create one summer representative composite per band
   - id: all-composite
     type: composite
     inputs: {data: preprocess}
     period: all
     aggregation: median
-
   # 3. calculate indices from the composite
   - id: indices
     type: s2.index
     inputs: {data: all-composite}
     indices: [NDGI, NDWI1, NDWI2, MSAVI, VARI, RVI, OSAVI, TGI, GLI, NGRDI, CIG, GNDVI, CVI, MTVI2, TCARI, TCI, NARI, TCAPB, TCAPG, TCAPW]
+
+  # S1 processing steps
+  # 1. preprocess using SNAP GPT
+  - id: s1-preprocess
+    type: snap_gpt
+    source: s1
+    dem: arcticdem
+    polarizations: [VV, VH]
+    subset: aoi
+    dem_vertical_datum: ellipsoid  # ArcticDEM heights are ellipsoidal
+    memory_gb: 16
+    threads: 4
+  # 2. create one summer representative composite per band
+  - id: s1-composite
+    type: composite
+    inputs: {data: s1-preprocess}
+    period: all
+    aggregation: median
+    empty_bins: fill  # sites without Sentinel-1 scenes get nodata, not an error
+  # 3. convert the composite to decibels
+  - id: s1-db
+    type: to_db
+    inputs: {data: s1-composite}
 
   # ArcticDEM processing steps
   # 1. calculate terrain features from the DEM
@@ -71,8 +96,11 @@ outputs:
     from: indices
     path: ../data/s2/pavc_samples
     format: parquet
-
   terrain:
     from: terrain
     path: ../data/arcticdem/pavc_samples
+    format: parquet
+  s1_backscatter_db:
+    from: s1-db
+    path: ../data/s1/pavc_samples
     format: parquet

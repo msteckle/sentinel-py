@@ -181,3 +181,10 @@ def test_remote_paths_are_recognised() -> None:
     assert is_remote_path("https://bucket.s3.us-west-2.amazonaws.com/tile.tif")
     assert is_remote_path("/vsis3/bucket/tile.tif")
     assert not is_remote_path(Path("/data/tile.tif"))
+
+
+def test_remote_reads_skip_the_aws_credential_lookup() -> None:
+    """Without this option every open waits ~2 s on the EC2 metadata probe."""
+    from sentinel_py.pipeline.grid import REMOTE_GDAL_OPTIONS
+
+    assert REMOTE_GDAL_OPTIONS["AWS_NO_SIGN_REQUEST"] == "YES"

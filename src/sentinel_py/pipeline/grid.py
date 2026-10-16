@@ -382,7 +382,11 @@ RASTERIO_LOCK = RLock()
 # Reads hold ``RASTERIO_LOCK``, so a worker process makes one network read at a time and
 # the concurrent connections are bounded by the number of worker processes. Throttling
 # responses (HTTP 429/503) are retried by GDAL with a growing delay.
+# ``AWS_NO_SIGN_REQUEST`` matters for speed as well as access: without it rasterio asks
+# boto3 for AWS credentials on every open, and off EC2 the instance-metadata probe
+# times out (about 2 s per file, measured), dwarfing the 0.3 s the read itself takes.
 REMOTE_GDAL_OPTIONS = {
+    "AWS_NO_SIGN_REQUEST": "YES",
     "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
     "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif",
     "GDAL_HTTP_MULTIPLEX": "YES",

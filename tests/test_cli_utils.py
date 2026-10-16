@@ -1,9 +1,12 @@
-"""AOI utility commands: ``bbox2geojson``, ``csv2geojson``, and ``grid``."""
+"""AOI utility commands: ``bbox2geojson``, ``aoi2bbox``, ``csv2geojson``, ``grid``."""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
+
+import geopandas as gpd
+from shapely.geometry import Point, box
 
 from helpers import runner, write_polygon_aoi
 from sentinel_py.cli.main import app
@@ -26,6 +29,41 @@ def test_bbox2geojson_writes_a_polygon_for_the_bounds(tmp_path: Path):
     xs = {point[0] for point in coordinates}
     ys = {point[1] for point in coordinates}
     assert xs == {0.0, 2.0} and ys == {1.0, 3.0}
+
+
+def test_aoi2bbox_encloses_all_features(tmp_path: Path):
+    aoi = tmp_path / "sheds.geojson"
+    gpd.GeoDataFrame(
+        {"name": ["a", "b"]},
+        geometry=[box(0, 0, 1, 1), box(2, -1, 3, 4)],
+        crs="EPSG:4326",
+    ).to_file(aoi, driver="GeoJSON")
+    output = tmp_path / "bbox.geojson"
+
+    result = runner.invoke(
+        app, ["aoi2bbox", "--aoi", str(aoi), "--output", str(output)]
+    )
+
+    assert result.exit_code == 0, result.output
+    (feature,) = _features(output)
+    coordinates = feature["geometry"]["coordinates"][0]
+    assert {p[0] for p in coordinates} == {0.0, 3.0}
+    assert {p[1] for p in coordinates} == {-1.0, 4.0}
+
+
+def test_aoi2bbox_rejects_degenerate_extent(tmp_path: Path):
+    aoi = tmp_path / "point.geojson"
+    gpd.GeoDataFrame(geometry=[Point(1, 1)], crs="EPSG:4326").to_file(
+        aoi, driver="GeoJSON"
+    )
+    output = tmp_path / "bbox.geojson"
+
+    result = runner.invoke(
+        app, ["aoi2bbox", "--aoi", str(aoi), "--output", str(output)]
+    )
+
+    assert result.exit_code == 2
+    assert not output.exists()
 
 
 def test_csv2geojson_writes_points_from_lon_lat_columns(tmp_path: Path):

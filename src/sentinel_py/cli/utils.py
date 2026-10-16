@@ -42,6 +42,40 @@ def bbox2geojson(
     )
 
 
+# sentinel-py aoi2bbox -----------------------------------------------------------------
+@app.command(
+    "aoi2bbox",
+    help=(
+        "Create a bounding box GeoJSON enclosing all features of an AOI file. "
+        "The output bbox will always be in EPSG:4326 (lat/lon)."
+    ),
+)
+def aoi2bbox(
+    aoi: Annotated[
+        Path,
+        typer.Option(
+            exists=True,
+            dir_okay=False,
+            help="Path to area of interest legible by pyogrio.",
+        ),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option(
+            help="Output file path for the bbox GeoJSON.",
+            dir_okay=False,
+        ),
+    ] = Path("aoi2bbox.geojson"),
+) -> None:
+    """Write a EPSG:4326 bounding-box GeoJSON enclosing every feature of an AOI."""
+    from sentinel_py.aoi import aoi_to_bbox
+
+    try:
+        aoi_to_bbox(aoi, output=output)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--aoi") from exc
+
+
 # sentinel-py csv2geojson --------------------------------------------------------------
 @app.command(
     "csv2geojson",

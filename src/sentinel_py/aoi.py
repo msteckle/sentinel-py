@@ -228,6 +228,41 @@ def bbox_to_geojson(
     return gdf
 
 
+def aoi_to_bbox(
+    aoi: GeometryLike,
+    *,
+    output: str | Path | None = None,
+) -> gpd.GeoDataFrame:
+    """
+    Create a single bounding-box polygon enclosing every feature of an AOI.
+
+    Parameters
+    ----------
+    aoi : GeometryLike
+        Path to a vector file readable by pyogrio, a GeoDataFrame, a GeoSeries,
+        or a shapely geometry in lat/lon. Features without a CRS are assumed to be
+        EPSG:4326; others are reprojected to EPSG:4326 before the extent is taken.
+    output : str or Path, optional
+        If provided, writes the bounding box as a GeoJSON file.
+
+    Returns
+    -------
+    gdf : geopandas.GeoDataFrame
+        One-row EPSG:4326 GeoDataFrame holding the bounding-box polygon.
+
+    Raises
+    ------
+    ValueError
+        If the AOI has no features, no valid extent, or a zero-width or
+        zero-height extent (for example, a single point).
+    """
+    gdf = aoi_as_gdf(aoi)
+    xmin, ymin, xmax, ymax = (float(v) for v in gdf.total_bounds)
+    if not np.isfinite((xmin, ymin, xmax, ymax)).all():
+        raise ValueError("AOI has no valid geometry to compute a bounding box from.")
+    return bbox_to_geojson((xmin, ymin, xmax, ymax), crs="EPSG:4326", output=output)
+
+
 def csv_to_geojson(
     csv: Union[str, Path],
     lon: str,

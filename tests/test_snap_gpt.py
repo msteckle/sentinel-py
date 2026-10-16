@@ -223,3 +223,116 @@ def test_backscatter_db_packed_to_int16_cog(tmp_path: Path):
         vv, vh = tile.read(1) * 0.01, tile.read(2) * 0.01
         assert vv.mean() == pytest.approx(-10.0, abs=0.01)  # 0.1 linear
         assert vh.mean() == pytest.approx(-13.01, abs=0.01)  # 0.05 linear
+
+
+# Missing data ---------------------------------------------------------------------
+
+
+def _no_scene_project(tmp_path: Path, **kwargs) -> Path:
+    """A project whose selected years (2019) have no downloaded scenes."""
+    project = write_s1_project(tmp_path, **kwargs)
+    project.write_text(project.read_text().replace("years: [2024]", "years: [2019]"))
+    return project
+
+
+def test_unit_without_scenes_becomes_an_empty_cube_with_a_warning(tmp_path, caplog):
+    logger = logging.getLogger("snap-no-scenes")
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        result = run_pipeline(
+            PipelineConfig.from_file(_no_scene_project(tmp_path)), logger
+        )
+    dataset = _dataset(result)
+
+    assert dataset.sizes["time"] == 0 and dataset.sizes["band"] == 2
+    assert dataset.backscatter.compute().shape == (0, 2, 20, 20)
+    warnings_ = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings_) == 1
+    assert "no Sentinel-1 scenes for 1 of 1 AOI unit(s): site-1" in warnings_[0]
+    assert "Their output will be nodata" in warnings_[0]
+    assert "years=(2019,)" in warnings_[0] and "flight_direction=BOTH" in warnings_[0]
+
+
+def test_on_no_scenes_error_restores_the_hard_failure(tmp_path):
+    project = _no_scene_project(tmp_path, node_extra="    on_no_scenes: error")
+    with pytest.raises(RuntimeError, match="Found 0 Sentinel-1 scenes for AOI site-1"):
+        _run(project)
+
+
+def test_missing_scenes_flow_to_nodata_cog_output(tmp_path: Path):
+    import rasterio
+
+    project = _no_scene_project(tmp_path)
+    project.write_text(
+        project.read_text().replace(
+            "outputs:\n  result:\n    from: sigma0\n    path: output\n    format: xarray",
+            "  - id: seasonal\n    type: composite\n    inputs: {data: sigma0}\n"
+            "    period: all\n    aggregation: median\n    empty_bins: fill\n"
+            "  - id: sigma0_db\n    type: to_db\n    inputs: {data: seasonal}\n"
+            "outputs:\n  result:\n    from: sigma0_db\n    path: output\n    format: cog\n"
+            "    encoding: {dtype: int16, scale: 0.01}",
+        )
+    )
+
+    result = _run(project)
+
+    assert all(r.status == "written" for r in result.output_results["result"].results)
+    tiles = sorted((tmp_path / "output").rglob("backscatter_db.r*.c*.tif"))
+    assert tiles
+    with rasterio.open(tiles[0]) as tile:
+        assert tile.dtypes == ("int16", "int16")
+        assert (tile.read() == -32768).all()  # every pixel is the nodata code
+    assert not list((tmp_path / "work").rglob("*.json"))  # SNAP never ran
+
+
+def test_site_with_and_site_without_scenes_in_one_run(tmp_path: Path):
+    import json
+
+    import rasterio
+
+    project = write_s1_project(tmp_path)
+    aoi = tmp_path / "aoi.geojson"
+    data = json.loads(aoi.read_text())
+    near = data["features"][0]
+    ring = near["geometry"]["coordinates"][0]
+    far = {  # 400 km away: no scene footprint reaches it
+        "type": "Feature", "properties": {"site": "site-far"},
+        "geometry": {"type": "Polygon", "coordinates": [[[x + 400_000, y] for x, y in ring]]},
+    }
+    data["features"].append(far)
+    aoi.write_text(json.dumps(data))
+    project.write_text(
+        project.read_text().replace(
+            "outputs:\n  result:\n    from: sigma0\n    path: output\n    format: xarray",
+            "  - id: seasonal\n    type: composite\n    inputs: {data: sigma0}\n"
+            "    period: all\n    aggregation: mean\n    empty_bins: fill\n"
+            "outputs:\n  result:\n    from: seasonal\n    path: output\n    format: cog",
+        )
+    )
+
+    _run(project)
+
+    near_tile = next((tmp_path / "output" / "site-1").rglob("backscatter.r0000.c0000.tif"))
+    far_tile = next((tmp_path / "output" / "site-far").rglob("backscatter.r0000.c0000.tif"))
+    with rasterio.open(near_tile) as src:
+        assert src.read(1).mean() == pytest.approx(0.1, rel=1e-5)
+    with rasterio.open(far_tile) as src:
+        assert src.nodata is not None and src.nodata != src.nodata  # NaN nodata
+        assert not (src.read() == src.read()).any()  # every pixel is NaN
+
+
+def test_points_without_scenes_give_a_typed_empty_table_then_nodata_rows(tmp_path: Path):
+    project = _no_scene_project(tmp_path, point=True)
+    project.write_text(
+        project.read_text().replace(
+            "outputs:\n  result:\n    from: sigma0\n    path: output\n    format: parquet",
+            "  - id: seasonal\n    type: composite\n    inputs: {data: sigma0}\n"
+            "    period: all\n    aggregation: median\n    empty_bins: fill\n"
+            "outputs:\n  result:\n    from: seasonal\n    path: output\n    format: parquet",
+        )
+    )
+    result = _run(project)
+
+    scenes = result.node_results["sigma0"].rows
+    assert scenes.empty and {"VV", "VH", "orbit_type", "units"} <= set(scenes.columns)
+    composite = result.node_results["seasonal"].rows
+    assert len(composite) == 1 and composite[["VV", "VH"]].isna().all().all()

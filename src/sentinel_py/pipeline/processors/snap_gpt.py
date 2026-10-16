@@ -78,6 +78,7 @@ class SnapGPTNodeConfig(BaseModel):
     memory_gb: int = Field(default=16, ge=1)
     threads: int = Field(default=4, ge=1)
     timeout_s: int | None = Field(default=None, gt=0)
+    on_no_scenes: Literal["warn", "error"] = "warn"
 
     @field_validator("polarizations", mode="before")
     @classmethod
@@ -121,12 +122,15 @@ def _unit_jobs(
     Raises
     ------
     RuntimeError
-        If no scene intersects the unit, a selected scene lacks an acceptable staged
+        If no scene intersects the unit and ``on_no_scenes`` is ``"error"`` (otherwise
+        an empty list is returned), or a selected scene lacks an acceptable staged
         orbit or a requested polarization.
     """
     scenes = select_unit_scenes(catalog, unit, source, pipeline.selection)
     if scenes.empty:
-        raise RuntimeError(f"Found 0 Sentinel-1 scenes for AOI {unit.aoi_id}")
+        if config.on_no_scenes == "error":
+            raise RuntimeError(f"Found 0 Sentinel-1 scenes for AOI {unit.aoi_id}")
+        return []
 
     allowed = _ALLOWED_ORBITS[source.orbit]
     no_orbit = scenes[~scenes["orbit_type"].isin(allowed)]
@@ -275,6 +279,14 @@ def _lazy_dataset(
             rows.append(da.concatenate(blocks, axis=2))
         scene_arrays.append(da.concatenate(rows, axis=1))
 
+    if scene_arrays:
+        stacked = da.stack(scene_arrays, axis=0).rechunk({1: -1})
+    else:  # no scenes: a zero-length time axis that composites can fill with nodata
+        stacked = da.zeros(
+            (0, bands, grid.height, grid.width), dtype=np.float32,
+            chunks=(1, bands, grid.chunks.y, grid.chunks.x),
+        )
+
     x = grid.bounds[0] + (np.arange(grid.width) + 0.5) * grid.resolution[0]
     y = grid.bounds[3] - (np.arange(grid.height) + 0.5) * grid.resolution[1]
     rows = [row for row, _ in jobs]
@@ -283,7 +295,7 @@ def _lazy_dataset(
         data_vars={
             "backscatter": (
                 ("time", "band", "y", "x"),
-                da.stack(scene_arrays, axis=0).rechunk({1: -1}),
+                stacked,
                 {
                     "long_name": "terrain-corrected sigma0 backscatter, linear power",
                     "nodata": float("nan"),
@@ -436,6 +448,30 @@ class SnapGPTProcessor(BaseProcessor):
             gpt=state["gpt"], version=state["version"], work_dir=state["work_dir"],
         )
 
+    @staticmethod
+    def _warn_no_scenes(
+        context: ProcessorContext,
+        config: SnapGPTNodeConfig,
+        state: dict,
+        empty: list[str],
+        total: int,
+    ) -> None:
+        """Warn once about AOI units without scenes; their output is nodata."""
+        if not empty:
+            return
+        selection, source = context.pipeline.selection, state["source"]
+        shown = ", ".join(empty[:10]) + (" ..." if len(empty) > 10 else "")
+        context.logger.warning(
+            "snap_gpt node=%s: no Sentinel-1 scenes for %d of %d AOI unit(s): %s. "
+            "Their output will be nodata. Looked in %s (%d scene(s) in the catalog) "
+            "for years=%s season=%02d-%02d..%02d-%02d flight_direction=%s; the "
+            "sensor may not have acquired this mode there, or the data is not yet "
+            "downloaded ('sentinel-py asf query/download').",
+            context.node.node_id, len(empty), total, shown, source.data_dir,
+            len(state["catalog"]), selection.years, *selection.start_period,
+            *selection.end_period, source.flight_direction,
+        )
+
     def _recipe(self, config: SnapGPTNodeConfig, state: dict, grid: Any) -> str:
         """Return the recipe ID covering every result-affecting node setting."""
         return make_recipe_id(
@@ -467,9 +503,12 @@ class SnapGPTProcessor(BaseProcessor):
         pipeline = context.pipeline
         state = self._prepare(config, context)
         datasets = {}
+        empty = []
         for unit in pipeline.aoi_plan.units:
             grid = grid_for_unit(unit, pipeline.output_grid)
             jobs = self._jobs(unit, config, context, state)
+            if not jobs:
+                empty.append(unit.aoi_id)
             dataset = _lazy_dataset(jobs, grid, config.polarizations)
             dataset.attrs.update(
                 pipeline=str(pipeline.path), processor=self.type_name,
@@ -479,6 +518,7 @@ class SnapGPTProcessor(BaseProcessor):
             datasets[(unit.aoi_id, unit.component_id)] = apply_polygon_mask(
                 dataset, unit
             )
+        self._warn_no_scenes(context, config, state, empty, len(datasets))
         context.logger.info(
             "Building lazy node=%s AOI units=%d scenes=%d",
             context.node.node_id, len(datasets),
@@ -516,6 +556,7 @@ class SnapGPTProcessor(BaseProcessor):
             )
 
         rows = []
+        empty = [unit.aoi_id for unit, jobs in per_unit if not jobs]
         for unit, jobs in per_unit:
             grid = point_grid(
                 unit, crs=pipeline.output_grid.crs,
@@ -540,5 +581,18 @@ class SnapGPTProcessor(BaseProcessor):
                     {pol: float(v) for pol, v in zip(config.polarizations, values, strict=True)}
                 )
                 rows.append(row)
+        self._warn_no_scenes(context, config, state, empty, len(per_unit))
+        if not rows:  # keep the column layout so downstream nodes can fill nodata
+            template = point_row(
+                per_unit[0][0], time="", product_id="", granule_id="",
+                time_representation="acquisition", source_fingerprint="",
+            )
+            template.update(
+                {"flight_direction": "", "relative_orbit": 0, "orbit_type": "",
+                 "units": "linear", **{pol: np.nan for pol in config.polarizations}}
+            )
+            return PointSampleArtifact(
+                pd.DataFrame(columns=list(template)), pipeline.aoi_plan
+            )
         return PointSampleArtifact(pd.DataFrame(rows), pipeline.aoi_plan)
 

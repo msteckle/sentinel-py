@@ -98,8 +98,11 @@ def test_missing_staged_orbit_fails_fast_with_guidance(tmp_path: Path):
 
 def test_uncovered_dem_names_the_scene(tmp_path: Path):
     project = write_s1_project(tmp_path, dem=False)
-    with pytest.raises(RuntimeError, match="does not cover the processing region"):
+    with pytest.raises(RuntimeError, match="does not cover the processing region") as info:
         _run(project)
+    message = str(info.value)
+    assert "2 scene(s)" in message  # every uncovered scene is counted, not just one
+    assert S1_SCENES[0] in message and "sentinel-py pgc missing" in message
 
 
 def test_scene_without_requested_polarization_is_reported(tmp_path: Path):

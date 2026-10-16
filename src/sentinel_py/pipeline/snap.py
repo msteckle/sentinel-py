@@ -25,6 +25,8 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from typing import Any
+
 import sentinel_py.pipeline.grid as pipeline_grid
 from sentinel_py.cache import deterministic_cache_key, write_json_atomic
 
@@ -59,6 +61,8 @@ RESERVED_VARIABLES = frozenset(
 # SNAP writes 0 outside the geocoded footprint and gives the GeoTIFF no nodata tag.
 OUTPUT_NODATA = 0.0
 DEFAULT_DEM_NODATA = -9999.0
+# Gaps below this area (degrees squared, about 10 square metres) are float noise.
+MIN_GAP_DEG2 = 1e-9
 _VARIABLE_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_.]*)\}")
 _VERSION_RE = re.compile(r"SNAP Release version\s+(\S+)")
 _DEGREES_PER_METER = 1.0 / 111_320.0
@@ -312,15 +316,27 @@ def region_polygon_wkt(bounds: tuple[float, float, float, float]) -> str:
 ########################################################################################
 
 
-def _tile_footprint_wgs84(path: Path) -> tuple[float, float, float, float]:
-    """Return a DEM tile's bounds in EPSG:4326 (densified for polar CRSs)."""
+@functools.lru_cache(maxsize=4096)
+def _footprint(path: str, mtime_ns: int) -> tuple[float, float, float, float]:
+    """Read a tile's EPSG:4326 bounds; ``mtime_ns`` keys the cache to the file."""
     import rasterio
     from rasterio.warp import transform_bounds
 
+    del mtime_ns
     with pipeline_grid.RASTERIO_LOCK, rasterio.open(path) as dataset:
         return tuple(
             transform_bounds(dataset.crs, "EPSG:4326", *dataset.bounds, densify_pts=21)
         )
+
+
+def tile_footprint_wgs84(path: Path) -> tuple[float, float, float, float]:
+    """Return a DEM tile's ``(west, south, east, north)`` bounds in EPSG:4326.
+
+    Bounds are densified for polar CRSs and cached per file and modification time,
+    so planning many scenes against one tile set opens each tile once.
+    """
+    path = Path(path)
+    return _footprint(str(path), path.stat().st_mtime_ns)
 
 
 def select_dem_tiles(
@@ -330,28 +346,49 @@ def select_dem_tiles(
     west, south, east, north = bounds_wgs84
     selected = []
     for tile in tiles:
-        t_west, t_south, t_east, t_north = _tile_footprint_wgs84(tile)
+        t_west, t_south, t_east, t_north = tile_footprint_wgs84(tile)
         if t_west < east and t_east > west and t_south < north and t_north > south:
             selected.append(tile)
     return tuple(selected)
 
 
-def dem_covers(
-    tiles: tuple[Path, ...], region_bounds_wgs84: tuple[float, float, float, float]
-) -> bool:
-    """Return whether the union of tile footprints contains a lon/lat box.
+def scene_region_bounds(
+    geometry_wgs84: Any,
+    footprint_wkt: str,
+    *,
+    subset: str,
+    subset_margin_m: float,
+    dem_margin_m: float,
+) -> tuple[tuple[float, float, float, float], tuple[float, float, float, float]]:
+    """Return a scene's processing region and the larger DEM extent it needs.
 
-    Tile footprints are compared in geographic space; a region is covered only when
-    no part of it lies outside every tile, which is what SNAP needs to avoid empty
-    output over uncovered ground.
+    Parameters
+    ----------
+    geometry_wgs84 : shapely geometry
+        AOI unit geometry in EPSG:4326.
+    footprint_wkt : str
+        Scene footprint (lon/lat WKT) from the catalog.
+    subset : str
+        ``"aoi"`` processes the AOI-footprint overlap plus ``subset_margin_m``;
+        ``"scene"`` processes the whole footprint.
+    subset_margin_m, dem_margin_m : float
+        Margins in metres around the processing region and around the DEM extent.
+
+    Returns
+    -------
+    tuple
+        ``(region, dem_bounds)``, each ``(west, south, east, north)``.
     """
-    from shapely.geometry import box
-    from shapely.ops import unary_union
+    from shapely import wkt
 
-    footprints = [box(*_tile_footprint_wgs84(tile)) for tile in tiles]
-    if not footprints:
-        return False
-    return bool(unary_union(footprints).buffer(0).contains(box(*region_bounds_wgs84)))
+    footprint = wkt.loads(footprint_wkt)
+    if subset == "scene":
+        region = footprint.bounds
+    else:
+        region = expand_bounds(
+            geometry_wgs84.intersection(footprint).bounds, subset_margin_m
+        )
+    return region, expand_bounds(region, dem_margin_m)
 
 
 def clip_dem(

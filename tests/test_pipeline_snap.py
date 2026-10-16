@@ -142,13 +142,28 @@ def test_job_key_changes_with_every_result_affecting_input(tmp_path: Path):
     assert replace(job, memory_gb=64, threads=1, timeout_s=5).key() == base
 
 
-def test_dem_covers_requires_the_whole_region(tmp_path: Path):
+def test_tile_selection_and_footprints(tmp_path: Path):
     job = _job(tmp_path)
     tiles = tuple(Path(t) for t in job.dem_tiles)
     west, south, east, north = job.dem_bounds_wgs84
-    assert snap.dem_covers(tiles, (west + 0.2, south + 0.2, east - 0.2, north - 0.2))
-    assert not snap.dem_covers(tiles, (west - 5, south, east, north))
-    assert not snap.dem_covers((), (west, south, east, north))
+    footprint = snap.tile_footprint_wgs84(tiles[0])
+    assert footprint[0] < west and footprint[2] > east  # the tile spans the DEM extent
+    assert snap.tile_footprint_wgs84(tiles[0]) == footprint  # served from the cache
     assert snap.select_dem_tiles(tiles, (west, south, east, north)) == tiles
     assert snap.select_dem_tiles(tiles, (0.0, 0.0, 1.0, 1.0)) == ()
 
+
+def test_scene_region_bounds_for_aoi_and_scene_subsets():
+    from shapely.geometry import box
+
+    footprint = box(-157, 68, -154, 69).wkt
+    aoi = box(-155.8, 68.4, -155.7, 68.45)
+    region, dem_bounds = snap.scene_region_bounds(
+        aoi, footprint, subset="aoi", subset_margin_m=1000, dem_margin_m=5000
+    )
+    assert region[0] < -155.8 and region[2] > -155.7  # margin added around the AOI
+    assert dem_bounds[0] < region[0] and dem_bounds[3] > region[3]
+    whole, _ = snap.scene_region_bounds(
+        aoi, footprint, subset="scene", subset_margin_m=1000, dem_margin_m=5000
+    )
+    assert whole == (-157.0, 68.0, -154.0, 69.0)

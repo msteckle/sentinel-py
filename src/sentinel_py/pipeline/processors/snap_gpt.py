@@ -25,6 +25,7 @@ from sentinel_py.download.s1_orbits import parse_scene_name
 from sentinel_py.download.snap_auxdata import EGM96_RELPATH
 from sentinel_py.enums import SourceType
 from sentinel_py.pipeline import snap
+from sentinel_py.pipeline.dem_coverage import find_dem_gaps
 from sentinel_py.pipeline.artifacts import PointSampleArtifact, RasterArtifact
 from sentinel_py.pipeline.grid import ChunkShape, grid_for_unit, point_grid
 from sentinel_py.pipeline.processors.base import (
@@ -37,7 +38,7 @@ from sentinel_py.pipeline.readers.base import apply_polygon_mask, point_row
 from sentinel_py.pipeline.readers.s1 import (
     attach_orbits,
     build_scene_catalog,
-    select_scenes,
+    select_unit_scenes,
 )
 
 # Bump when the produced backscatter values change (built-in graph, grid handling,
@@ -121,19 +122,9 @@ def _unit_jobs(
     ------
     RuntimeError
         If no scene intersects the unit, a selected scene lacks an acceptable staged
-        orbit or a requested polarization, or the DEM does not cover its region.
+        orbit or a requested polarization.
     """
-    from shapely import wkt
-
-    selection = pipeline.selection
-    scenes = select_scenes(
-        catalog,
-        geometry_wgs84=unit.geometry_wgs84,
-        flight_direction=source.flight_direction,
-        years=selection.years,
-        speriod=selection.start_period,
-        eperiod=selection.end_period,
-    )
+    scenes = select_unit_scenes(catalog, unit, source, pipeline.selection)
     if scenes.empty:
         raise RuntimeError(f"Found 0 Sentinel-1 scenes for AOI {unit.aoi_id}")
 
@@ -160,20 +151,12 @@ def _unit_jobs(
     origin = (anchor[0] + resolution[0] / 2, anchor[1] + resolution[1] / 2)
     jobs = []
     for row in scenes.itertuples():
-        footprint = wkt.loads(row.footprint_wkt)
-        if config.subset == "scene":
-            region = footprint.bounds
-        else:
-            region = unit.geometry_wgs84.intersection(footprint).bounds
-            region = snap.expand_bounds(region, config.subset_margin_m)
-        dem_bounds = snap.expand_bounds(region, config.dem_margin_m)
+        region, dem_bounds = snap.scene_region_bounds(
+            unit.geometry_wgs84, row.footprint_wkt, subset=config.subset,
+            subset_margin_m=config.subset_margin_m, dem_margin_m=config.dem_margin_m,
+        )
+        # DEM coverage of ``region`` was checked for the whole node in ``_prepare``.
         tiles = snap.select_dem_tiles(dem_tiles, dem_bounds)
-        if not snap.dem_covers(tiles, region):
-            raise RuntimeError(
-                f"DEM source {config.dem!r} does not cover the processing region of "
-                f"scene {row.scene} (lon/lat bounds {region}); add ArcticDEM tiles "
-                "for it or narrow the AOI"
-            )
         times = parse_scene_name(row.scene)
         assert times is not None  # catalog rows come from validated scene names
         jobs.append(
@@ -412,6 +395,15 @@ class SnapGPTProcessor(BaseProcessor):
         pipeline = context.pipeline
         source = pipeline.sources[config.source]
         dem = pipeline.sources[config.dem]
+        gaps = find_dem_gaps(pipeline, [context.node.node_id], include_margin=False)
+        if gaps:
+            raise RuntimeError(
+                f"DEM source {config.dem!r} does not cover the processing region of "
+                f"{len(gaps)} scene(s) (e.g. {gaps[0].scene}, lon/lat bounds "
+                f"{gaps[0].region}); run 'sentinel-py pgc missing --pipeline "
+                f"{pipeline.path}' to list the missing ArcticDEM tiles, then fetch "
+                "them with 'sentinel-py pgc query' and 'sentinel-py pgc download'"
+            )
         gpt = snap.resolve_gpt(config.gpt)
         version = snap.snap_version(str(gpt))
         base = Path(pipeline.path).parent

@@ -306,6 +306,37 @@ def select_scenes(
     return selected.reset_index(drop=True)
 
 
+def select_unit_scenes(
+    catalog: pd.DataFrame, unit: Any, source: Any, selection: Any
+) -> pd.DataFrame:
+    """Select the catalog scenes one AOI unit is processed from.
+
+    Parameters
+    ----------
+    catalog : pandas.DataFrame
+        Output of :func:`build_scene_catalog` (optionally with orbits attached).
+    unit : AOIUnit
+        Planned AOI unit supplying the EPSG:4326 geometry.
+    source : S1SourceConfig
+        Source supplying the ``flight_direction`` filter.
+    selection : SelectionConfig
+        Pipeline selection supplying years and the season.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Scenes intersecting the unit within the selected years and season.
+    """
+    return select_scenes(
+        catalog,
+        geometry_wgs84=unit.geometry_wgs84,
+        flight_direction=source.flight_direction,
+        years=selection.years,
+        speriod=selection.start_period,
+        eperiod=selection.end_period,
+    )
+
+
 ########################################################################################
 # Pipeline reader adapter
 ########################################################################################

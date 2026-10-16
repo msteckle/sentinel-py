@@ -12,7 +12,6 @@ import json
 import logging
 import re
 from collections.abc import Callable
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,6 +43,9 @@ from sentinel_py.pipeline.readers.base import BaseReader, apply_polygon_mask, po
 
 S2_ACQUISITION_PATTERN = re.compile(r"_MSIL2A_(\d{8}T\d{6})_")
 S2_TILE_PATTERN = re.compile(r"_(T\d{2}[A-Z]{3})_")
+
+# Largest number of points one point-sampling task reads from a granule.
+POINTS_PER_TASK = 500
 
 
 ########################################################################################
@@ -816,9 +818,9 @@ def read_s2_unit(
 ########################################################################################
 
 
-def _read_scene_point(
+def _sample_granule_points(
     granule: Any,
-    unit: AOIUnit,
+    units: tuple[AOIUnit, ...],
     *,
     crs: str,
     resolution: tuple[float, float],
@@ -826,24 +828,32 @@ def _read_scene_point(
     bands: tuple[str, ...],
     mask_classes: tuple[int, ...],
     nodata: int,
-) -> dict[str, Any]:
-    """Read one scene's canonical pixel for one point in an isolated process."""
+) -> list[dict[str, Any]]:
+    """Read one granule's canonical pixel for a batch of points (one worker task).
 
-    grid = point_grid(unit, crs=crs, resolution=resolution, anchor=anchor,
-                      chunks=ChunkShape(y=1, x=1))
+    The granule metadata is resolved once and every point reuses it, so a remote
+    scene's files are opened once per batch rather than once per point.
+    """
+
     scene = _scene_source(granule, bands, mask_classes, nodata)
-    values = _read_scene_chunk(scene, grid, next(grid.iter_windows()))[:, 0, 0]
-    row = point_row(
-        unit,
-        time=granule.acquisition_time,
-        product_id=granule.product_id,
-        granule_id=granule.granule_id,
-        time_representation="acquisition",
-        source_fingerprint=_source_fingerprint(scene),
-    )
-    row["quantification_value"] = scene.quantification_value
-    row.update({band: value.item() for band, value in zip(bands, values)})
-    return row
+    fingerprint = _source_fingerprint(scene)
+    rows = []
+    for unit in units:
+        grid = point_grid(unit, crs=crs, resolution=resolution, anchor=anchor,
+                          chunks=ChunkShape(y=1, x=1))
+        values = _read_scene_chunk(scene, grid, next(grid.iter_windows()))[:, 0, 0]
+        row = point_row(
+            unit,
+            time=granule.acquisition_time,
+            product_id=granule.product_id,
+            granule_id=granule.granule_id,
+            time_representation="acquisition",
+            source_fingerprint=fingerprint,
+        )
+        row["quantification_value"] = scene.quantification_value
+        row.update({band: value.item() for band, value in zip(bands, values)})
+        rows.append(row)
+    return rows
 
 
 def sample_s2_points(
@@ -860,41 +870,59 @@ def sample_s2_points(
     crs: str,
     resolution: tuple[float, float],
     anchor: tuple[float, float],
-    workers: int,
+    execution: Any,
     progress: Callable[[int, int], None] | None = None,
     find_granules: GranuleFinder | None = None,
 ) -> pd.DataFrame:
-    """Discover once and sample all intersecting scene/point pairs in parallel."""
+    """Discover once and sample all intersecting scene/point pairs on the Dask backend.
+
+    Work is split into one task per granule and batch of at most ``POINTS_PER_TASK``
+    points and runs through ``execution`` (local, external Dask, or Slurm), exactly
+    like raster outputs. ``progress`` counts scene/point pairs.
+    """
+    from sentinel_py.pipeline.execution import compute_dask_tasks
 
     if find_granules is None:
         find_granules = local_granule_finder(
             data_dir, bands, resolution_m, years=years, speriod=speriod, eperiod=eperiod
         )
     granules = find_granules(None)
-    work = [
-        (granule, unit)
-        for granule in granules
-        for unit in units
-        if granule.footprint is not None and granule.footprint.intersects(unit.geometry_wgs84)
-    ]
-    if not work:
+    batches = []
+    for granule in granules:
+        matching = tuple(
+            unit
+            for unit in units
+            if granule.footprint is not None
+            and granule.footprint.intersects(unit.geometry_wgs84)
+        )
+        for start in range(0, len(matching), POINTS_PER_TASK):
+            batches.append((granule, matching[start : start + POINTS_PER_TASK]))
+    total = sum(len(batch) for _, batch in batches)
+    if not total:
         raise RuntimeError("Found 0 Sentinel-2 granules intersecting the point AOIs")
     if progress is not None:
-        progress(0, len(work))
-    rows: list[dict[str, Any]] = []
-    with ProcessPoolExecutor(max_workers=max(1, workers)) as executor:
-        futures = [
-            executor.submit(
-                _read_scene_point, granule, unit, crs=crs, resolution=resolution,
-                anchor=anchor, bands=bands, mask_classes=mask_classes, nodata=nodata,
-            )
-            for granule, unit in work
-        ]
-        for completed, future in enumerate(as_completed(futures), start=1):
-            rows.append(future.result())
-            if progress is not None:
-                progress(completed, len(work))
-    return pd.DataFrame.from_records(rows)
+        progress(0, total)
+
+    from dask import delayed
+
+    tasks = [
+        delayed(_sample_granule_points)(
+            granule, batch, crs=crs, resolution=resolution, anchor=anchor,
+            bands=bands, mask_classes=mask_classes, nodata=nodata,
+        )
+        for granule, batch in batches
+    ]
+    completed = 0
+
+    def on_result(rows: list[dict[str, Any]]) -> None:
+        """Advance the progress count by the points a finished task sampled."""
+        nonlocal completed
+        completed += len(rows)
+        if progress is not None:
+            progress(completed, total)
+
+    results = compute_dask_tasks(tasks, execution, progress_callback=on_result)
+    return pd.DataFrame.from_records([row for rows in results for row in rows])
 
 
 ########################################################################################

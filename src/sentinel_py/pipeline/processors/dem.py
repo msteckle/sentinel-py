@@ -474,11 +474,30 @@ class DEMProcessor(BaseProcessor):
         from sentinel_py.pipeline.artifacts import PointSampleArtifact
         from sentinel_py.pipeline.readers.base import point_row
 
+        from sentinel_py.pipeline.execution import compute_dask_tasks
+
         raster = self.execute_raster(config, inputs, context)
+        keys = list(raster.datasets)
+        # One task per point, run on the pipeline's execution backend like raster tasks.
+        label = f"Sampling terrain points ({context.node.node_id})"
+        completed = 0
+
+        def on_result(_: Any) -> None:
+            """Report one finished point to the node progress bar."""
+            nonlocal completed
+            completed += 1
+            context.report_progress(label, completed, len(keys))
+
+        context.report_progress(label, 0, len(keys))
+        computed = compute_dask_tasks(
+            [raster.datasets[key].reflectance.data[0, :, 0, 0] for key in keys],
+            context.pipeline.execution,
+            progress_callback=on_result,
+        )
         records: list[dict[str, Any]] = []
-        for key, dataset in raster.datasets.items():
+        for key, values in zip(keys, computed, strict=True):
+            dataset = raster.datasets[key]
             unit = raster.plan.by_key[key]
-            values = dataset.reflectance.compute().values[0, :, 0, 0]
             record = point_row(
                 unit,
                 time="1970-01-01",

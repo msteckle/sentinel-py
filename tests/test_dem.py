@@ -198,3 +198,22 @@ def test_local_and_remote_sources_sample_identical_terrain(tmp_path, monkeypatch
     for column in ("slope", "aspect"):
         assert remote[column].iloc[0] == pytest.approx(local[column].iloc[0])
     assert remote["source_fingerprint"].iloc[0] != local["source_fingerprint"].iloc[0]
+
+
+def test_dem_point_sampling_reports_progress_per_point(tmp_path):
+    import logging
+
+    from sentinel_py.pipeline import PipelineConfig
+    from sentinel_py.pipeline.run import run_pipeline
+
+    path = _write_dem_project(tmp_path, "{type: dem.local, data_dir: dem}")
+    events = []
+
+    run_pipeline(
+        PipelineConfig.from_file(path),
+        logging.getLogger("dem-progress-test"),
+        node_progress_callback=lambda *event: events.append(event),
+    )
+
+    assert events[0] == ("Sampling terrain points (terrain)", 0, 1)
+    assert events[-1] == ("Sampling terrain points (terrain)", 1, 1)

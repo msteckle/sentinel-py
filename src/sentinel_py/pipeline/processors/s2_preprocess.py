@@ -273,7 +273,7 @@ class S2PreprocessProcessor(BaseProcessor):
             crs=pipeline.output_grid.crs,
             resolution=pipeline.output_grid.resolution,
             anchor=pipeline.output_grid.anchor,
-            workers=pipeline.execution.workers,
+            execution=pipeline.execution,
             progress=report,
             find_granules=find_granules,
         )

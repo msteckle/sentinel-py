@@ -207,7 +207,7 @@ S1_SITE_COORDS = "68.0,-156.5 68.9,-156.5 68.9,-154.9 68.0,-154.9"
 
 _STUB_GPT = '''#!{python}
 """Stand-in for SNAP gpt: verifies the offline layout and writes a tiny GeoTIFF."""
-import glob, json, math, os, sys
+import glob, json, math, os, sys, time
 
 import numpy as np
 import rasterio
@@ -232,6 +232,8 @@ assert orbits, "orbit file not linked into the SNAP user directory"
 assert os.path.exists(os.path.join(userdir, "auxdata/dem/egm96/ww15mgh_b.zip"))
 assert os.path.exists(params["demFile"]), "DEM clip missing"
 
+started = time.time()
+time.sleep(float(os.environ.get("STUB_GPT_SLEEP", "0")))
 res = float(params["pixelSpacing"])
 ox, oy = float(params["gridOriginX"]), float(params["gridOriginY"])
 coords = params["geoRegion"].replace("POLYGON((", "").replace("))", "").split(",")
@@ -254,6 +256,9 @@ with rasterio.open(
         dst.write(np.full((height, width), {{"Sigma0_VV": 0.1, "Sigma0_VH": 0.05}}.get(band, 0.2), "float32"), index)
 with open(params["output"] + ".args.json", "w") as handle:
     json.dump({{"argv": args, "params": params}}, handle)
+if os.environ.get("STUB_GPT_LOG"):
+    with open(os.environ["STUB_GPT_LOG"], "a") as handle:
+        handle.write("%s %s\\n" % (started, time.time()))
 '''
 
 

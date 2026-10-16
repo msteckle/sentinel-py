@@ -167,3 +167,84 @@ def test_scene_region_bounds_for_aoi_and_scene_subsets():
         aoi, footprint, subset="scene", subset_margin_m=1000, dem_margin_m=5000
     )
     assert whole == (-157.0, 68.0, -154.0, 69.0)
+
+
+# Bounded concurrency ---------------------------------------------------------------
+
+
+def _isolated_slots(monkeypatch, tmp_path: Path) -> None:
+    """Give a test its own slot directory so tests cannot block each other."""
+    monkeypatch.setattr(snap.tempfile, "gettempdir", lambda: str(tmp_path / "slots"))
+
+
+def test_snap_slot_blocks_until_one_of_the_slots_is_free(monkeypatch, tmp_path: Path):
+    import threading
+    import time
+
+    _isolated_slots(monkeypatch, tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def holder():
+        with snap.snap_slot(1):
+            entered.set()
+            release.wait(5)
+
+    thread = threading.Thread(target=holder)
+    thread.start()
+    entered.wait(5)
+    started = time.monotonic()
+    waiter_done = threading.Event()
+
+    def waiter():
+        with snap.snap_slot(1):
+            waiter_done.set()
+
+    other = threading.Thread(target=waiter)
+    other.start()
+    assert not waiter_done.wait(0.6)  # the only slot is taken
+    release.set()
+    assert waiter_done.wait(5)
+    thread.join()
+    other.join()
+    assert time.monotonic() - started >= 0.6
+
+    # With two slots both holders run together.
+    inside = []
+    barrier = threading.Barrier(2, timeout=5)
+
+    def pair():
+        with snap.snap_slot(2) as slot:
+            inside.append(slot)
+            barrier.wait()
+
+    threads = [threading.Thread(target=pair) for _ in range(2)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert sorted(inside) == [0, 1]
+
+
+@pytest.mark.parametrize(("limit", "expected_max_overlap"), [(1, 1), (3, 3)])
+def test_run_scene_never_exceeds_max_concurrent(
+    tmp_path: Path, monkeypatch, limit: int, expected_max_overlap: int
+):
+    from concurrent.futures import ThreadPoolExecutor
+
+    _isolated_slots(monkeypatch, tmp_path)
+    log = tmp_path / "gpt-times.log"
+    monkeypatch.setenv("STUB_GPT_SLEEP", "0.8")
+    monkeypatch.setenv("STUB_GPT_LOG", str(log))
+    (tmp_path / "project").mkdir()
+    base = _job(tmp_path / "project", max_concurrent=limit)
+    jobs = [replace(base, parameters=((f"run{i}", "1"),)) for i in range(3)]
+
+    with ThreadPoolExecutor(3) as pool:
+        list(pool.map(snap.run_scene, jobs))
+
+    spans = sorted(tuple(map(float, line.split())) for line in log.read_text().splitlines())
+    assert len(spans) == 3
+    overlap = max(
+        sum(1 for other in spans if other[0] < end and other[1] > start)
+        for start, end in spans
+    )
+    assert overlap == expected_max_overlap

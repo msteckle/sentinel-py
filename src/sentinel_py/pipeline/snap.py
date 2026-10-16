@@ -21,6 +21,8 @@ import subprocess
 import tempfile
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -66,6 +68,8 @@ MIN_GAP_DEG2 = 1e-9
 _VARIABLE_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_.]*)\}")
 _VERSION_RE = re.compile(r"SNAP Release version\s+(\S+)")
 _DEGREES_PER_METER = 1.0 / 111_320.0
+SLOT_DIR_PREFIX = "sentinel-py-snap-slots"
+SLOT_POLL_SECONDS = 0.25
 
 
 ########################################################################################
@@ -222,6 +226,9 @@ class SceneJob:
         JVM heap and tile parallelism for the run.
     timeout_s : int, optional
         Wall-clock limit for the ``gpt`` process.
+    max_concurrent : int
+        Most ``gpt`` processes allowed to run at once on this machine, across every
+        worker and pipeline (see :func:`snap_slot`); not part of the cache key.
     """
 
     scene: str
@@ -248,6 +255,7 @@ class SceneJob:
     memory_gb: int = 16
     threads: int = 4
     timeout_s: int | None = None
+    max_concurrent: int = 2
 
     def key(self) -> str:
         """Return the deterministic key of every input that affects the output.
@@ -470,6 +478,50 @@ def clip_dem(
 ########################################################################################
 
 
+@contextmanager
+def snap_slot(limit: int) -> Iterator[int]:
+    """Hold one of ``limit`` per-machine slots while a ``gpt`` process runs.
+
+    Every ``gpt`` is a JVM with its own heap and worker threads, so running as many
+    as there are Dask workers or threads can exhaust memory and CPU. Slots are
+    advisory ``flock`` files in the machine's temporary directory, so the bound
+    holds across all worker processes and pipelines on one machine, and a crashed
+    process releases its slot automatically. Slots are per machine on purpose:
+    on Slurm each node enforces its own limit.
+
+    Parameters
+    ----------
+    limit : int
+        Number of slots; the caller blocks until one is free.
+
+    Yields
+    ------
+    int
+        Index of the slot held.
+    """
+    import fcntl
+
+    directory = Path(tempfile.gettempdir()) / f"{SLOT_DIR_PREFIX}-{os.getuid()}"
+    directory.mkdir(parents=True, exist_ok=True)
+    slot, handle = 0, None
+    while handle is None:
+        for candidate in range(limit):
+            attempt = open(directory / f"slot-{candidate}.lock", "a+")
+            try:
+                fcntl.flock(attempt, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                attempt.close()
+                continue
+            slot, handle = candidate, attempt
+            break
+        else:
+            time.sleep(SLOT_POLL_SECONDS)
+    try:
+        yield slot
+    finally:
+        handle.close()  # closing the descriptor releases the lock
+
+
 def prepare_userdir(job: SceneJob, userdir: Path) -> None:
     """Link staged orbit and EGM96 files into a throwaway SNAP user directory.
 
@@ -602,7 +654,7 @@ def run_scene(job: SceneJob, logger: logging.Logger | None = None) -> str:
         ]
         logger.info("Running SNAP for %s (%s)", job.scene, key)
         try:
-            with log_path.open("w") as log:
+            with snap_slot(job.max_concurrent), log_path.open("w") as log:
                 log.write("$ " + " ".join(command) + "\n")
                 log.flush()
                 completed = subprocess.run(

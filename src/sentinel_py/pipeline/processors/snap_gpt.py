@@ -9,8 +9,9 @@ per-scene cache; point AOIs run the same cached scene jobs and sample one pixel.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Literal
 
@@ -79,6 +80,7 @@ class SnapGPTNodeConfig(BaseModel):
     threads: int = Field(default=4, ge=1)
     timeout_s: int | None = Field(default=None, gt=0)
     on_no_scenes: Literal["warn", "error"] = "warn"
+    max_concurrent: int = Field(default=2, ge=1)
 
     @field_validator("polarizations", mode="before")
     @classmethod
@@ -102,6 +104,27 @@ def _parameter_items(parameters: Mapping[str, Any]) -> tuple[tuple[str, str], ..
             for name, value in parameters.items()
         )
     )
+
+
+def _warn_if_oversubscribed(context: ProcessorContext, config: SnapGPTNodeConfig) -> None:
+    """Warn when the allowed concurrent ``gpt`` runs could exceed RAM or CPU cores."""
+    try:
+        ram_gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1024**3
+    except (ValueError, OSError, AttributeError):
+        ram_gb = None
+    cores = os.cpu_count()
+    if ram_gb is not None and config.max_concurrent * config.memory_gb > ram_gb:
+        context.logger.warning(
+            "snap_gpt node=%s: max_concurrent (%d) x memory_gb (%d) exceeds the %.0f GB "
+            "of RAM on this machine; lower either to avoid swapping",
+            context.node.node_id, config.max_concurrent, config.memory_gb, ram_gb,
+        )
+    if cores is not None and config.max_concurrent * config.threads > cores:
+        context.logger.warning(
+            "snap_gpt node=%s: max_concurrent (%d) x threads (%d) exceeds the %d CPU "
+            "cores on this machine",
+            context.node.node_id, config.max_concurrent, config.threads, cores,
+        )
 
 
 def _unit_jobs(
@@ -191,6 +214,7 @@ def _unit_jobs(
                     memory_gb=config.memory_gb,
                     threads=config.threads,
                     timeout_s=config.timeout_s,
+                    max_concurrent=config.max_concurrent,
                 ),
             )
         )
@@ -427,9 +451,12 @@ class SnapGPTProcessor(BaseProcessor):
             work_dir = (base / config.work_dir).resolve()
         catalog = attach_orbits(build_scene_catalog(source.data_dir), source.data_dir)
         context.logger.info(
-            "snap_gpt node=%s gpt=%s snap=%s graph=%s work_dir=%s",
+            "snap_gpt node=%s gpt=%s snap=%s graph=%s work_dir=%s up to %d concurrent "
+            "gpt process(es) of %d thread(s) and a %d GB heap",
             context.node.node_id, gpt, version, graph[0].name, work_dir,
+            config.max_concurrent, config.threads, config.memory_gb,
         )
+        _warn_if_oversubscribed(context, config)
         return {
             "source": source,
             "gpt": str(gpt),
@@ -534,8 +561,9 @@ class SnapGPTProcessor(BaseProcessor):
     ) -> Any:
         """Run the cached scene jobs and sample one pixel per point and scene.
 
-        SNAP runs on the client with ``execution.workers`` concurrent ``gpt``
-        processes, matching how the Sentinel-2 point path samples on the client.
+        SNAP runs on the client with at most ``min(execution.workers, max_concurrent)``
+        concurrent ``gpt`` processes, matching how the Sentinel-2 point path samples
+        on the client.
         """
         if not isinstance(config, SnapGPTNodeConfig) or inputs:
             raise TypeError("Invalid snap_gpt configuration or inputs")
@@ -550,10 +578,21 @@ class SnapGPTProcessor(BaseProcessor):
             "snap_gpt points=%d scene runs=%d workers=%d",
             len(per_unit), len(unique), pipeline.execution.workers,
         )
-        with ThreadPoolExecutor(max_workers=max(1, pipeline.execution.workers)) as pool:
-            outputs = dict(
-                zip(unique, pool.map(snap.run_scene, unique.values()), strict=True)
-            )
+        # Threads only wait on gpt subprocesses; more than max_concurrent would just
+        # queue on the machine's gpt slots.
+        pool_size = max(1, min(pipeline.execution.workers, config.max_concurrent))
+        label = f"SNAP scenes ({context.node.node_id})"
+        outputs = {}
+        context.report_progress(label, 0, len(unique))
+        with ThreadPoolExecutor(max_workers=pool_size) as pool:
+            futures = {pool.submit(snap.run_scene, job): key for key, job in unique.items()}
+            try:
+                for done, future in enumerate(as_completed(futures), start=1):
+                    outputs[futures[future]] = future.result()
+                    context.report_progress(label, done, len(unique))
+            except BaseException:
+                pool.shutdown(wait=False, cancel_futures=True)  # stop queued scenes
+                raise
 
         rows = []
         empty = [unit.aoi_id for unit, jobs in per_unit if not jobs]

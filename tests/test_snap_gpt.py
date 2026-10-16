@@ -359,3 +359,75 @@ def test_s1_points_flow_into_binned_climatology(tmp_path: Path):
     assert valid["VV"].tolist() == pytest.approx([-10.0, -10.0], abs=1e-4)  # 0.1 linear
     assert valid["VH"].tolist() == pytest.approx([-13.0103, -13.0103], abs=1e-3)
     assert rows["VV"].isna().sum() == 7 and set(rows["units"].dropna()) == {"dB"}
+
+
+def test_max_concurrent_defaults_and_is_validated():
+    assert SnapGPTNodeConfig(source="s1", dem="dem").max_concurrent == 2
+    with pytest.raises(ValueError):
+        SnapGPTNodeConfig(source="s1", dem="dem", max_concurrent=0)
+
+
+def test_oversubscription_is_warned_about(tmp_path: Path, caplog):
+    project = write_s1_project(
+        tmp_path, node_extra="    max_concurrent: 1000\n    memory_gb: 1024\n    threads: 1024"
+    )
+    logger = logging.getLogger("snap-oversub")
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        run_pipeline(PipelineConfig.from_file(project), logger)
+    messages = " ".join(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+    assert "exceeds the" in messages and "GB of RAM" in messages and "CPU cores" in messages
+
+
+def test_point_runs_use_no_more_threads_than_max_concurrent(tmp_path: Path, monkeypatch):
+    from sentinel_py.pipeline.processors import snap_gpt
+
+    sizes = []
+
+    class Recording(snap_gpt.ThreadPoolExecutor):
+        def __init__(self, max_workers=None, *args, **kwargs):
+            sizes.append(max_workers)
+            super().__init__(max_workers, *args, **kwargs)
+
+    monkeypatch.setattr(snap_gpt, "ThreadPoolExecutor", Recording)
+    # execution.workers is 2 in the fixture, so max_concurrent 1 must win.
+    _run(write_s1_project(tmp_path, point=True, node_extra="    max_concurrent: 1"))
+    assert sizes == [1]
+
+
+def test_point_scene_runs_report_progress_before_outputs_exist(tmp_path: Path):
+    events = []
+    config = PipelineConfig.from_file(write_s1_project(tmp_path, point=True))
+
+    run_pipeline(
+        config, LOGGER, node_progress_callback=lambda *event: events.append(event)
+    )
+
+    label = "SNAP scenes (sigma0)"
+    assert events[0] == (label, 0, 2)  # the bar can open before any scene finishes
+    assert events[-1] == (label, 2, 2)
+    assert [done for _, done, _ in events] == sorted(done for _, done, _ in events)
+    assert {name for name, _, _ in events} == {label}
+
+
+def test_point_progress_counts_cached_scenes_immediately(tmp_path: Path):
+    project = write_s1_project(tmp_path, point=True)
+    _run(project)  # populate the per-scene cache
+    events = []
+
+    run_pipeline(
+        PipelineConfig.from_file(project), LOGGER,
+        node_progress_callback=lambda *event: events.append(event),
+    )
+
+    assert events[-1][1:] == (2, 2)
+
+
+def test_cli_run_shows_the_eager_scene_bar_for_point_pipelines(tmp_path: Path):
+    from helpers import runner
+
+    from sentinel_py.cli.main import app
+
+    result = runner.invoke(app, ["run", str(write_s1_project(tmp_path, point=True))])
+
+    assert result.exit_code == 0, result.output
+    assert "SNAP scenes (sigma0)" in result.output

@@ -33,7 +33,9 @@ from sentinel_py.pipeline.processors.base import (
 _PERIOD_PATTERN = re.compile(r"^(?P<count>[1-9][0-9]*)(?P<unit>D|W|M|Y)$")
 
 # Bump when composite output changes so cached COG resume keys are invalidated.
-PROCESSOR_VERSION = 2
+# 3: bins after an empty bin kept their position in the compacted list, so their
+# time coordinate and ``bin_NNNN_<date>`` label named the wrong seasonal slot.
+PROCESSOR_VERSION = 3
 
 
 ########################################################################################
@@ -49,6 +51,7 @@ class S2CompositeNodeConfig(BaseModel):
     period: str = Field(default="all", min_length=1)
     aggregation: Literal["mean", "median", "maximum"] = "mean"
     variable: str | None = Field(default=None, min_length=1)
+    empty_bins: Literal["drop", "fill"] = "drop"
 
     @field_validator("period", mode="before")
     @classmethod
@@ -115,16 +118,53 @@ def _season_boundaries(
 def _seasonal_groups(
     times: np.ndarray,
     boundaries: tuple[np.datetime64, ...],
-) -> tuple[tuple[int, ...], ...]:
-    """Group source time indices into non-empty seasonal bins."""
-    canonical = np.array([_canonical_date(value) for value in times])
-    indices = np.searchsorted(boundaries, canonical, side="right") - 1
-    groups: list[tuple[int, ...]] = []
-    for group_index in range(len(boundaries) - 1):
-        members = tuple(np.flatnonzero(indices == group_index).tolist())
-        if members:
-            groups.append(members)
+    *,
+    keep_empty: bool = False,
+) -> tuple[tuple[int, tuple[int, ...]], ...]:
+    """Group source time indices into seasonal bins.
+
+    Parameters
+    ----------
+    times : numpy.ndarray
+        Acquisition timestamps.
+    boundaries : tuple[numpy.datetime64, ...]
+        Bin boundaries from :func:`_season_boundaries`.
+    keep_empty : bool, default False
+        Also return bins without observations (with no members), so every seasonal
+        slot is represented even when no data exists for it.
+
+    Returns
+    -------
+    tuple[tuple[int, tuple[int, ...]], ...]
+        ``(bin index, member time indices)`` pairs. The bin index is the position of
+        the bin in the full season, whether or not earlier bins are returned.
+    """
+    bin_count = len(boundaries) - 1
+    if len(times):
+        canonical = np.array([_canonical_date(value) for value in times])
+        indices = np.searchsorted(boundaries, canonical, side="right") - 1
+    else:
+        indices = np.array([], dtype=int)
+    groups: list[tuple[int, tuple[int, ...]]] = []
+    for bin_index in range(bin_count):
+        members = tuple(np.flatnonzero(indices == bin_index).tolist())
+        if members or keep_empty:
+            groups.append((bin_index, members))
     return tuple(groups)
+
+
+def _nodata_composite(values: Any) -> Any:
+    """Return an all-NaN ``(band, y, x)`` composite shaped like ``values`` without time."""
+    import dask.array as da
+    import xarray as xr
+
+    dims = [name for name in values.dims if name != "time"]
+    shape = tuple(values.sizes[name] for name in dims)
+    return xr.DataArray(
+        da.full(shape, np.nan, dtype=np.float32, chunks=shape),
+        dims=dims,
+        coords={name: values.coords[name] for name in dims if name in values.coords},
+    )
 
 
 def _composite_name(source: Any, selection: Any, aggregation: str) -> str:
@@ -145,6 +185,47 @@ def _composite_name(source: Any, selection: Any, aggregation: str) -> str:
         f"{start_month:02d}-{start_day:02d}-{end_month:02d}-{end_day:02d}_"
         f"{aggregation}"
     )
+
+
+def _fill_missing_points(aggregate: Any, plan: Any, value_columns: list[str]) -> Any:
+    """Append an all-NaN composite row for every planned point without observations.
+
+    Parameters
+    ----------
+    aggregate : pandas.DataFrame
+        Composite rows of the points that had observations.
+    plan : AOIPlan
+        Pipeline AOI plan whose ``units`` list every point.
+    value_columns : list[str]
+        Value columns to set to NaN on the added rows.
+
+    Returns
+    -------
+    pandas.DataFrame
+        ``aggregate`` plus one nodata row per missing point.
+    """
+    import pandas as pd
+
+    from sentinel_py.enums import AOIKind
+    from sentinel_py.pipeline.readers.base import point_row
+
+    present = set(zip(aggregate["aoi_id"], aggregate["component_id"], strict=True))
+    added = []
+    for unit in getattr(plan, "units", ()):
+        if unit.kind != AOIKind.point or (unit.aoi_id, unit.component_id) in present:
+            continue
+        row = point_row(
+            unit, time=aggregate["time"].iloc[0] if len(aggregate) else "all",
+            product_id="composite", granule_id="all",
+            time_representation="composite", source_fingerprint="composite",
+        )
+        row.update({name: np.nan for name in value_columns})
+        added.append(row)
+    if not added:
+        return aggregate
+    if aggregate.empty:
+        return pd.DataFrame(added)
+    return pd.concat([aggregate, pd.DataFrame(added)], ignore_index=True)
 
 
 ########################################################################################
@@ -205,8 +286,12 @@ class S2CompositeProcessor(BaseProcessor):
         if not isinstance(source, xr.Dataset):
             raise TypeError("composite input must be an xarray Dataset")
         variable = select_cube_variable(source, config.variable, owner="composite")
-        if source.sizes.get("time", 0) == 0:
-            raise ValueError("composite input contains no time steps")
+        fill = config.empty_bins == "fill"
+        if source.sizes.get("time", 0) == 0 and not fill:
+            raise ValueError(
+                "composite input contains no time steps; set empty_bins: fill to "
+                "write nodata composites for areas without data"
+            )
 
         selection = context.pipeline.selection
         boundaries = _season_boundaries(
@@ -214,7 +299,7 @@ class S2CompositeProcessor(BaseProcessor):
             selection.end_period,
             config.period,
         )
-        groups = _seasonal_groups(source.time.values, boundaries)
+        groups = _seasonal_groups(source.time.values, boundaries, keep_empty=fill)
         if not groups:
             raise ValueError("composite input contains no observations in the season")
         composite_name = _composite_name(source, selection, config.aggregation)
@@ -224,26 +309,29 @@ class S2CompositeProcessor(BaseProcessor):
         reductions = []
         bin_labels = []
         source_fingerprints = []
-        for group_index, members in enumerate(groups):
-            subset = values.isel(time=list(members))
-            valid = subset.notnull().any(dim="time")
-            safe_subset = subset.where(valid, 0)
-            if config.aggregation == "mean":
-                composite = safe_subset.mean(dim="time", skipna=True)
-            elif config.aggregation == "median":
-                composite = safe_subset.median(dim="time", skipna=True)
+        for bin_index, members in groups:
+            if members:
+                subset = values.isel(time=list(members))
+                valid = subset.notnull().any(dim="time")
+                safe_subset = subset.where(valid, 0)
+                if config.aggregation == "mean":
+                    composite = safe_subset.mean(dim="time", skipna=True)
+                elif config.aggregation == "median":
+                    composite = safe_subset.median(dim="time", skipna=True)
+                else:
+                    composite = safe_subset.max(dim="time", skipna=True)
+                composite = composite.where(valid)
             else:
-                composite = safe_subset.max(dim="time", skipna=True)
-            composite = composite.where(valid)
+                composite = _nodata_composite(values)
             if nodata is not None:
                 composite = composite.fillna(nodata).astype(np.float32)
             reductions.append(
                 composite.expand_dims(
-                    time=[boundaries[group_index].astype("datetime64[ns]")]
+                    time=[boundaries[bin_index].astype("datetime64[ns]")]
                 )
             )
             bin_labels.append(
-                f"bin_{group_index:04d}_{str(boundaries[group_index])[:10]}"
+                f"bin_{bin_index:04d}_{str(boundaries[bin_index])[:10]}"
             )
             source_fingerprints.append(
                 deterministic_cache_key(
@@ -252,6 +340,8 @@ class S2CompositeProcessor(BaseProcessor):
                             str(value)
                             for value in source.source_fingerprint.values[list(members)]
                         ]
+                        if members
+                        else []
                     }
                 )
             )
@@ -284,6 +374,7 @@ class S2CompositeProcessor(BaseProcessor):
                 self.version,
                 period=config.period,
                 aggregation=config.aggregation,
+                empty_bins=config.empty_bins,
                 source_recipe=source.attrs.get("recipe_id"),
                 # Added only for non-default variables so Sentinel-2 recipe IDs
                 # (and the COG resume state keyed by them) stay unchanged.
@@ -335,6 +426,8 @@ class S2CompositeProcessor(BaseProcessor):
             aggregate["granule_id"] = "all"
             aggregate["time_representation"] = "composite"
             aggregate["source_fingerprint"] = "composite"
+            if config.empty_bins == "fill":
+                aggregate = _fill_missing_points(aggregate, source.plan, value_columns)
             return PointSampleArtifact(aggregate, source.plan)
         # Preserve acquisition rows for non-all bins until binning rules are expanded.
         # This is explicit rather than silently applying a different calendar policy.

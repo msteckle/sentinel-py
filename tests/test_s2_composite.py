@@ -234,15 +234,16 @@ def test_composite_variable_selection_and_errors():
     np.testing.assert_allclose(result.extra.values[0, 0, 0, 0], 0.4, rtol=1e-6)
 
 
-def test_composite_recipe_id_is_unchanged_for_reflectance_and_varies_by_variable():
+def test_composite_recipe_id_covers_empty_bins_and_varies_by_variable():
     from sentinel_py.pipeline.processors.base import make_recipe_id
 
     processor = S2CompositeProcessor()
     config = S2CompositeNodeConfig(period="15D", aggregation="maximum")
     s2 = processor.execute(config, {"data": _source()}, _context())
-    # Recorded recipe: Sentinel-2 composites must keep their pre-generalization ID.
+    # Recorded recipe for version 3 (bin labels fixed; see PROCESSOR_VERSION).
     assert s2.attrs["recipe_id"] == make_recipe_id(
-        "composite", 2, period="15D", aggregation="maximum", source_recipe="source"
+        "composite", 3, period="15D", aggregation="maximum", empty_bins="drop",
+        source_recipe="source",
     )
     s1 = processor.execute(config, {"data": _backscatter()}, _context())
     assert s1.attrs["recipe_id"] != s2.attrs["recipe_id"]
@@ -271,3 +272,137 @@ def test_point_composite_keeps_s1_zeros_and_skips_scene_attributes():
     assert not {"flight_direction", "relative_orbit", "orbit_type"} & set(
         result.rows.columns
     )
+
+
+# Empty seasonal bins and missing data -------------------------------------------------
+
+
+def _sparse_cube(float_data: bool = False) -> xr.Dataset:
+    """Observations in bin 0 (06-02) and bin 2 (07-04) of 15-day bins from 06-01."""
+    if float_data:
+        values, nodata, dtype = np.array([[[[1.0]]], [[[3.0]]]]), float("nan"), "float32"
+    else:
+        values, nodata, dtype = np.array([[[[10]]], [[[30]]]]), 65535, "uint16"
+    return xr.Dataset(
+        {
+            "reflectance": (
+                ("time", "band", "y", "x"),
+                values.astype(dtype),
+                {"nodata": nodata},
+            )
+        },
+        coords={
+            "time": np.array(["2023-06-02", "2024-07-04"], dtype="datetime64[ns]"),
+            "band": ["B02"], "y": [0], "x": [0],
+            "source_fingerprint": ("time", ["a", "b"]),
+        },
+        attrs={"recipe_id": "source"},
+    )
+
+
+def test_dropped_bins_keep_their_true_seasonal_position():
+    """Regression: the label of a bin after an empty one named the wrong slot."""
+    result = S2CompositeProcessor().execute(
+        S2CompositeNodeConfig(period="15D", aggregation="mean"),
+        {"data": _sparse_cube()}, _context(),
+    )
+    assert result.granule_id.values.tolist() == [
+        "bin_0000_2000-06-01", "bin_0002_2000-07-01",
+    ]
+    assert [str(t)[:10] for t in result.time.values] == ["2000-06-01", "2000-07-01"]
+
+
+def test_fill_emits_every_bin_with_nodata_for_empty_ones():
+    result = S2CompositeProcessor().execute(
+        S2CompositeNodeConfig(period="15D", aggregation="mean", empty_bins="fill"),
+        {"data": _sparse_cube()}, _context(),
+    )
+    labels = result.granule_id.values.tolist()
+    assert labels[:4] == [
+        "bin_0000_2000-06-01", "bin_0001_2000-06-16",
+        "bin_0002_2000-07-01", "bin_0003_2000-07-16",
+    ]
+    # 06-01 .. 08-31 in 15-day bins: six full bins and a two-day remainder.
+    assert len(labels) == result.sizes["time"] == 7
+    values = result.reflectance.values[:, 0, 0, 0]
+    assert values.tolist() == [10.0, 65535.0, 30.0, 65535.0, 65535.0, 65535.0, 65535.0]
+    assert result.source_fingerprint.values[1] != result.source_fingerprint.values[0]
+
+
+def test_fill_uses_nan_for_floating_point_cubes_and_ignores_nan_inputs():
+    cube = _sparse_cube(float_data=True)
+    cube["reflectance"].values[0, 0, 0, 0] = np.nan  # the only bin-0 sample is NaN
+    result = S2CompositeProcessor().execute(
+        S2CompositeNodeConfig(period="15D", aggregation="median", empty_bins="fill"),
+        {"data": cube}, _context(),
+    )
+    values = result.reflectance.values[:, 0, 0, 0]
+    assert np.isnan(values[[0, 1, 3, 4, 5, 6]]).all() and values[2] == 3.0
+
+
+def test_zero_time_cube_needs_fill():
+    empty = _sparse_cube(float_data=True).isel(time=slice(0, 0))
+    with pytest.raises(ValueError, match="empty_bins: fill"):
+        S2CompositeProcessor().execute(
+            S2CompositeNodeConfig(), {"data": empty}, _context()
+        )
+    result = S2CompositeProcessor().execute(
+        S2CompositeNodeConfig(period="all", empty_bins="fill"), {"data": empty}, _context()
+    )
+    assert result.sizes["time"] == 1 and np.isnan(result.reflectance.values).all()
+    assert result.granule_id.values.tolist() == ["bin_0000_2000-06-01"]
+
+
+def _point_unit(index: int):
+    from shapely.geometry import Point
+
+    from sentinel_py.enums import AOIKind
+
+    return SimpleNamespace(
+        aoi_id=f"site-{index}", component_id=f"part-{index}", kind=AOIKind.point,
+        geometry_wgs84=Point(-150.0 + index, 68.0),
+    )
+
+
+def _point_rows(*indices: int) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "aoi_id": f"site-{i}", "component_id": f"part-{i}", "point_index": i,
+                "longitude": -150.0 + i, "latitude": 68.0, "time": "20240601T000000",
+                "product_id": "p", "granule_id": "g", "time_representation": "acquisition",
+                "source_fingerprint": "f", "VV": 0.1 * (i + 1), "VH": 0.01,
+            }
+            for i in indices
+        ]
+    )
+
+
+def test_point_composite_fill_adds_nodata_rows_for_points_without_data():
+    plan = SimpleNamespace(units=(_point_unit(0), _point_unit(1)))
+    result = S2CompositeProcessor().execute_points(
+        S2CompositeNodeConfig(period="all", aggregation="mean", empty_bins="fill"),
+        {"data": PointSampleArtifact(_point_rows(0), plan)}, _context(),
+    )
+    rows = result.rows.set_index("aoi_id")
+    assert list(rows.index) == ["site-0", "site-1"]
+    assert rows.loc["site-0", "VV"] == pytest.approx(0.1)
+    assert np.isnan(rows.loc["site-1", "VV"]) and np.isnan(rows.loc["site-1", "VH"])
+    assert rows.loc["site-1", "time_representation"] == "composite"
+    # Without fill the point is simply absent.
+    plain = S2CompositeProcessor().execute_points(
+        S2CompositeNodeConfig(period="all", aggregation="mean"),
+        {"data": PointSampleArtifact(_point_rows(0), plan)}, _context(),
+    )
+    assert list(plain.rows["aoi_id"]) == ["site-0"]
+
+
+def test_point_composite_fill_handles_a_table_with_no_rows():
+    plan = SimpleNamespace(units=(_point_unit(0), _point_unit(1)))
+    empty = _point_rows(0).iloc[0:0].astype({"VV": "float64", "VH": "float64"})
+    result = S2CompositeProcessor().execute_points(
+        S2CompositeNodeConfig(period="all", aggregation="median", empty_bins="fill"),
+        {"data": PointSampleArtifact(empty, plan)}, _context(),
+    )
+    assert len(result.rows) == 2 and result.rows[["VV", "VH"]].isna().all().all()
+    assert result.rows[["VV", "VH"]].isna().all().all()

@@ -116,6 +116,8 @@ def test_remote_example_pipeline_validates(tmp_path) -> None:
     example = Path(__file__).parents[1] / "examples" / "pavc_random_sample_remote_processing.yaml"
     (tmp_path / "examples").mkdir()
     shutil.copy(example, tmp_path / "examples" / example.name)
+    (tmp_path / "data" / "s1" / "raw").mkdir(parents=True)
+    (tmp_path / "data" / "arcticdem" / "10m").mkdir(parents=True)
     aoi = tmp_path / "data" / "aois" / "pavc_random_sample.geojson"
     aoi.parent.mkdir(parents=True)
     aoi.write_text(
@@ -138,5 +140,13 @@ def test_remote_example_pipeline_validates(tmp_path) -> None:
     assert {source.source_type for source in config.sources.values()} == {
         "s2.l2a.remote",
         "dem.remote",
+        "s1.grd.local",
+        "dem.local",
+    }
+    # Sentinel-1 backscatter joins the table through the same node.
+    assert config.nodes[-1].inputs == {
+        "base": "indices",
+        "terrain": "terrain",
+        "radar": "s1-db",
     }
     assert [node.node_id for node in config.ordered_nodes][-1] == "samples"

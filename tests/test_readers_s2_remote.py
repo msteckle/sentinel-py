@@ -47,23 +47,46 @@ def _scene(item_id: str, when: str, footprint, hrefs: dict[str, str]) -> dict:
 HREFS = {"B02": "https://example.invalid/B02.tif", "SCL": "https://example.invalid/SCL.tif"}
 
 
-def test_granule_record_carries_cog_urls_radiometry_and_identity() -> None:
+def test_granule_record_carries_cog_urls_and_identity() -> None:
     scenes = pd.DataFrame([_scene("item-1", "2024-06-15T12:00:00Z", box(0, 0, 1, 1), HREFS)])
+    row = next(scenes.itertuples())
 
-    granule = s2_remote.granule_from_row(
-        next(scenes.itertuples()), ("B02",), "sentinel-2-l2a"
-    )
+    granule = s2_remote.granule_from_row(row, ("B02",), "sentinel-2-c1-l2a")
 
     assert granule.band_paths == {"B02": HREFS["B02"]}
     assert granule.scl_path == HREFS["SCL"]
     assert granule.acquisition_time == "20240615T120000"
     assert granule.safe_dir is None and granule.product_metadata is None
-    assert granule.radiometry.offsets == {"B02": -1000}
     assert granule.radiometry.special_values == (0, 65535)
     assert granule.radiometry.quantification_value == 10000
     # Identity changes with the collection, so the two archives never share caches.
-    other = s2_remote.granule_from_row(next(scenes.itertuples()), ("B02",), "sentinel-2-c1-l2a")
+    other = s2_remote.granule_from_row(row, ("B02",), "sentinel-2-l2a")
     assert other.fingerprint != granule.fingerprint
+
+
+def test_offset_comes_from_stac_only_for_collections_that_encode_it() -> None:
+    """``sentinel-2-l2a`` pixels carry no +1000 offset although STAC advertises -0.1."""
+    scenes = pd.DataFrame([_scene("item-1", "2024-06-15T12:00:00Z", box(0, 0, 1, 1), HREFS)])
+    row = next(scenes.itertuples())
+
+    encoded = s2_remote.granule_from_row(row, ("B02",), "sentinel-2-c1-l2a")
+    harmonized = s2_remote.granule_from_row(row, ("B02",), "sentinel-2-l2a")
+
+    assert encoded.radiometry.offsets == {"B02": -1000}
+    assert harmonized.radiometry.offsets == {"B02": 0}
+
+
+def test_offset_convention_is_part_of_the_fingerprint(monkeypatch) -> None:
+    """Point samples cached under the other offset convention must not be reused."""
+    scenes = pd.DataFrame([_scene("item-1", "2024-06-15T12:00:00Z", box(0, 0, 1, 1), HREFS)])
+    row = next(scenes.itertuples())
+    before = s2_remote.granule_from_row(row, ("B02",), "sentinel-2-l2a").fingerprint
+
+    monkeypatch.setattr(
+        s2_remote, "COLLECTIONS_WITH_ENCODED_OFFSET", frozenset({"sentinel-2-l2a"})
+    )
+
+    assert s2_remote.granule_from_row(row, ("B02",), "sentinel-2-l2a").fingerprint != before
 
 
 def test_finder_queries_once_filters_by_season_and_footprint(tmp_path, monkeypatch) -> None:
@@ -103,12 +126,13 @@ def test_remote_source_config_accepts_only_known_collections(tmp_path: Path) -> 
     reader = get_default_reader_registry().get(SourceType.s2_l2a_remote)
 
     default = reader.parse_config("s2", {"type": "s2.l2a.remote"}, tmp_path)
-    c1 = reader.parse_config(
-        "s2", {"type": "s2.l2a.remote", "collection": "sentinel-2-c1-l2a"}, tmp_path
+    other = reader.parse_config(
+        "s2", {"type": "s2.l2a.remote", "collection": "sentinel-2-l2a"}, tmp_path
     )
 
-    assert default.data_dir is None and default.collection == "sentinel-2-l2a"
-    assert c1.collection == "sentinel-2-c1-l2a"
+    # Collection 1 matches the CDSE SAFE encoding, so it is the default.
+    assert default.data_dir is None and default.collection == "sentinel-2-c1-l2a"
+    assert other.collection == "sentinel-2-l2a"
     with pytest.raises(PipelineConfigError, match="collection must be one of"):
         reader.parse_config("s2", {"type": "s2.l2a.remote", "collection": "x"}, tmp_path)
     with pytest.raises(PipelineConfigError, match="data_dir"):

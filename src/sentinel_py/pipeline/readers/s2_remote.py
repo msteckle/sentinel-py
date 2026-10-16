@@ -19,7 +19,7 @@ import pandas as pd
 from shapely import wkt
 
 from sentinel_py.cache import DEFAULT_PIPELINE_CACHE_DIR, QueryCache, deterministic_cache_key
-from sentinel_py.enums import S2_SATURATED_DN
+from sentinel_py.enums import S2_SATURATED_DN, EarthSearchCollection
 from sentinel_py.pipeline.grid import AOIPlan, AOIUnit
 from sentinel_py.pipeline.readers.s2 import S2Granule, S2Radiometry, _acquisition_is_selected
 
@@ -29,6 +29,15 @@ STAC_CACHE_DIR = DEFAULT_PIPELINE_CACHE_DIR / "s2-stac"
 STAC_QUERY_CACHE_VERSION = 1
 DEFAULT_QUANTIFICATION_VALUE = 10_000
 DEFAULT_NODATA_DN = 0
+
+# Collections whose pixel values still carry the ESA +1000 DN offset (the STAC
+# ``raster:bands`` offset of -0.1 is true for them). The pixels of ``sentinel-2-l2a``
+# do not carry it even where its STAC items advertise ``offset: -0.1`` (baseline 04.00
+# and later): the same acquisition is exactly 1000 lower in every band than in
+# ``sentinel-2-c1-l2a`` (checked on 2024-07-16 tile 5WPS, and 2021 scenes of baseline
+# 03.01 agree in magnitude), so subtracting the STAC offset there would clip dark and
+# visible-band pixels to zero. The offset is therefore taken from STAC only for these.
+COLLECTIONS_WITH_ENCODED_OFFSET = frozenset({EarthSearchCollection.c1_l2a})
 
 
 ########################################################################################
@@ -94,9 +103,15 @@ def _dn_offset(record: dict[str, Any]) -> int:
 
 
 def granule_from_row(row: Any, bands: tuple[str, ...], collection: str) -> S2Granule:
-    """Build the granule record of one scene-table row for the requested bands."""
+    """Build the granule record of one scene-table row for the requested bands.
+
+    The DN offset comes from the STAC item only for collections that encode it in the
+    pixels (``COLLECTIONS_WITH_ENCODED_OFFSET``); the convention is part of the
+    fingerprint, so point samples cached under another convention are not reused.
+    """
     assets = json.loads(row.assets)
     spectral = {band: record for band, record in assets.items() if band != "SCL"}
+    encoded = collection in COLLECTIONS_WITH_ENCODED_OFFSET
     scale = next((r["scale"] for r in spectral.values() if r.get("scale")), None)
     nodata = next(
         (r["nodata"] for r in spectral.values() if r.get("nodata") is not None),
@@ -119,13 +134,16 @@ def granule_from_row(row: Any, bands: tuple[str, ...], collection: str) -> S2Gra
         scl_path=assets.get("SCL", {}).get("href"),
         footprint=wkt.loads(row.geometry_wkt),
         radiometry=S2Radiometry(
-            offsets={band: _dn_offset(record) for band, record in spectral.items()},
+            offsets={
+                band: _dn_offset(record) if encoded else 0
+                for band, record in spectral.items()
+            },
             special_values=(int(nodata), S2_SATURATED_DN),
             quantification_value=round(1 / scale) if scale else DEFAULT_QUANTIFICATION_VALUE,
         ),
         fingerprint=hashlib.sha256(
             json.dumps(
-                [str(collection), row.item_id, row.processing_baseline, used],
+                [str(collection), row.item_id, row.processing_baseline, encoded, used],
                 separators=(",", ":"),
             ).encode()
         ).hexdigest(),

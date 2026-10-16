@@ -4,6 +4,7 @@ execution:
   # slurm: workers are Slurm jobs; every worker reads Sentinel-2 and ArcticDEM over
   # HTTPS, so the compute nodes need internet access. Concurrent connections equal
   # the number of worker processes (workers, or jobs x processes_per_job on Slurm).
+  # Sentinel-1 is not remote: SNAP needs the ZIPs, orbit files and DEM tiles on disk.
   method: local
   workers: 8
   threads_per_worker: 1
@@ -27,9 +28,21 @@ sources:
   # their cloud-optimized GeoTIFFs are read in place.
   s2:
     type: s2.l2a.remote
-    collection: sentinel-2-l2a  # or sentinel-2-c1-l2a (Collection 1 reprocessing)
+    collection: sentinel-2-c1-l2a  # Collection 1 (default; values match CDSE SAFE); or sentinel-2-l2a
   arcticdem:
     type: dem.remote
+  # Sentinel-1 preprocessing runs SNAP gpt on local files: stage the ZIPs and orbit
+  # files with `sentinel-py asf download` and the DEM tiles with `sentinel-py pgc
+  # download` (`sentinel-py pgc missing --pipeline <yaml>` lists uncovered areas).
+  s1:
+    type: s1.grd.local
+    data_dir: ../data/s1/raw
+    flight_direction: PREDOMINANT  # don't mix ascending and descending scenes
+    orbit: precise-or-restituted
+  arcticdem_local:
+    type: dem.local
+    data_dir: ../data/arcticdem/10m
+    pattern: "*.tif"
 
 nodes:
   # Sentinel-2: one summer median per band, then spectral indices from the medians
@@ -58,14 +71,34 @@ nodes:
     hillshade_azimuth: 315
     hillshade_altitude: 45
 
-  # One wide row per point: the first input is the base; static terrain columns are
-  # added to every row.
+  # Sentinel-1: SNAP preprocessing per scene, a summer median, then decibels
+  - id: s1-preprocess
+    type: snap_gpt
+    source: s1
+    dem: arcticdem_local
+    polarizations: [VV, VH]
+    subset: aoi
+    dem_vertical_datum: ellipsoid  # ArcticDEM heights are ellipsoidal
+    memory_gb: 16
+    threads: 4
+  - id: s1-composite
+    type: composite
+    inputs: {data: s1-preprocess}
+    period: all
+    aggregation: median
+    empty_bins: fill  # sites without Sentinel-1 scenes get nodata, not an error
+  - id: s1-db
+    type: to_db
+    inputs: {data: s1-composite}
+
+  # One wide row per point: the first input is the base; the static terrain columns
+  # are added to every row and the Sentinel-1 columns match the same summer bin.
   - id: samples
     type: join
-    inputs: {base: indices, terrain: terrain}
+    inputs: {base: indices, terrain: terrain, radar: s1-db}
 
 outputs:
   samples:
     from: samples
-    path: ../data/pavc_samples_remote
+    path: ../data/processed/pavc_samples_remote
     format: parquet

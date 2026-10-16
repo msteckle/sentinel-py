@@ -109,7 +109,7 @@ def _search_batches(
 def query_earth_search(
     aoi_geometries: Iterable[shapely_base.BaseGeometry],
     *,
-    collection: str = EarthSearchCollection.l2a,
+    collection: str = EarthSearchCollection.c1_l2a,
     years: tuple[int, ...] | None,
     speriod: tuple[int, int],
     eperiod: tuple[int, int],

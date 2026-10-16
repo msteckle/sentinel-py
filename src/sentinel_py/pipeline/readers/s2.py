@@ -948,7 +948,7 @@ class S2Reader(BaseReader):
 
         if self.source_type == SourceType.s2_l2a_remote:
             only_keys(raw, {"type", "collection"}, f"sources.{source_id}")
-            collection = raw.get("collection", EarthSearchCollection.l2a.value)
+            collection = raw.get("collection", EarthSearchCollection.c1_l2a.value)
             if collection not in {item.value for item in EarthSearchCollection}:
                 choices = ", ".join(item.value for item in EarthSearchCollection)
                 raise PipelineConfigError(

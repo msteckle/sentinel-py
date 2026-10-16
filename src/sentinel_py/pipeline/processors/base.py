@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
 from typing import Any, ClassVar, Protocol, runtime_checkable
@@ -33,6 +33,25 @@ class ProcessorContext:
     node: Any
     outputs: tuple[Any, ...]
     logger: logging.Logger
+    progress: Callable[[str, int, int], None] | None = None
+
+    def report_progress(self, label: str, completed: int, total: int) -> None:
+        """Report eager work of this node (for example sampling) to the progress bar.
+
+        Raster nodes build lazy graphs and need no reporting, because their tasks are
+        counted when the outputs are computed. Nodes that do work while the graph is
+        being built (point sampling, per-scene SNAP runs) call this so the user sees
+        progress before any output task exists.
+
+        Parameters
+        ----------
+        label : str
+            Short description of the work; calls with the same label update one bar.
+        completed, total : int
+            Units finished so far and in total.
+        """
+        if self.progress is not None:
+            self.progress(label, completed, total)
 
 
 @runtime_checkable

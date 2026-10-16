@@ -54,3 +54,20 @@ def test_mask_nodata_replaces_the_sentinel_with_nan_and_ignores_none():
     assert np.isnan(masked.values[1])
     assert masked.values[[0, 2]].tolist() == [1.0, 3.0]
     assert mask_nodata(values, None) is values
+
+
+def test_context_reports_node_progress_only_when_a_listener_exists():
+    import logging
+
+    from sentinel_py.pipeline.processors.base import ProcessorContext
+
+    events = []
+    quiet = ProcessorContext(None, None, (), logging.getLogger("quiet"))
+    quiet.report_progress("work", 1, 2)  # no listener: a harmless no-op
+
+    listening = ProcessorContext(
+        None, None, (), logging.getLogger("listening"),
+        progress=lambda *event: events.append(event),
+    )
+    listening.report_progress("work", 1, 2)
+    assert events == [("work", 1, 2)]

@@ -275,3 +275,46 @@ def test_cog_state_is_checkpointed_after_every_materialization_batch(
     assert not (state_path.with_name(state_path.name + ".parts")).exists() or not list(
         state_path.with_name(state_path.name + ".parts").glob("part-*.parquet")
     )
+
+
+def test_s2_point_sampling_reports_node_progress(tmp_path, monkeypatch):
+    import logging
+    from types import SimpleNamespace
+
+    import pandas as pd
+
+    from sentinel_py.pipeline.processors.base import ProcessorContext
+    from sentinel_py.pipeline.processors.s2_preprocess import (
+        S2PreprocessNodeConfig,
+        S2PreprocessProcessor,
+    )
+
+    def fake_sample(units, *, progress, **kwargs):
+        progress(0, 4)
+        progress(2, 4)
+        progress(4, 4)
+        return pd.DataFrame({"aoi_id": []})
+
+    monkeypatch.setattr("sentinel_py.pipeline.readers.s2.sample_s2_points", fake_sample)
+    pipeline = SimpleNamespace(
+        sources={"s2": SimpleNamespace(data_dir=tmp_path)},
+        aoi_plan=SimpleNamespace(units=()),
+        output_grid=SimpleNamespace(crs="EPSG:3338", resolution=(20.0, 20.0), anchor=(0.0, 0.0)),
+        selection=SimpleNamespace(years=(2024,), start_period=(6, 1), end_period=(8, 31)),
+        execution=SimpleNamespace(workers=1),
+    )
+    events = []
+    context = ProcessorContext(
+        pipeline, SimpleNamespace(node_id="prep"), (), logging.getLogger("s2-progress"),
+        progress=lambda *event: events.append(event),
+    )
+
+    S2PreprocessProcessor().execute_points(
+        S2PreprocessNodeConfig(source="s2"), {}, context
+    )
+
+    assert events == [
+        ("Sampling Sentinel-2 points (prep)", 0, 4),
+        ("Sampling Sentinel-2 points (prep)", 2, 4),
+        ("Sampling Sentinel-2 points (prep)", 4, 4),
+    ]

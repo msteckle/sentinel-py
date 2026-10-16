@@ -201,3 +201,39 @@ outputs:
     )
     with rasterio.open(reflectance.output_path) as output:
         assert output.read(1).tolist() == [[65535, 100], [65535, 2000]]
+
+
+def test_run_pipeline_forwards_node_progress_to_processors(tmp_path: Path):
+    class Reporting(_ValueProcessor):
+        def execute(self, config, inputs, context):
+            for done in range(1, 4):
+                context.report_progress(f"work ({context.node.node_id})", done, 3)
+            return super().execute(config, inputs, context)
+
+    (tmp_path / "raw").mkdir()
+    pipeline = tmp_path / "graph.yaml"
+    pipeline.write_text(
+        """
+version: 1
+execution: {method: local}
+selection: {years: [2024]}
+output_grid: {crs: native, resolution_m: 20}
+sources:
+  s2: {type: s2.l2a.local, data_dir: raw}
+nodes:
+  - {id: only, type: test.value, value: 1}
+outputs:
+  total: {from: only, path: output, format: xarray}
+"""
+    )
+    registry = ProcessorRegistry()
+    registry.register(Reporting([]))
+    events = []
+
+    run_pipeline(
+        PipelineConfig.from_file(pipeline, registry=registry),
+        logging.getLogger("node-progress-test"),
+        node_progress_callback=lambda *event: events.append(event),
+    )
+
+    assert events == [("work (only)", 1, 3), ("work (only)", 2, 3), ("work (only)", 3, 3)]

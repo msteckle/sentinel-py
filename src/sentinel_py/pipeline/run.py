@@ -41,6 +41,7 @@ def run_pipeline(
     progress_callback: Callable[[Any], None] | None = None,
     progress_start_callback: Callable[[int], None] | None = None,
     task_progress_callback: Callable[[int, int], None] | None = None,
+    node_progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> PipelineRunResult:
     """Build every processor and execute all requested outputs as one Dask graph."""
 
@@ -64,7 +65,9 @@ def run_pipeline(
             output for output in config.outputs.values() if output.node == node.node_id
         )
         # Create the processor context for this node
-        context = ProcessorContext(config, node, outputs, logger)
+        context = ProcessorContext(
+            config, node, outputs, logger, progress=node_progress_callback
+        )
         logger.info(
             "Executing node=%s type=%s inputs=%s",
             node.node_id,

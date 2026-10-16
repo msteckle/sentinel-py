@@ -78,9 +78,30 @@ def run(
     progress_task_id: TaskID | None = None
     progress_counts = {"written": 0, "skipped": 0, "failed": 0}
 
+    node_progress: Progress | None = None
+    node_tasks: dict[str, TaskID] = {}
+
+    def update_node_progress(label: str, completed: int, total: int) -> None:
+        """Show eager node work, such as point sampling, before outputs are planned."""
+        nonlocal node_progress
+        if node_progress is None:
+            node_progress = make_progress()
+            node_progress.start()
+        if label not in node_tasks:
+            node_tasks[label] = node_progress.add_task(label, total=total)
+        node_progress.update(node_tasks[label], total=total, completed=completed)
+
+    def stop_node_progress() -> None:
+        """Close the node bar; Rich allows only one live display at a time."""
+        nonlocal node_progress
+        if node_progress is not None:
+            node_progress.stop()
+            node_progress = None
+
     def start_progress(total: int) -> None:
         """Start the output progress bar once the total task count is known."""
         nonlocal progress, progress_task_id
+        stop_node_progress()
         progress = make_progress(status=True)
         progress.start()
         progress_task_id = progress.add_task(
@@ -120,11 +141,13 @@ def run(
             progress_callback=update_output_progress,
             progress_start_callback=start_progress,
             task_progress_callback=update_task_progress,
+            node_progress_callback=update_node_progress,
         )
     except (FileNotFoundError, RuntimeError, TypeError, ValueError) as error:
         logger.exception("Pipeline execution failed")
         raise ClickException(f"Pipeline execution failed: {error}") from error
     finally:
+        stop_node_progress()
         if progress is not None:
             progress.stop()
 

@@ -236,6 +236,9 @@ class S2PreprocessProcessor(BaseProcessor):
         def report(completed: int, total: int) -> None:
             """Log source sampling progress at roughly 10% intervals."""
             nonlocal reported
+            context.report_progress(
+                f"Sampling Sentinel-2 points ({context.node.node_id})", completed, total
+            )
             step = max(1, -(-total // 10))
             if completed in {0, total} or completed - reported >= step:
                 reported = completed

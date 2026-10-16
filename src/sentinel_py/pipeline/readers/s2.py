@@ -510,40 +510,53 @@ def _read_scene_chunk_locked(
     for value in scene.mask_classes:
         mask |= scl == value
 
-    output = np.empty(
-        (len(scene.bands) + 1, window.height, window.width), dtype=np.uint16
-    )
-    for index, band_name in enumerate(scene.bands):
+    # Resolve every band asset before reading any, so a missing asset is reported
+    # the same way whether or not the window turns out to be masked.
+    band_paths = []
+    for band_name in scene.bands:
         try:
-            path = scene.granule.band_paths[band_name]
+            band_paths.append(scene.granule.band_paths[band_name])
         except KeyError as error:
             raise FileNotFoundError(
                 f"Missing {band_name} asset for {scene.granule.granule_id}"
             ) from error
-        source, source_transform, source_crs, source_resolution = _window_dataset(
-            path,
-            grid,
-            window,
-            nodata=scene.nodata,
-            offset=scene.offsets[band_name],
-            invalid_values=scene.special_values,
-        )
-        values = warp_to_window(
-            source,
-            source_transform,
-            source_crs,
-            grid,
-            window,
-            resampling=select_resampling(source_resolution, grid),
-            src_nodata=scene.nodata,
-            dst_nodata=scene.nodata,
-        )
-        output[index] = np.where(
-            # Raw no-data and saturation codes were already normalized to the
-            # canonical nodata value before offset correction. A corrected DN
-            # of zero can be valid and must remain distinguishable from nodata.
-            mask | (values == scene.nodata), scene.nodata, values
-        ).astype(np.uint16)
+
+    output = np.empty(
+        (len(scene.bands) + 1, window.height, window.width), dtype=np.uint16
+    )
+    if mask.all():
+        # The SCL masks every pixel, so each band would be set to nodata below no
+        # matter what it holds: skip decoding the band files (about 70% of point
+        # windows over cloudy Arctic summers are fully masked).
+        output[:-1] = scene.nodata
+    else:
+        for index, (band_name, path) in enumerate(
+            zip(scene.bands, band_paths, strict=True)
+        ):
+            source, source_transform, source_crs, source_resolution = _window_dataset(
+                path,
+                grid,
+                window,
+                nodata=scene.nodata,
+                offset=scene.offsets[band_name],
+                invalid_values=scene.special_values,
+            )
+            values = warp_to_window(
+                source,
+                source_transform,
+                source_crs,
+                grid,
+                window,
+                resampling=select_resampling(source_resolution, grid),
+                src_nodata=scene.nodata,
+                dst_nodata=scene.nodata,
+            )
+            output[index] = np.where(
+                # Raw no-data and saturation codes were already normalized to the
+                # canonical nodata value before offset correction. A corrected DN
+                # of zero can be valid and must remain distinguishable from nodata.
+                mask | (values == scene.nodata), scene.nodata, values
+            ).astype(np.uint16)
     output[-1] = scl
     return output
 

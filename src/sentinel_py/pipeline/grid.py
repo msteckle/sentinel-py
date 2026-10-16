@@ -11,6 +11,7 @@ This module is the geometry core of the pipeline:
 
 from __future__ import annotations
 
+import functools
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -400,6 +401,23 @@ def window_transform(grid: GridSpec, window: GridWindow) -> Affine:
     return Affine(grid.resolution[0], 0.0, xmin, 0.0, -grid.resolution[1], ymax)
 
 
+@functools.lru_cache(maxsize=256)
+def _transformed_bounds(
+    target_bounds: tuple[float, float, float, float],
+    target_crs: str,
+    source_crs: Any,
+) -> tuple[float, float, float, float]:
+    """Return ``target_bounds`` expressed in ``source_crs`` (densified edges).
+
+    A granule's bands share one CRS and a task's windows share their bounds, so the
+    same transform is asked for once per band file; caching it is exact (the function
+    is pure) and saves a PROJ transformer setup per call. The cache is per process.
+    """
+    from rasterio.warp import transform_bounds
+
+    return tuple(transform_bounds(target_crs, source_crs, *target_bounds, densify_pts=21))
+
+
 def native_pixel_window(
     dataset: Any,
     target_bounds: tuple[float, float, float, float],
@@ -426,15 +444,13 @@ def native_pixel_window(
         ``(x_offset, y_offset, width, height)`` clipped to the raster, or
         ``None`` when the window does not intersect the raster.
     """
-    from rasterio.warp import transform_bounds
-
     source_transform = dataset.transform
     if source_transform.b != 0 or source_transform.d != 0:
         raise ValueError("Lazy raster reads require north-up source rasters")
     if dataset.crs is None:
         raise ValueError(f"Raster source has no CRS: {dataset.name}")
-    source_bounds = transform_bounds(
-        target_crs, dataset.crs, *target_bounds, densify_pts=21
+    source_bounds = _transformed_bounds(
+        tuple(target_bounds), str(target_crs), dataset.crs
     )
     inverse = ~source_transform
     xmin, ymin, xmax, ymax = source_bounds

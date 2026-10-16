@@ -318,3 +318,97 @@ def test_s2_point_sampling_reports_node_progress(tmp_path, monkeypatch):
         ("Sampling Sentinel-2 points (prep)", 2, 4),
         ("Sampling Sentinel-2 points (prep)", 4, 4),
     ]
+
+
+# Fully masked windows ------------------------------------------------------------------
+
+
+def _scene_and_grid(tmp_path: Path, mask_classes=(0, 1, 3, 8, 9, 10, 11)):
+    """The synthetic granule as a scene source plus its four 1x1-pixel windows.
+
+    The SCL is ``[[4, 4], [4, 9]]``: only the last window (class 9, cloud) is masked.
+    """
+    from sentinel_py.pipeline.grid import grid_for_unit
+    from sentinel_py.pipeline.readers import s2
+
+    pipeline, _ = _synthetic_pipeline(tmp_path)
+    config = PipelineConfig.from_file(pipeline)
+    granules = s2.discover_s2_granules(
+        config.sources["s2"].data_dir, ("B02", "B03"), 20,
+        years=(2024,), speriod=(6, 1), eperiod=(8, 31),
+    )
+    grid = grid_for_unit(config.aoi_plan.units[0], config.output_grid)
+    scene = s2._scene_source(granules[0], ("B02", "B03"), mask_classes, 65535)
+    return scene, grid, list(grid.iter_windows())
+
+
+def _count_reads(monkeypatch) -> list[str]:
+    from sentinel_py.pipeline.readers import s2
+
+    opened: list[str] = []
+    original = s2._window_dataset
+
+    def counting(path, *args, **kwargs):
+        opened.append(Path(path).name)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(s2, "_window_dataset", counting)
+    return opened
+
+
+def test_fully_masked_window_reads_only_the_scl(tmp_path, monkeypatch):
+    from sentinel_py.pipeline.readers import s2
+
+    scene, grid, windows = _scene_and_grid(tmp_path)
+    opened = _count_reads(monkeypatch)
+
+    masked = s2._read_scene_chunk_locked(scene, grid, windows[3])
+
+    assert [name.split("_")[-2] for name in opened] == ["SCL"]
+    np.testing.assert_array_equal(masked[:2, 0, 0], [65535, 65535])  # bands: nodata
+    assert masked[2, 0, 0] == 9  # the SCL itself is still returned
+    assert masked.dtype == np.uint16 and masked.shape == (3, 1, 1)
+
+
+def test_clear_and_partly_masked_windows_still_read_every_band(tmp_path, monkeypatch):
+    from sentinel_py.pipeline.readers import s2
+
+    scene, grid, windows = _scene_and_grid(tmp_path)
+    opened = _count_reads(monkeypatch)
+    clear = s2._read_scene_chunk_locked(scene, grid, windows[0])
+    assert sorted(name.split("_")[-2] for name in opened) == ["B02", "B03", "SCL"]
+    assert clear[2, 0, 0] == 4 and clear[0, 0, 0] != 65535  # valid B02 survives
+
+    # With no masking classes the cloud window is read and keeps real values, which
+    # shows the shortcut changes nothing but the skipped work.
+    scene_open, grid, windows = _scene_and_grid(tmp_path / "open", mask_classes=())
+    opened.clear()
+    cloudy = s2._read_scene_chunk_locked(scene_open, grid, windows[3])
+    assert sorted(name.split("_")[-2] for name in opened) == ["B02", "B03", "SCL"]
+    assert cloudy[0, 0, 0] == 3300  # mean of 4000..4600 after the -1000 BOA offset
+    assert cloudy[1, 0, 0] == 65535  # the 20 m B03 pixel is raw saturation
+
+
+def test_missing_band_asset_is_reported_even_for_a_masked_window(tmp_path):
+    from dataclasses import replace
+
+    from sentinel_py.pipeline.readers import s2
+
+    scene, grid, windows = _scene_and_grid(tmp_path)
+    paths = {k: v for k, v in scene.granule.band_paths.items() if k != "B03"}
+    broken = replace(scene, granule=replace(scene.granule, band_paths=paths))
+
+    for window in windows:  # masked (3) and clear (0..2) alike
+        with pytest.raises(FileNotFoundError, match="Missing B03 asset"):
+            s2._read_scene_chunk_locked(broken, grid, window)
+
+
+def test_unreadable_band_file_only_matters_where_it_would_be_read(tmp_path):
+    from sentinel_py.pipeline.readers import s2
+
+    scene, grid, windows = _scene_and_grid(tmp_path)
+    scene.granule.band_paths["B03"].write_bytes(b"not a raster")
+
+    assert s2._read_scene_chunk_locked(scene, grid, windows[3])[2, 0, 0] == 9  # masked
+    with pytest.raises(rasterio.errors.RasterioIOError):
+        s2._read_scene_chunk_locked(scene, grid, windows[0])  # needs B03

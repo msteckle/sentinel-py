@@ -255,3 +255,34 @@ def test_canonical_grid_requires_an_aoi(tmp_path: Path):
 
     with pytest.raises(PipelineConfigError, match="selection.aoi is required"):
         PipelineConfig.from_file(path, registry=_registry())
+
+
+def test_native_window_bounds_transform_is_cached_and_exact(tmp_path):
+    import numpy as np
+    import rasterio
+    from rasterio.transform import from_origin
+    from rasterio.warp import transform_bounds
+
+    from sentinel_py.pipeline import grid as pipeline_grid
+
+    path = tmp_path / "band.tif"
+    with rasterio.open(
+        path, "w", driver="GTiff", width=100, height=100, count=1, dtype="uint16",
+        crs="EPSG:32606", transform=from_origin(500000, 1000000, 10, 10),
+    ) as dst:
+        dst.write(np.zeros((100, 100), "uint16"), 1)
+    bounds = (-70000.0, 2050000.0, -69900.0, 2050100.0)  # EPSG:3338 output window
+    pipeline_grid._transformed_bounds.cache_clear()
+
+    with rasterio.open(path) as src:
+        first = pipeline_grid.native_pixel_window(src, bounds, "EPSG:3338")
+        again = pipeline_grid.native_pixel_window(src, bounds, "EPSG:3338")
+        pipeline_grid.native_pixel_window(
+            src, (-70100.0, 2050000.0, -70000.0, 2050100.0), "EPSG:3338"
+        )
+    info = pipeline_grid._transformed_bounds.cache_info()
+
+    assert first == again
+    assert (info.hits, info.misses) == (1, 2)  # the repeat hit; the new window missed
+    direct = transform_bounds("EPSG:3338", "EPSG:32606", *bounds, densify_pts=21)
+    assert pipeline_grid._transformed_bounds(bounds, "EPSG:3338", rasterio.crs.CRS.from_epsg(32606)) == tuple(direct)

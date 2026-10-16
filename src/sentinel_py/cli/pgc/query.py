@@ -14,11 +14,7 @@ from sentinel_py.cli.options import (
     load_aoi_geometries,
 )
 from sentinel_py.download.base import make_progress
-from sentinel_py.download.pgc import (
-    PGC_CATALOG_URL,
-    PGC_COLLECTION,
-    query_arcticdem,
-)
+from sentinel_py.download.pgc import arcticdem_query_payload, query_arcticdem
 from sentinel_py.log import get_logger
 
 app = typer.Typer()
@@ -58,15 +54,7 @@ def query(
     logger = get_logger(name="pgc_query_logger", logpath=log, verbose=verbose)
     geometries = load_aoi_geometries(aoi, crs)
     geometry_wkts = [geometry.wkt for geometry in geometries]
-    payload = {
-        "provider": "PGC",
-        "catalog": PGC_CATALOG_URL,
-        "collection": PGC_COLLECTION,
-        "geometries_wkt": geometry_wkts,
-        "spatial_query_strategy": "component_bbox_exact_v2",
-        "max_results": max_results,
-        "cache_version": 1,
-    }
+    payload = arcticdem_query_payload(geometry_wkts, max_results)
     query_cache = QueryCache.for_payload(cache_dir, payload, "manifest.parquet")
     manifest_path = query_cache.table_path
     if query_cache.exists():

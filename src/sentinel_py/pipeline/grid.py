@@ -378,6 +378,45 @@ def point_grid(unit: AOIUnit, *, crs: str, resolution: tuple[float, float], anch
 # the name: Dask may pickle closures by value and a lock itself cannot be pickled.
 RASTERIO_LOCK = RLock()
 
+# GDAL options for rasters read over HTTP(S) (public, unsigned cloud-optimized GeoTIFFs).
+# Reads hold ``RASTERIO_LOCK``, so a worker process makes one network read at a time and
+# the concurrent connections are bounded by the number of worker processes. Throttling
+# responses (HTTP 429/503) are retried by GDAL with a growing delay.
+REMOTE_GDAL_OPTIONS = {
+    "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
+    "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif",
+    "GDAL_HTTP_MULTIPLEX": "YES",
+    "GDAL_HTTP_MAX_RETRY": "5",
+    "GDAL_HTTP_RETRY_DELAY": "1",
+    "VSI_CACHE": "TRUE",
+}
+REMOTE_PATH_PREFIXES = ("http://", "https://", "s3://", "/vsi")
+
+
+def is_remote_path(path: Any) -> bool:
+    """Return whether ``path`` is a URL or GDAL virtual-filesystem path."""
+    return str(path).startswith(REMOTE_PATH_PREFIXES)
+
+
+def raster_env(paths: Any) -> Any:
+    """Return a ``rasterio.Env`` carrying remote-read options when any path is remote.
+
+    Parameters
+    ----------
+    paths
+        Raster paths about to be opened, local or remote.
+
+    Returns
+    -------
+    rasterio.Env
+        An environment to use as a context manager around the opens and reads.
+    """
+    import rasterio
+
+    if any(is_remote_path(path) for path in paths):
+        return rasterio.Env(**REMOTE_GDAL_OPTIONS)
+    return rasterio.Env()
+
 
 # Window geometry ----------------------------------------------------------------------
 

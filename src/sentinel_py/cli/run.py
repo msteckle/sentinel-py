@@ -48,7 +48,9 @@ def run(
     typer.echo(f"Pipeline:      {config.path}")
     typer.echo(f"Execution:     {config.execution.method}")
     for source in config.sources.values():
-        typer.echo(f"Source:        {source.source_id} ({source.data_dir})")
+        typer.echo(
+            f"Source:        {source.source_id} ({source.data_dir or source.source_type})"
+        )
     if config.output_grid.chunks is None:
         typer.echo(f"Output grid:   native, {config.output_grid.resolution} m")
     else:

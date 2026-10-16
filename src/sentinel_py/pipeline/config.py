@@ -616,10 +616,14 @@ class S2SourceConfig:
 
 @dataclass(frozen=True)
 class DEMSourceConfig:
-    """Data class representing a local collection of DEM GeoTIFFs."""
+    """Data class representing a DEM GeoTIFF collection, local or remote.
+
+    ``data_dir`` is ``None`` for ``SourceType.dem_remote``, whose tiles are resolved
+    through the PGC STAC catalog instead of a directory.
+    """
 
     source_id: str
-    data_dir: Path
+    data_dir: Path | None
     pattern: str = "*.tif"
     source_type: str = SourceType.dem_local
 

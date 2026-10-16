@@ -77,6 +77,7 @@ class SourceType(StrEnum):
     s2_l2a_local = "s2.l2a.local"
     s1_grd_local = "s1.grd.local"
     dem_local = "dem.local"
+    dem_remote = "dem.remote"
 
 
 # Download and write-result CVs -------------------------------------------------------

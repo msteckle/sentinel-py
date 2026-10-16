@@ -98,3 +98,103 @@ def test_select_dem_paths_keeps_only_tiles_intersecting_the_aoi_component(tmp_pa
     )
 
     assert selected == (near,)
+
+
+def _write_dem_project(tmp_path: Path, source_yaml: str) -> Path:
+    """Write a point pipeline over one synthetic 45-degree planar DEM tile."""
+    import json
+
+    import rasterio
+    from rasterio.transform import from_origin
+
+    tile_dir = tmp_path / "dem"
+    tile_dir.mkdir(exist_ok=True)
+    columns = np.arange(1200, dtype=np.float32)
+    with rasterio.open(
+        tile_dir / "tile.tif",
+        "w",
+        driver="GTiff",
+        width=1200,
+        height=1200,
+        count=1,
+        dtype="float32",
+        crs="EPSG:3338",
+        transform=from_origin(-6000.0, 1006000.0, 10.0, 10.0),
+    ) as dataset:
+        dataset.write(np.tile(columns * 10.0, (1200, 1))[None])
+    (tmp_path / "aoi.geojson").write_text(
+        json.dumps(
+            {
+                "type": "FeatureCollection",
+                "crs": {"type": "name", "properties": {"name": "EPSG:3338"}},
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {"site": "site-1"},
+                        "geometry": {"type": "Point", "coordinates": [0.0, 1000000.0]},
+                    }
+                ],
+            }
+        )
+    )
+    path = tmp_path / "pipeline.yaml"
+    path.write_text(
+        f"""
+version: 1
+execution: {{method: local}}
+selection: {{aoi: aoi.geojson, aoi_id_field: site}}
+output_grid:
+  crs: EPSG:3338
+  resolution: 10
+  extent: aoi
+  anchor: [0, 0]
+  chunks: {{y: 64, x: 64}}
+sources:
+  dem: {source_yaml}
+nodes:
+  - {{id: terrain, type: dem, source: dem, features: [slope, aspect]}}
+outputs:
+  result: {{from: terrain, path: output, format: parquet}}
+"""
+    )
+    return path
+
+
+def _run_dem_project(path: Path):
+    import logging
+
+    import pandas as pd
+
+    from sentinel_py.pipeline import PipelineConfig
+    from sentinel_py.pipeline.run import run_pipeline
+
+    run_pipeline(PipelineConfig.from_file(path), logging.getLogger("dem-project-test"))
+    return pd.read_parquet(path.parent / "output" / "samples.parquet")
+
+
+def test_local_and_remote_sources_sample_identical_terrain(tmp_path, monkeypatch):
+    pytest.importorskip("rasterio")
+    from rasterio.warp import transform_bounds
+    from shapely.geometry import box
+
+    from sentinel_py.pipeline.readers import arcticdem
+
+    local = _run_dem_project(
+        _write_dem_project(tmp_path, "{type: dem.local, data_dir: dem}")
+    )
+
+    remote_dir = tmp_path / "remote"
+    remote_dir.mkdir()
+    footprint = box(*transform_bounds("EPSG:3338", "EPSG:4326", -6000, 994000, 6000, 1006000))
+    tile = arcticdem.DEMTile(
+        str(tmp_path / "dem" / "tile.tif"), "https://example.invalid/tile.tif#etag", footprint
+    )
+    # The catalog lookup is replaced; everything after it is the shared code path.
+    monkeypatch.setattr(arcticdem, "remote_dem_tiles", lambda plan, **kwargs: (tile,))
+    remote = _run_dem_project(_write_dem_project(remote_dir, "{type: dem.remote}"))
+
+    assert np.isclose(local["slope"].iloc[0], 45.0, atol=0.01)
+    assert np.isclose(local["aspect"].iloc[0], 90.0, atol=0.01)
+    for column in ("slope", "aspect"):
+        assert remote[column].iloc[0] == pytest.approx(local[column].iloc[0])
+    assert remote["source_fingerprint"].iloc[0] != local["source_fingerprint"].iloc[0]

@@ -17,7 +17,7 @@ from sentinel_py.cache import (
     mark_cache_used,
     write_parquet_atomic,
 )
-from sentinel_py.enums import AOIKind
+from sentinel_py.enums import AOIKind, SourceType
 from sentinel_py.pipeline.base import Registry
 from sentinel_py.pipeline.grid import AOIUnit, point_pixel
 
@@ -140,7 +140,8 @@ def get_default_reader_registry() -> ReaderRegistry:
         registry = ReaderRegistry()
         registry.register(S1Reader())
         registry.register(S2Reader())
-        registry.register(ArcticDEMReader())
+        registry.register(ArcticDEMReader(SourceType.dem_local))
+        registry.register(ArcticDEMReader(SourceType.dem_remote))
         _DEFAULT_READERS = registry
     return _DEFAULT_READERS
 

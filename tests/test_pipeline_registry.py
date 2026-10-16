@@ -26,6 +26,7 @@ def test_default_registries_expose_builtin_names():
         "s1.grd.local",
         "s2.l2a.local",
         "dem.local",
+        "dem.remote",
     }
     writers = get_default_writer_registry()
     assert {writers.get(name).format_name for name in ("cog", "parquet", "xarray")} == {

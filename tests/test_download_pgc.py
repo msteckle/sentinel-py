@@ -222,3 +222,13 @@ def test_interrupted_pgc_download_keeps_finished_state_and_resumes(
     assert (summary.downloaded, summary.skipped) == (1, 2)
     assert store.part_paths() == []
     assert len(pd.read_parquet(state_file)) == 3
+
+
+def test_arcticdem_query_payload_key_is_stable_across_releases() -> None:
+    """The payload is shared by ``pgc query`` and the remote pipeline source."""
+    from sentinel_py.cache import deterministic_cache_key
+    from sentinel_py.download.pgc import arcticdem_query_payload
+
+    payload = arcticdem_query_payload(["POINT (0 0)"])
+
+    assert deterministic_cache_key(payload) == "4bbcb99ad2232419135a618babe77fdb"

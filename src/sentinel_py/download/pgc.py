@@ -61,6 +61,32 @@ PGC_DOWNLOAD_STATE_COLUMNS = [
 ]
 
 
+def arcticdem_query_payload(
+    geometry_wkts: list[str], max_results: int | None = None
+) -> dict[str, Any]:
+    """Return the cache payload identifying one ArcticDEM STAC query.
+
+    The ``pgc query`` command and the remote pipeline source share this payload, so a
+    query cached by one is reused by the other for the same geometries.
+
+    Parameters
+    ----------
+    geometry_wkts : list of str
+        WKT of the WGS84 AOI geometries.
+    max_results : int or None, optional
+        Maximum number of returned tiles.
+    """
+    return {
+        "provider": "PGC",
+        "catalog": PGC_CATALOG_URL,
+        "collection": PGC_COLLECTION,
+        "geometries_wkt": geometry_wkts,
+        "spatial_query_strategy": "component_bbox_exact_v2",
+        "max_results": max_results,
+        "cache_version": 1,
+    }
+
+
 def _asset_href(asset: Any) -> str:
     """Return an HTTPS URL for a public PGC STAC asset."""
     href = str(asset.href)

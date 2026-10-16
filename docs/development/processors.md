@@ -188,7 +188,7 @@ nodes:
 
 ## DEM terrain features
 
-The built-in ``dem`` processor reads local ArcticDEM GeoTIFFs and returns a single canonical-grid feature cube. It supports ``elevation``, ``aspect``, ``slope``, and ``hillshade`` bands. Slope, aspect, and hillshade use GDAL-compatible Horn semantics by default; ``ZevenbergenThorne`` is also available. Derivatives are calculated on the native projected DEM grid before reprojection to the pipeline output grid.
+The built-in ``dem`` processor reads ArcticDEM GeoTIFFs and returns a single canonical-grid feature cube. It supports ``elevation``, ``aspect``, ``slope``, and ``hillshade`` bands. Slope, aspect, and hillshade use GDAL-compatible Horn semantics by default; ``ZevenbergenThorne`` is also available. Derivatives are calculated on the native projected DEM grid before reprojection to the pipeline output grid.
 
 ```yaml
 sources:
@@ -206,6 +206,8 @@ nodes:
     hillshade_azimuth: 315
     hillshade_altitude: 45
 ```
+
+A ``dem.local`` source reads tiles from ``data_dir``. A ``dem.remote`` source (``type: dem.remote``, no other keys) reads the public PGC ArcticDEM v4.1 10 m cloud-optimized GeoTIFFs directly over HTTPS, so nothing is downloaded and the compute nodes need internet access. The tiles covering all AOIs are found with one PGC STAC query over their combined bounds, cached like ``sentinel-py pgc query`` (the same cache entry is reused for identical geometries), and selected per AOI unit from their catalog footprints without opening them. Remote reads hold the same raster lock as local reads, so a worker process makes one network read at a time and the concurrent connections equal ``execution.workers``; GDAL retries throttled requests with a growing delay. No request limit is published for the PGC bucket. ``snap_gpt`` still requires a ``dem.local`` source because SNAP needs the tiles on disk.
 
 New DEM-derived bands can be added by defining and registering a ``DEMFeature`` subclass in ``sentinel_py.pipeline.processors.dem``. The processor validates feature names from the shared registry and assembles the selected bands without changing YAML dispatch. DEM raster reads run under the process-wide raster lock, like every other native GDAL call. Changing a feature's output requires bumping ``PROCESSOR_VERSION`` in ``dem.py``.
 

@@ -26,6 +26,7 @@ from sentinel_py.pipeline.processors.base import (
 # moves ``recipe_id`` onto ``make_recipe_id`` (processor name now hashed), so
 # existing DEM COG tiles are regenerated once.
 PROCESSOR_VERSION = 4
+DEM_SOURCE_TYPES = (SourceType.dem_local, SourceType.dem_remote)
 
 
 ########################################################################################
@@ -221,7 +222,7 @@ class DEMNodeConfig(BaseModel):
 
 
 def _native_feature_chunk(
-    paths: tuple[Path, ...], grid: Any, window: Any, config: DEMNodeConfig
+    paths: tuple[str | Path, ...], grid: Any, window: Any, config: DEMNodeConfig
 ) -> np.ndarray:
     """Read a native DEM halo, calculate one output chunk, and align it.
 
@@ -233,7 +234,7 @@ def _native_feature_chunk(
 
 
 def _native_feature_chunk_locked(
-    paths: tuple[Path, ...], grid: Any, window: Any, config: DEMNodeConfig
+    paths: tuple[str | Path, ...], grid: Any, window: Any, config: DEMNodeConfig
 ) -> np.ndarray:
     """Run one DEM chunk calculation while holding the raster lock."""
     try:
@@ -242,12 +243,12 @@ def _native_feature_chunk_locked(
         from rasterio.warp import transform_bounds
     except ImportError as error:
         raise RuntimeError("DEM processing requires rasterio") from error
-    with rasterio.open(paths[0]) as first:
-        source_crs = first.crs
-        source_res = (abs(first.transform.a), abs(first.transform.e))
-        source_transform = first.transform
-    with rasterio.Env():
-        datasets = [rasterio.open(path) for path in paths]
+    with pipeline_grid.raster_env(paths):
+        with rasterio.open(paths[0]) as first:
+            source_crs = first.crs
+            source_res = (abs(first.transform.a), abs(first.transform.e))
+            source_transform = first.transform
+        datasets =[rasterio.open(path) for path in paths]
         try:
             projected_bounds = transform_bounds(
                 grid.crs, source_crs, *window.bounds, densify_pts=21
@@ -361,8 +362,11 @@ class DEMProcessor(BaseProcessor):
         if inputs:
             raise ValueError("dem does not accept upstream inputs")
         source = sources.get(config.source)
-        if getattr(source, "source_type", None) != SourceType.dem_local:
-            raise ValueError(f"dem.source must reference a {SourceType.dem_local} source")
+        if getattr(source, "source_type", None) not in DEM_SOURCE_TYPES:
+            raise ValueError(
+                f"dem.source must reference a {SourceType.dem_local} or "
+                f"{SourceType.dem_remote} source"
+            )
         if output_grid.chunks is None:
             raise ValueError("dem requires a canonical output grid")
 
@@ -381,24 +385,24 @@ class DEMProcessor(BaseProcessor):
             from dask import delayed
         except ImportError as error:
             raise RuntimeError("DEM processing requires xarray and Dask") from error
-        from sentinel_py.pipeline.readers.arcticdem import select_dem_paths
+        from sentinel_py.pipeline.readers import get_default_reader_registry
+        from sentinel_py.pipeline.readers.arcticdem import select_dem_tiles
         from sentinel_py.pipeline.readers.base import apply_polygon_mask
 
-        source = context.pipeline.sources[config.source]
-        paths = tuple(sorted(source.data_dir.glob(source.pattern)))
-        if not paths:
-            raise RuntimeError(
-                f"No DEM GeoTIFFs matched {source.data_dir / source.pattern}"
-            )
         pipeline = context.pipeline
+        source = pipeline.sources[config.source]
+        tiles = get_default_reader_registry().get(source.source_type).tiles(
+            source, pipeline.aoi_plan, logger=context.logger
+        )
         if pipeline.output_grid.chunks is None:
             raise ValueError("DEM requires output-grid chunks")
         datasets = {}
         for unit in pipeline.aoi_plan.units:
             grid = grid_for_unit(unit, pipeline.output_grid)
-            selected_paths = select_dem_paths(paths, unit, grid=grid)
-            if not selected_paths:
+            selected_tiles = select_dem_tiles(tiles, unit, grid=grid)
+            if not selected_tiles:
                 raise RuntimeError(f"No DEM GeoTIFFs intersect AOI {unit.aoi_id}")
+            selected_paths = tuple(tile.path for tile in selected_tiles)
             arrays = []
             for window in grid.iter_windows():
                 task = delayed(_native_feature_chunk)(
@@ -432,7 +436,11 @@ class DEMProcessor(BaseProcessor):
                     "granule_id": ("time", ["dem"]),
                     "source_fingerprint": (
                         "time",
-                        [deterministic_cache_key([str(path) for path in paths])],
+                        [
+                            deterministic_cache_key(
+                                [tile.fingerprint for tile in tiles]
+                            )
+                        ],
                     ),
                 },
                 attrs={

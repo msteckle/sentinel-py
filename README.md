@@ -305,6 +305,16 @@ sentinel-py pgc download \
 
 Download state is stored at `<outdir>/.sentinel-py/pgc_downloads.parquet`. It records each tile's URL, local path, size, status, and last action. Existing files are checked only when referenced by the manifest and verified complete files are skipped; the output directory is never recursively crawled. Downloads use atomic temporary files, retries, and a Rich progress bar. PGC ArcticDEM mosaics use EPSG:3413 and ellipsoidal heights; follow PGC's attribution requirements when publishing results.
 
+For Sentinel-1 pipelines that use the `snap_gpt` node, the local ArcticDEM tiles must cover each scene's processing region (the AOI overlap plus margin, or the whole footprint with `subset: scene`). Check a pipeline and write the uncovered areas as an AOI with `pgc missing`, then fetch exactly those tiles with the normal query and download commands:
+
+```bash
+sentinel-py pgc missing --pipeline pipelines/s1.yaml
+sentinel-py pgc query --aoi pipelines/s1_missing_dem.geojson
+sentinel-py pgc download --outdir data/arcticdem/10m
+```
+
+`pgc missing` needs neither SNAP nor the network; it exits with code 1 when any area is missing and 0 when everything is covered. The GeoJSON (EPSG:4326) has a `required` feature for ground SNAP cannot process without a DEM tile and a `margin` feature for ground needed only for the DEM margin around each region; `--no-margin` reports and writes only the required areas, and `--output` chooses the file (default `<pipeline name>_missing_dem.geojson` beside the pipeline). Coverage is judged from tile footprints, so a tile with internal nodata voids still counts as covering its area. The `snap_gpt` node runs the same check before starting and stops with the number of uncovered scenes, because compute nodes should not fetch data at run time.
+
 ### Managing caches
 
 Query results, shared asset listings, and checkpointed download state accumulate under `~/.sentinel-py/cache` (override the location with `SENTINEL_PY_HOME`), and state files sit beside your data in `.sentinel-py` directories. The `cache` commands show and tidy them without touching downloaded data or processing outputs.

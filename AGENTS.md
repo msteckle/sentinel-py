@@ -32,6 +32,7 @@ Find the right home before writing code. Source is under `src/sentinel_py`; test
 | `pipeline/artifacts.py` | `RasterArtifact` and `PointSampleArtifact`. |
 | `pipeline/base.py` | The generic `Registry` shared by processors, readers, and writers. |
 | `pipeline/snap.py` | SNAP `gpt` execution for Sentinel-1: gpt/version resolution, per-scene jobs, DEM clipping, offline SNAP user directory, cached per-scene outputs; graphs live in `pipeline/snap_graphs/`. |
+| `pipeline/dem_coverage.py` | Geometric check of `snap_gpt` DEM tiles against each scene's processing region (`find_dem_gaps`); backs the processor preflight and `sentinel-py pgc missing`. |
 | `pipeline/processors/` | Semantic transformations; `base.py` holds `BaseProcessor`, `make_recipe_id`, `mask_nodata`. |
 | `pipeline/readers/` | Source adapters; `base.py` holds `BaseReader` and point-sampling helpers. |
 | `pipeline/writers/` | Output writers; `base.py` holds `BaseOutputWriter` and the writer registry. |

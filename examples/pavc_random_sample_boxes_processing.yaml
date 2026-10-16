@@ -23,12 +23,18 @@ sources:
   s2:
     type: s2.l2a.local
     data_dir: ../data/s2/raw
+  s1:
+    type: s1.grd.local
+    data_dir: ../data/s1/raw
+    flight_direction: PREDOMINANT  # don't mix ascending and descending scenes
+    orbit: precise-or-restituted
   arcticdem:
     type: dem.local
     data_dir: ../data/arcticdem/10m
     pattern: "*.tif"
 
 nodes:
+  # Sentinel-2
   - id: preprocess
     type: s2.preprocess
     source: s2
@@ -44,6 +50,26 @@ nodes:
     type: s2.index
     inputs: {data: all-composite}
     indices: [NDGI, NDWI1, NDWI2, MSAVI, VARI, RVI, OSAVI, TGI, GLI, NGRDI, CIG, GNDVI, CVI, MTVI2, TCARI, TCI, NARI, TCAPB, TCAPG, TCAPW]
+  # Sentinel-1
+  - id: s1-preprocess
+    type: snap_gpt
+    source: s1
+    dem: arcticdem
+    polarizations: [VV, VH]
+    subset: aoi
+    dem_vertical_datum: ellipsoid  # ArcticDEM heights are ellipsoidal
+    memory_gb: 16
+    threads: 4
+  - id: s1-composite
+    type: composite
+    inputs: {data: s1-preprocess}
+    period: all
+    aggregation: median
+    empty_bins: fill  # sites without Sentinel-1 scenes get nodata, not an error
+  - id: s1-db
+    type: to_db
+    inputs: {data: s1-composite}
+  # ArcticDEM
   - id: terrain
     type: dem
     source: arcticdem
@@ -61,3 +87,8 @@ outputs:
     from: terrain
     path: ../data/arcticdem/pavc_random_sample_boxes
     format: cog
+  s1_backscatter_db:
+    from: s1-db
+    path: ../data/s1/pavc_random_sample_boxes
+    format: cog
+    encoding: {dtype: int16, scale: 0.01}  # 0.01 dB steps; about half the size of float32

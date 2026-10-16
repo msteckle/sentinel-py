@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sentinel_py.cache import deterministic_cache_key
 from sentinel_py.enums import S2_NODATA
 from sentinel_py.pipeline.readers.base import (
+    POINT_METADATA_COLUMNS,
     S1_POINT_ATTRIBUTE_COLUMNS,
     S1_POINT_POLARIZATIONS,
 )
@@ -498,11 +499,7 @@ class S2CompositeProcessor(BaseProcessor):
         by_index = {point_bin.index: point_bin for point_bin in bins}
 
         rows = source.rows.copy()
-        metadata = {
-            "aoi_id", "component_id", "point_index", "longitude", "latitude",
-            "time", "product_id", "granule_id", "time_representation", "source_fingerprint",
-        }
-        metadata |= S1_POINT_ATTRIBUTE_COLUMNS
+        metadata = POINT_METADATA_COLUMNS | S1_POINT_ATTRIBUTE_COLUMNS
         value_columns = [name for name in rows.columns if name not in metadata]
         group_columns = ["aoi_id", "component_id", "point_index", "longitude", "latitude"]
         # S2 source rows may carry 0 (no-data) or 65535 (saturated) from older caches;

@@ -1,0 +1,71 @@
+version: 1
+
+execution:
+  # slurm: workers are Slurm jobs; every worker reads Sentinel-2 and ArcticDEM over
+  # HTTPS, so the compute nodes need internet access. Concurrent connections equal
+  # the number of worker processes (workers, or jobs x processes_per_job on Slurm).
+  method: local
+  workers: 8
+  threads_per_worker: 1
+
+selection:
+  aoi: ../data/aois/pavc_random_sample.geojson
+  aoi_id_field: site_visit_id
+  years: [2023, 2024]
+  speriod: "06-01"
+  eperiod: "08-31"
+
+output_grid:
+  crs: EPSG:3338
+  resolution: 20
+  extent: aoi
+  anchor: [0, 0]
+  chunks: {y: 1024, x: 1024}
+
+sources:
+  # Nothing is downloaded: scenes and tiles are found with STAC searches (cached) and
+  # their cloud-optimized GeoTIFFs are read in place.
+  s2:
+    type: s2.l2a.remote
+    collection: sentinel-2-l2a  # or sentinel-2-c1-l2a (Collection 1 reprocessing)
+  arcticdem:
+    type: dem.remote
+
+nodes:
+  # Sentinel-2: one summer median per band, then spectral indices from the medians
+  - id: preprocess
+    type: s2.preprocess
+    source: s2
+    bands: [B02, B03, B04, B05, B06, B07, B08, B8A, B11, B12]
+    mask_classes: [0, 1, 3, 8, 9, 10, 11]
+    nodata: 65535
+  - id: all-composite
+    type: composite
+    inputs: {data: preprocess}
+    period: all
+    aggregation: median
+  - id: indices
+    type: s2.index
+    inputs: {data: all-composite}
+    indices: [NDGI, NDWI1, NDWI2, MSAVI, VARI, GNDVI]
+
+  # ArcticDEM: terrain features
+  - id: terrain
+    type: dem
+    source: arcticdem
+    features: [elevation, aspect, slope, hillshade]
+    algorithm: Horn
+    hillshade_azimuth: 315
+    hillshade_altitude: 45
+
+  # One wide row per point: the first input is the base; static terrain columns are
+  # added to every row.
+  - id: samples
+    type: join
+    inputs: {base: indices, terrain: terrain}
+
+outputs:
+  samples:
+    from: samples
+    path: ../data/pavc_samples_remote
+    format: parquet

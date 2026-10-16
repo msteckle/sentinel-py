@@ -86,6 +86,13 @@ POINT_SAMPLE_CACHE_VERSION = 1
 # Sentinel-1 point rows carry polarization value columns plus per-scene attributes;
 # consumers must not treat the attributes as values, nor apply Sentinel-2 integer
 # sentinels (0 / 65535) to floating-point backscatter.
+# Identity, geometry, and provenance columns written by ``point_row`` on every point row.
+POINT_METADATA_COLUMNS = frozenset(
+    {
+        "aoi_id", "component_id", "point_index", "longitude", "latitude", "time",
+        "product_id", "granule_id", "time_representation", "source_fingerprint",
+    }
+)
 S1_POINT_POLARIZATIONS = frozenset({"VV", "VH", "HH", "HV"})
 S1_POINT_ATTRIBUTE_COLUMNS = frozenset(
     {"flight_direction", "relative_orbit", "orbit_type", "units"}

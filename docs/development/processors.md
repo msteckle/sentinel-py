@@ -213,6 +213,19 @@ A ``dem.local`` source reads tiles from ``data_dir``. A ``dem.remote`` source (`
 
 New DEM-derived bands can be added by defining and registering a ``DEMFeature`` subclass in ``sentinel_py.pipeline.processors.dem``. The processor validates feature names from the shared registry and assembles the selected bands without changing YAML dispatch. DEM raster reads run under the process-wide raster lock, like every other native GDAL call. Changing a feature's output requires bumping ``PROCESSOR_VERSION`` in ``dem.py``.
 
+## Joining point samples
+
+The built-in ``join`` processor merges the point rows of several nodes into one wide table, so a point pipeline can write a single Parquet file holding, for example, spectral indices, terrain, and backscatter. It takes two or more ``inputs`` and no other keys. The first input is the base: its rows, order, and identity and provenance columns are kept. The value columns of the other inputs are added by a left join. An input whose rows are all ``static`` (such as ``dem`` terrain) is matched on the point (``aoi_id`` and ``component_id``) and repeated on every base row; any other input is matched on the point and its ``time`` label, so seasonal composite bins of different sources line up, and a point with no matching row gets missing values. An input with several rows per join key (for example uncomposited scenes) and a value column name that already exists are errors, so aggregate with ``composite`` first. ``join`` only supports point AOIs; with polygon AOIs each node keeps its own raster output.
+
+```yaml
+nodes:
+  - id: samples
+    type: join
+    inputs: {base: indices, terrain: terrain, radar: s1-db}
+outputs:
+  samples: {from: samples, path: ../data/samples, format: parquet}
+```
+
 ## Sentinel-1 preprocessing with SNAP
 
 The built-in `snap_gpt` processor runs the external SNAP `gpt` tool once per Sentinel-1 GRD scene and AOI unit, then exposes the terrain-corrected scenes as a lazy `backscatter` variable with dimensions `(time, band, y, x)` on the canonical output grid. Install SNAP 14 first (see `docs/quickstart/install.md`), then stage orbit files and the EGM96 grid with `sentinel-py asf download` so processing never needs the network. The node sources are an `s1.grd.local` source (ASF ZIPs plus the staged orbits) and a `dem.local` source holding ArcticDEM tiles.

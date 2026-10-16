@@ -406,3 +406,120 @@ def test_point_composite_fill_handles_a_table_with_no_rows():
     )
     assert len(result.rows) == 2 and result.rows[["VV", "VH"]].isna().all().all()
     assert result.rows[["VV", "VH"]].isna().all().all()
+
+
+# Binned (climatological) point composites ------------------------------------------
+
+
+def _obs(point: int, time: str, vv: float, vh: float = 0.01) -> dict:
+    row = _point_rows(point).iloc[0].to_dict()
+    row.update(time=time, VV=vv, VH=vh, product_id=f"p-{time}", granule_id=f"g-{time}",
+               source_fingerprint=f"fp-{time}-{point}")
+    return row
+
+
+def _binned(rows, *, units=(0, 1), **config):
+    plan = SimpleNamespace(units=tuple(_point_unit(i) for i in units))
+    return S2CompositeProcessor().execute_points(
+        S2CompositeNodeConfig(**config),
+        {"data": PointSampleArtifact(pd.DataFrame(rows), plan)}, _context(),
+    ).rows
+
+
+def test_binned_point_composite_pools_years_into_shared_seasonal_slots():
+    rows = _binned(
+        [
+            _obs(0, "20230602T164404", 0.1),    # bin 0 (06-01), year 2023
+            _obs(0, "2024-06-10", 0.3),         # bin 0, year 2024, ISO date
+            _obs(0, "20240704T170031", 0.5),    # bin 2 (07-01)
+            _obs(1, "20230820T164404", 0.7),    # bin 5 (08-15)
+        ],
+        period="15D", aggregation="mean",
+    )
+    assert rows[["aoi_id", "granule_id", "time"]].values.tolist() == [
+        ["site-0", "bin_0000_2000-06-01", "06-01"],
+        ["site-0", "bin_0002_2000-07-01", "07-01"],
+        ["site-1", "bin_0005_2000-08-15", "08-15"],
+    ]
+    assert rows["VV"].tolist() == pytest.approx([0.2, 0.5, 0.7])
+    assert set(rows["time_representation"]) == {"composite"}
+    assert set(rows["product_id"]) == {"composite"}
+    assert "bin" not in rows.columns
+
+
+def test_binned_point_composite_ignores_nan_and_keeps_all_nan_bins_as_nan():
+    rows = _binned(
+        [
+            _obs(0, "2023-06-02", np.nan),
+            _obs(0, "2024-06-10", 0.3),            # the valid one in bin 0
+            _obs(0, "2024-07-04", np.nan, np.nan),  # bin 2 has only NaN
+        ],
+        period="15D", aggregation="median", units=(0,),
+    )
+    by_bin = rows.set_index("granule_id")
+    assert by_bin.loc["bin_0000_2000-06-01", "VV"] == pytest.approx(0.3)
+    assert np.isnan(by_bin.loc["bin_0002_2000-07-01", "VV"])
+    assert np.isnan(by_bin.loc["bin_0002_2000-07-01", "VH"])
+
+
+def test_binned_point_composite_fill_gives_every_point_every_bin():
+    rows = _binned(
+        [_obs(0, "2024-06-10", 0.3), _obs(1, "2024-08-20", 0.7)],
+        period="15D", aggregation="maximum", empty_bins="fill",
+    )
+    assert len(rows) == 2 * 7  # two points, seven 15-day bins from 06-01 to 08-31
+    assert rows.groupby("aoi_id").size().tolist() == [7, 7]
+    assert rows["granule_id"].iloc[:7].tolist() == [
+        f"bin_{i:04d}_{d}" for i, d in enumerate(
+            ["2000-06-01", "2000-06-16", "2000-07-01", "2000-07-16",
+             "2000-07-31", "2000-08-15", "2000-08-30"]
+        )
+    ]
+    valid = rows.dropna(subset=["VV"])
+    assert valid[["aoi_id", "granule_id"]].values.tolist() == [
+        ["site-0", "bin_0000_2000-06-01"], ["site-1", "bin_0005_2000-08-15"],
+    ]
+    # Rows are ordered by point then bin, and fill rows carry real point identity.
+    assert rows["aoi_id"].is_monotonic_increasing
+    assert rows.loc[rows["aoi_id"] == "site-1", "latitude"].eq(68.0).all()
+
+
+def test_binned_point_composite_drops_out_of_season_and_rejects_bad_times():
+    rows = _binned(
+        [_obs(0, "2023-09-10", 9.0), _obs(0, "2023-06-02", 0.1)],
+        period="15D", aggregation="mean", units=(0,),
+    )
+    assert rows["VV"].tolist() == [0.1]  # September is outside the 06-01..08-31 season
+
+    with pytest.raises(ValueError, match="cannot parse"):
+        _binned([_obs(0, "not-a-date", 0.1)], period="15D", units=(0,))
+
+
+def test_binned_point_fingerprint_names_the_members_and_all_stays_literal():
+    first = _binned([_obs(0, "2023-06-02", 0.1), _obs(0, "2024-06-10", 0.3)],
+                    period="15D", units=(0,))
+    reordered = _binned([_obs(0, "2024-06-10", 0.3), _obs(0, "2023-06-02", 0.1)],
+                        period="15D", units=(0,))
+    fewer = _binned([_obs(0, "2023-06-02", 0.1)], period="15D", units=(0,))
+    assert first["source_fingerprint"].iloc[0] == reordered["source_fingerprint"].iloc[0]
+    assert first["source_fingerprint"].iloc[0] != fewer["source_fingerprint"].iloc[0]
+    single = _binned([_obs(0, "2023-06-02", 0.1)], period="all", units=(0,))
+    assert single["source_fingerprint"].iloc[0] == "composite"
+
+
+def test_period_all_point_columns_keep_their_historic_order():
+    rows = _binned([_obs(0, "2023-06-02", 0.1)], period="all", units=(0,))
+    assert list(rows.columns) == [
+        "aoi_id", "component_id", "point_index", "longitude", "latitude", "VV", "VH",
+        "time", "product_id", "granule_id", "time_representation", "source_fingerprint",
+    ]
+
+
+def test_binned_point_composite_fill_with_no_rows_at_all():
+    empty = _point_rows(0).iloc[0:0].astype({"VV": "float64", "VH": "float64"})
+    plan = SimpleNamespace(units=(_point_unit(0),))
+    result = S2CompositeProcessor().execute_points(
+        S2CompositeNodeConfig(period="15D", aggregation="median", empty_bins="fill"),
+        {"data": PointSampleArtifact(empty, plan)}, _context(),
+    )
+    assert len(result.rows) == 7 and result.rows[["VV", "VH"]].isna().all().all()

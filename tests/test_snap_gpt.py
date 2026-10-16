@@ -336,3 +336,26 @@ def test_points_without_scenes_give_a_typed_empty_table_then_nodata_rows(tmp_pat
     assert scenes.empty and {"VV", "VH", "orbit_type", "units"} <= set(scenes.columns)
     composite = result.node_results["seasonal"].rows
     assert len(composite) == 1 and composite[["VV", "VH"]].isna().all().all()
+
+
+def test_s1_points_flow_into_binned_climatology(tmp_path: Path):
+    project = write_s1_project(tmp_path, point=True)
+    project.write_text(
+        project.read_text().replace(
+            "outputs:\n  result:\n    from: sigma0\n    path: output\n    format: parquet",
+            "  - id: seasonal\n    type: composite\n    inputs: {data: sigma0}\n"
+            "    period: 15D\n    aggregation: median\n    empty_bins: fill\n"
+            "  - id: sigma0_db\n    type: to_db\n    inputs: {data: seasonal}\n"
+            "outputs:\n  result:\n    from: sigma0_db\n    path: output\n    format: parquet",
+        )
+    )
+
+    rows = _run(project).node_results["sigma0_db"].rows
+
+    # Season 06-01..09-30 in 15-day bins is nine bins; scenes fall in bins 5 and 6.
+    assert len(rows) == 9
+    valid = rows.dropna(subset=["VV"])
+    assert valid["granule_id"].tolist() == ["bin_0005_2000-08-15", "bin_0006_2000-08-30"]
+    assert valid["VV"].tolist() == pytest.approx([-10.0, -10.0], abs=1e-4)  # 0.1 linear
+    assert valid["VH"].tolist() == pytest.approx([-13.0103, -13.0103], abs=1e-3)
+    assert rows["VV"].isna().sum() == 7 and set(rows["units"].dropna()) == {"dB"}

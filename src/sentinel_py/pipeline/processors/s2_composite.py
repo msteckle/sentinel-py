@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 
@@ -187,40 +188,117 @@ def _composite_name(source: Any, selection: Any, aggregation: str) -> str:
     )
 
 
-def _fill_missing_points(aggregate: Any, plan: Any, value_columns: list[str]) -> Any:
-    """Append an all-NaN composite row for every planned point without observations.
+@dataclass(frozen=True)
+class _PointBin:
+    """One seasonal bin of a point composite and the labels written on its rows."""
+
+    index: int
+    time: str
+    granule_id: str
+
+
+def _point_bins(
+    boundaries: tuple[np.datetime64, ...], period: str
+) -> tuple[_PointBin, ...]:
+    """Describe every seasonal bin of a point composite.
+
+    The single bin of ``period: all`` keeps the labels point composites have always
+    used (``time`` is the season start as ``MM-DD`` and ``granule_id`` is ``all``);
+    binned periods label bins like the raster composites do.
+    """
+    bins = []
+    for index in range(len(boundaries) - 1):
+        stamp = str(boundaries[index])[:10]  # year 2000, the shared seasonal calendar
+        bins.append(
+            _PointBin(
+                index,
+                stamp[5:],
+                "all" if period == "all" else f"bin_{index:04d}_{stamp}",
+            )
+        )
+    return tuple(bins)
+
+
+def _point_bin_indices(times: Any, boundaries: tuple[np.datetime64, ...]) -> np.ndarray:
+    """Map observation times to seasonal bin indices, shared across years.
+
+    Parameters
+    ----------
+    times : pandas.Series
+        Acquisition timestamps as strings (``%Y%m%dT%H%M%S`` or ISO dates).
+    boundaries : tuple[numpy.datetime64, ...]
+        Bin boundaries from :func:`_season_boundaries`.
+
+    Returns
+    -------
+    numpy.ndarray
+        Bin index per row; ``-1`` or ``len(boundaries) - 1`` mean outside the season.
+
+    Raises
+    ------
+    ValueError
+        If a timestamp cannot be parsed.
+    """
+    import pandas as pd
+
+    try:
+        stamps = pd.to_datetime(times.astype(str), format="mixed")
+    except (ValueError, TypeError) as error:
+        raise ValueError(f"composite cannot parse point observation times: {error}") from error
+    canonical = pd.to_datetime(
+        {"year": 2000, "month": stamps.dt.month, "day": stamps.dt.day}
+    )
+    return np.searchsorted(
+        np.array(boundaries, dtype="datetime64[ns]"),
+        canonical.to_numpy(dtype="datetime64[ns]"),
+        side="right",
+    ) - 1
+
+
+def _fill_missing_points(
+    aggregate: Any, plan: Any, value_columns: list[str], bins: tuple[_PointBin, ...]
+) -> Any:
+    """Append an all-NaN composite row for every planned point and bin without data.
 
     Parameters
     ----------
     aggregate : pandas.DataFrame
-        Composite rows of the points that had observations.
+        Composite rows with a ``bin`` column, for the (point, bin) pairs that had
+        observations.
     plan : AOIPlan
         Pipeline AOI plan whose ``units`` list every point.
     value_columns : list[str]
         Value columns to set to NaN on the added rows.
+    bins : tuple[_PointBin, ...]
+        Every seasonal bin that must be present for every point.
 
     Returns
     -------
     pandas.DataFrame
-        ``aggregate`` plus one nodata row per missing point.
+        ``aggregate`` plus one nodata row per missing (point, bin) pair.
     """
     import pandas as pd
 
     from sentinel_py.enums import AOIKind
     from sentinel_py.pipeline.readers.base import point_row
 
-    present = set(zip(aggregate["aoi_id"], aggregate["component_id"], strict=True))
+    present = set(
+        zip(aggregate["aoi_id"], aggregate["component_id"], aggregate["bin"], strict=True)
+    )
     added = []
     for unit in getattr(plan, "units", ()):
-        if unit.kind != AOIKind.point or (unit.aoi_id, unit.component_id) in present:
+        if unit.kind != AOIKind.point:
             continue
-        row = point_row(
-            unit, time=aggregate["time"].iloc[0] if len(aggregate) else "all",
-            product_id="composite", granule_id="all",
-            time_representation="composite", source_fingerprint="composite",
-        )
-        row.update({name: np.nan for name in value_columns})
-        added.append(row)
+        for point_bin in bins:
+            if (unit.aoi_id, unit.component_id, point_bin.index) in present:
+                continue
+            row = point_row(
+                unit, time=point_bin.time, product_id="composite",
+                granule_id=point_bin.granule_id, time_representation="composite",
+                source_fingerprint="composite",
+            )
+            row.update({"bin": point_bin.index, **{name: np.nan for name in value_columns}})
+            added.append(row)
     if not added:
         return aggregate
     if aggregate.empty:
@@ -396,7 +474,15 @@ class S2CompositeProcessor(BaseProcessor):
         inputs: Mapping[str, Any],
         context: ProcessorContext,
     ) -> Any:
-        """Aggregate normalized point observations without constructing raster tasks."""
+        """Aggregate point observations into seasonal bins without raster tasks.
+
+        Observations are binned by month and day, so every selected year falls into
+        the same seasonal slots (a climatology). Missing values never enter an
+        aggregate; with ``empty_bins: fill`` every planned point gets a row for
+        every bin, nodata where it has no valid observation.
+        """
+        import pandas as pd
+
         from sentinel_py.pipeline.artifacts import PointSampleArtifact
 
         if not isinstance(config, S2CompositeNodeConfig) or len(inputs) != 1:
@@ -404,6 +490,13 @@ class S2CompositeProcessor(BaseProcessor):
         source = next(iter(inputs.values()))
         if not isinstance(source, PointSampleArtifact):
             raise TypeError("composite point input must be a PointSampleArtifact")
+        selection = context.pipeline.selection
+        boundaries = _season_boundaries(
+            selection.start_period, selection.end_period, config.period
+        )
+        bins = _point_bins(boundaries, config.period)
+        by_index = {point_bin.index: point_bin for point_bin in bins}
+
         rows = source.rows.copy()
         metadata = {
             "aoi_id", "component_id", "point_index", "longitude", "latitude",
@@ -412,23 +505,56 @@ class S2CompositeProcessor(BaseProcessor):
         metadata |= S1_POINT_ATTRIBUTE_COLUMNS
         value_columns = [name for name in rows.columns if name not in metadata]
         group_columns = ["aoi_id", "component_id", "point_index", "longitude", "latitude"]
+        # S2 source rows may carry 0 (no-data) or 65535 (saturated) from older caches;
+        # neither may participate in a point composite.
+        for column in value_columns:
+            if column in S1_POINT_POLARIZATIONS:
+                continue  # floating-point backscatter already uses NaN nodata
+            rows[column] = rows[column].replace((0, S2_NODATA), np.nan)
+
         if config.period == "all":
-            # S2 source rows may carry 0 (no-data) or 65535 (saturated) from
-            # older caches; neither may participate in a point composite.
-            for column in value_columns:
-                if column in S1_POINT_POLARIZATIONS:
-                    continue  # floating-point backscatter already uses NaN nodata
-                rows[column] = rows[column].replace((0, S2_NODATA), np.nan)
-            grouped = rows.groupby(group_columns, dropna=False, sort=False)
-            aggregate = getattr(grouped[value_columns], {"mean": "mean", "median": "median", "maximum": "max"}[config.aggregation])().reset_index()
-            aggregate["time"] = f"{context.pipeline.selection.start_period[0]:02d}-{context.pipeline.selection.start_period[1]:02d}"
-            aggregate["product_id"] = "composite"
-            aggregate["granule_id"] = "all"
-            aggregate["time_representation"] = "composite"
+            rows["bin"] = 0
+        elif len(rows):
+            rows["bin"] = _point_bin_indices(rows["time"], boundaries)
+            rows = rows[(rows["bin"] >= 0) & (rows["bin"] < len(bins))]
+        else:
+            rows["bin"] = pd.Series(dtype="int64")
+
+        function = {"mean": "mean", "median": "median", "maximum": "max"}[config.aggregation]
+        if rows.empty:
+            aggregate = pd.DataFrame(columns=[*group_columns, "bin", *value_columns])
+        else:
+            grouped = rows.groupby([*group_columns, "bin"], dropna=False, sort=False)
+            aggregate = getattr(grouped[value_columns], function)().reset_index()
+            if config.period != "all":
+                aggregate["source_fingerprint"] = grouped["source_fingerprint"].agg(
+                    lambda values: deterministic_cache_key(
+                        {"source_fingerprints": sorted(str(value) for value in values)}
+                    )
+                ).to_numpy()
+        aggregate["time"] = aggregate["bin"].map({b.index: b.time for b in bins})
+        aggregate["granule_id"] = aggregate["bin"].map(
+            {index: point_bin.granule_id for index, point_bin in by_index.items()}
+        )
+        aggregate["product_id"] = "composite"
+        aggregate["time_representation"] = "composite"
+        if "source_fingerprint" not in aggregate:
             aggregate["source_fingerprint"] = "composite"
-            if config.empty_bins == "fill":
-                aggregate = _fill_missing_points(aggregate, source.plan, value_columns)
-            return PointSampleArtifact(aggregate, source.plan)
-        # Preserve acquisition rows for non-all bins until binning rules are expanded.
-        # This is explicit rather than silently applying a different calendar policy.
-        raise ValueError("Point composites currently support period: all only")
+        if config.empty_bins == "fill":
+            aggregate = _fill_missing_points(aggregate, source.plan, value_columns, bins)
+        aggregate = aggregate[
+            [
+                *group_columns, *value_columns, "time", "product_id", "granule_id",
+                "time_representation", "source_fingerprint", "bin",
+            ]
+        ]
+        if config.period != "all":
+            aggregate = aggregate.sort_values(
+                ["aoi_id", "component_id", "bin"], kind="stable"
+            ).reset_index(drop=True)
+        context.logger.info(
+            "Built point composite node=%s rows=%d bins=%d aggregation=%s period=%s",
+            context.node.node_id, len(aggregate), len(bins), config.aggregation,
+            config.period,
+        )
+        return PointSampleArtifact(aggregate.drop(columns="bin"), source.plan)

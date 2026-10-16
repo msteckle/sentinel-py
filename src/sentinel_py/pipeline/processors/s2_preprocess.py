@@ -8,7 +8,6 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pyproj import CRS
 
-from sentinel_py.cache import REGISTRY
 from sentinel_py.enums import S2_NODATA, S2Bands, SourceType
 from sentinel_py.pipeline.grid import grid_for_unit
 from sentinel_py.pipeline.processors.base import (
@@ -24,6 +23,7 @@ DEFAULT_MASK_CLASSES = (0, 1, 3, 8, 9, 10, 11)
 # Bump when preprocessing output changes so cached recipes and COG resume keys are
 # invalidated. Included in ``recipe_id``.
 PROCESSOR_VERSION = 1
+S2_SOURCE_TYPES = (SourceType.s2_l2a_local, SourceType.s2_l2a_remote)
 
 
 ########################################################################################
@@ -106,9 +106,10 @@ class S2PreprocessProcessor(BaseProcessor):
         if source is None:
             raise ValueError(f"{node_id}.source does not reference a configured source")
         # Ensure the source is of the correct type
-        if getattr(source, "source_type", None) != SourceType.s2_l2a_local:
+        if getattr(source, "source_type", None) not in S2_SOURCE_TYPES:
             raise ValueError(
-                f"{node_id}.source must reference an {SourceType.s2_l2a_local} source"
+                f"{node_id}.source must reference an {SourceType.s2_l2a_local} or "
+                f"{SourceType.s2_l2a_remote} source"
             )
         # Ensure the output grid is configured and of the correct type
         if output_grid.chunks is None:
@@ -145,6 +146,7 @@ class S2PreprocessProcessor(BaseProcessor):
         if inputs:
             raise ValueError("s2.preprocess does not accept upstream artifacts yet")
 
+        from sentinel_py.pipeline.readers import get_default_reader_registry
         from sentinel_py.pipeline.readers.s2 import read_s2_unit
 
         # Access the pipeline and output grid
@@ -152,14 +154,22 @@ class S2PreprocessProcessor(BaseProcessor):
         if pipeline.output_grid.chunks is None:
             raise ValueError("Lazy S2 preprocessing requires output-grid chunks")
         source = pipeline.sources[config.source]
+        selection = pipeline.selection
+        find_granules = get_default_reader_registry().get(source.source_type).granule_finder(
+            source, pipeline.aoi_plan, bands=config.bands,
+            resolution_m=round(min(pipeline.output_grid.resolution)),
+            years=selection.years, speriod=selection.start_period,
+            eperiod=selection.end_period, logger=context.logger,
+        )
         datasets = {}
         for unit in pipeline.aoi_plan.units:
             grid = grid_for_unit(unit, pipeline.output_grid)
             dataset = read_s2_unit(
-                unit, data_dir=source.data_dir, bands=config.bands,
+                unit, bands=config.bands,
                 resolution_m=round(min(grid.resolution)), years=pipeline.selection.years,
                 speriod=pipeline.selection.start_period, eperiod=pipeline.selection.end_period,
                 mask_classes=config.mask_classes, nodata=config.nodata, grid=grid,
+                find_granules=find_granules,
             )
             dataset.attrs.update(
                 pipeline=str(pipeline.path), processor=self.type_name,
@@ -194,6 +204,7 @@ class S2PreprocessProcessor(BaseProcessor):
         if not isinstance(config, S2PreprocessNodeConfig) or inputs:
             raise TypeError("Invalid s2.preprocess configuration or inputs")
         from sentinel_py.pipeline.artifacts import PointSampleArtifact
+        from sentinel_py.pipeline.readers import get_default_reader_registry
         from sentinel_py.pipeline.readers.s2 import sample_s2_points
         from sentinel_py.pipeline.readers.base import (
             load_point_sample_cache,
@@ -210,12 +221,16 @@ class S2PreprocessProcessor(BaseProcessor):
             resolution=pipeline.output_grid.resolution,
             anchor=pipeline.output_grid.anchor,
         )
-        # The state fingerprint covers checkpoint parts as well as the base file.
-        fingerprint = REGISTRY["cdse_downloads"].store(source.data_dir).fingerprint()
-        if fingerprint is None:
-            fingerprint = (str(source.data_dir), source.data_dir.stat().st_mtime_ns)
+        reader = get_default_reader_registry().get(source.source_type)
+        resolution_m = round(min(pipeline.output_grid.resolution))
+        find_granules = reader.granule_finder(
+            source, pipeline.aoi_plan, bands=config.bands, resolution_m=resolution_m,
+            years=pipeline.selection.years, speriod=pipeline.selection.start_period,
+            eperiod=pipeline.selection.end_period, logger=context.logger,
+        )
+        fingerprint = reader.point_cache_fingerprint(source, find_granules)
         cache_key = point_sample_cache_key(
-            reader_name=SourceType.s2_l2a_local,
+            reader_name=source.source_type,
             source_fingerprint=fingerprint,
             requests=requests,
             settings={
@@ -226,7 +241,7 @@ class S2PreprocessProcessor(BaseProcessor):
                 "anchor": pipeline.output_grid.anchor,
             },
         )
-        rows = load_point_sample_cache(SourceType.s2_l2a_local, cache_key)
+        rows = load_point_sample_cache(source.source_type, cache_key)
         if rows is not None:
             context.logger.info("Using cached S2 point samples (%d rows)", len(rows))
             return PointSampleArtifact(rows, pipeline.aoi_plan)
@@ -248,9 +263,8 @@ class S2PreprocessProcessor(BaseProcessor):
 
         rows = sample_s2_points(
             pipeline.aoi_plan.units,
-            data_dir=source.data_dir,
             bands=config.bands,
-            resolution_m=round(min(pipeline.output_grid.resolution)),
+            resolution_m=resolution_m,
             years=pipeline.selection.years,
             speriod=pipeline.selection.start_period,
             eperiod=pipeline.selection.end_period,
@@ -261,6 +275,7 @@ class S2PreprocessProcessor(BaseProcessor):
             anchor=pipeline.output_grid.anchor,
             workers=pipeline.execution.workers,
             progress=report,
+            find_granules=find_granules,
         )
-        save_point_sample_cache(SourceType.s2_l2a_local, cache_key, rows)
+        save_point_sample_cache(source.source_type, cache_key, rows)
         return PointSampleArtifact(rows, pipeline.aoi_plan)

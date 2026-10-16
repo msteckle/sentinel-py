@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -27,7 +28,7 @@ from shapely.geometry.base import BaseGeometry
 
 from sentinel_py.cache import REGISTRY
 from sentinel_py.aoi import GeometryLike, aoi_as_geom
-from sentinel_py.enums import S2_BAND_IDS, SourceType
+from sentinel_py.enums import S2_BAND_IDS, EarthSearchCollection, SourceType
 import sentinel_py.pipeline.grid as pipeline_grid
 from sentinel_py.pipeline.grid import (
     AOIUnit,
@@ -51,9 +52,28 @@ S2_TILE_PATTERN = re.compile(r"_(T\d{2}[A-Z]{3})_")
 
 
 @dataclass(frozen=True)
+class S2Radiometry:
+    """Radiometric metadata of one granule, for sources that do not ship SAFE XML.
+
+    Attributes
+    ----------
+    offsets : dict[str, int]
+        Signed DN offset (``BOA_ADD_OFFSET``) per spectral band.
+    special_values : tuple[int, ...]
+        Raw DNs that mean nodata or saturation.
+    quantification_value : int
+        DN-to-reflectance divisor (``BOA_QUANTIFICATION_VALUE``).
+    """
+
+    offsets: dict[str, int]
+    special_values: tuple[int, ...]
+    quantification_value: int
+
+
+@dataclass(frozen=True)
 class S2Granule:
     """
-    The local inputs needed to preprocess one Sentinel-2 granule.
+    The inputs needed to preprocess one Sentinel-2 granule, local or remote.
 
     Attributes
     ----------
@@ -65,25 +85,36 @@ class S2Granule:
         The tile identifier of the Sentinel-2 granule.
     acquisition_time : str
         The acquisition time of the Sentinel-2 granule.
-    safe_dir : Path
-        The path to the SAFE directory of the Sentinel-2 granule.
-    product_metadata : Path
-        The path to the product metadata file (XML) of the Sentinel-2 granule.
-    band_paths : dict[str, Path]
-        A dictionary mapping band names to their corresponding file paths.
-    scl_path : Path | None
-        The path to the scene classification layer file, if available.
+    safe_dir : Path | None
+        The path to the SAFE directory of the Sentinel-2 granule (``None`` for remote).
+    product_metadata : Path | None
+        The path to the product metadata file (XML) of the Sentinel-2 granule
+        (``None`` for remote).
+    band_paths : dict[str, str | Path]
+        A dictionary mapping band names to their file paths or URLs.
+    scl_path : str | Path | None
+        The path or URL of the scene classification layer file, if available.
+    footprint : Any | None
+        WGS84 footprint of the granule.
+    radiometry : S2Radiometry | None
+        Radiometric metadata carried on the record; ``None`` means it is read from
+        ``product_metadata``.
+    fingerprint : str | None
+        Identity of the granule inputs; ``None`` means it is derived from the files'
+        size and modification time.
     """
 
     product_id: str
     granule_id: str
     tile_id: str
     acquisition_time: str
-    safe_dir: Path
-    product_metadata: Path
-    band_paths: dict[str, Path]
-    scl_path: Path | None
+    safe_dir: Path | None
+    product_metadata: Path | None
+    band_paths: dict[str, str | Path]
+    scl_path: str | Path | None
     footprint: Any | None = None
+    radiometry: S2Radiometry | None = None
+    fingerprint: str | None = None
 
 
 ########################################################################################
@@ -396,6 +427,32 @@ def discover_s2_granules(
     return granules
 
 
+# Callable that lists the granules usable for one AOI unit (``None``: all granules).
+GranuleFinder = Callable[[AOIUnit | None], list[S2Granule]]
+
+
+def local_granule_finder(
+    data_dir: Any,
+    bands: tuple[str, ...],
+    resolution_m: int,
+    *,
+    years: tuple[int, ...] | None,
+    speriod: tuple[int, int],
+    eperiod: tuple[int, int],
+) -> GranuleFinder:
+    """Return a finder that scans a local SAFE archive, filtered to the unit's AOI."""
+
+    def find(unit: AOIUnit | None = None) -> list[S2Granule]:
+        """List local granules, restricted to those intersecting ``unit``."""
+        return discover_s2_granules(
+            data_dir, bands, resolution_m,
+            aoi=None if unit is None else unit.geometry_wgs84,
+            years=years, speriod=speriod, eperiod=eperiod,
+        )
+
+    return find
+
+
 ########################################################################################
 # Lazy scene reads on the canonical grid
 ########################################################################################
@@ -430,7 +487,7 @@ def _correct_dn_values(
 
 
 def _window_dataset(
-    path: Path,
+    path: str | Path,
     grid: GridSpec,
     window: GridWindow,
     *,
@@ -447,7 +504,7 @@ def _window_dataset(
             "Rasterio is required when lazy Sentinel-2 chunks are computed. "
             "Install the processing dependencies."
         ) from error
-    with rasterio.open(path) as source:
+    with pipeline_grid.raster_env([path]), rasterio.open(path) as source:
         source_resolution = abs(float(source.transform.a))
         source_window = native_pixel_window(source, window.bounds, grid.crs)
         if source_window is None:
@@ -568,8 +625,15 @@ def _scene_source(
     nodata: int,
 ) -> S2SceneSource:
     """Read the radiometric metadata shared by every chunk of one granule."""
-    offsets, quantification_value = read_l2a_radiometry(granule.product_metadata)
-    special_values = tuple(read_l2a_special_values(granule.product_metadata).values())
+    if granule.radiometry is not None:
+        offsets = granule.radiometry.offsets
+        special_values = granule.radiometry.special_values
+        quantification_value = granule.radiometry.quantification_value
+    else:
+        offsets, quantification_value = read_l2a_radiometry(granule.product_metadata)
+        special_values = tuple(
+            read_l2a_special_values(granule.product_metadata).values()
+        )
     return S2SceneSource(
         granule,
         bands,
@@ -582,7 +646,9 @@ def _scene_source(
 
 
 def _source_fingerprint(scene: S2SceneSource) -> str:
-    """Return a hash of the path, size, and mtime of every scene input file."""
+    """Return the granule's identity, else a hash of every input file's path, size, mtime."""
+    if scene.granule.fingerprint is not None:
+        return scene.granule.fingerprint
     paths = [
         scene.granule.product_metadata,
         *[scene.granule.band_paths[band] for band in scene.bands],
@@ -712,7 +778,7 @@ def build_lazy_s2_dataset(
 def read_s2_unit(
     unit: AOIUnit,
     *,
-    data_dir: Any,
+    data_dir: Any = None,
     bands: tuple[str, ...],
     resolution_m: int,
     years: tuple[int, ...] | None,
@@ -721,16 +787,22 @@ def read_s2_unit(
     mask_classes: tuple[int, ...],
     nodata: int,
     grid: Any | None = None,
+    find_granules: GranuleFinder | None = None,
 ) -> Any:
-    """Build a lazy Sentinel-2 dataset for one planned polygon AOI unit."""
+    """Build a lazy Sentinel-2 dataset for one planned polygon AOI unit.
+
+    Granules come from ``find_granules`` (supplied by the source's reader) or, when it
+    is omitted, from a scan of the local archive in ``data_dir``.
+    """
 
     grid = grid or unit.grid
     if grid is None:
         raise ValueError("Sentinel-2 raster reads require a polygon AOI unit")
-    granules = discover_s2_granules(
-        data_dir, bands, resolution_m, aoi=unit.geometry_wgs84, years=years,
-        speriod=speriod, eperiod=eperiod,
-    )
+    if find_granules is None:
+        find_granules = local_granule_finder(
+            data_dir, bands, resolution_m, years=years, speriod=speriod, eperiod=eperiod
+        )
+    granules = find_granules(unit)
     if not granules:
         raise RuntimeError(f"Found 0 Sentinel-2 granules for AOI {unit.aoi_id}")
     dataset = build_lazy_s2_dataset(
@@ -777,7 +849,7 @@ def _read_scene_point(
 def sample_s2_points(
     units: tuple[AOIUnit, ...],
     *,
-    data_dir: Any,
+    data_dir: Any = None,
     bands: tuple[str, ...],
     resolution_m: int,
     years: tuple[int, ...] | None,
@@ -790,12 +862,15 @@ def sample_s2_points(
     anchor: tuple[float, float],
     workers: int,
     progress: Callable[[int, int], None] | None = None,
+    find_granules: GranuleFinder | None = None,
 ) -> pd.DataFrame:
     """Discover once and sample all intersecting scene/point pairs in parallel."""
 
-    granules = discover_s2_granules(
-        data_dir, bands, resolution_m, years=years, speriod=speriod, eperiod=eperiod,
-    )
+    if find_granules is None:
+        find_granules = local_granule_finder(
+            data_dir, bands, resolution_m, years=years, speriod=speriod, eperiod=eperiod
+        )
+    granules = find_granules(None)
     work = [
         (granule, unit)
         for granule in granules
@@ -828,9 +903,10 @@ def sample_s2_points(
 
 
 class S2Reader(BaseReader):
-    """Reader adapter for downloaded Sentinel-2 L2A SAFE products."""
+    """Reader adapter for Sentinel-2 L2A: local SAFE archives or remote Earth Search COGs."""
 
-    source_type = SourceType.s2_l2a_local
+    def __init__(self, source_type: SourceType = SourceType.s2_l2a_local) -> None:
+        self.source_type = source_type
 
     def parse_config(self, source_id: str, raw: dict[str, Any], base_dir: Any) -> Any:
         """Parse the source configuration without coupling YAML parsing to readers."""
@@ -842,6 +918,17 @@ class S2Reader(BaseReader):
             resolve_path,
         )
 
+        if self.source_type == SourceType.s2_l2a_remote:
+            only_keys(raw, {"type", "collection"}, f"sources.{source_id}")
+            collection = raw.get("collection", EarthSearchCollection.l2a.value)
+            if collection not in {item.value for item in EarthSearchCollection}:
+                choices = ", ".join(item.value for item in EarthSearchCollection)
+                raise PipelineConfigError(
+                    f"sources.{source_id}.collection must be one of: {choices}"
+                )
+            return S2SourceConfig(
+                source_id, None, SourceType.s2_l2a_remote, str(collection)
+            )
         only_keys(raw, {"type", "data_dir"}, f"sources.{source_id}")
         data_dir = resolve_path(
             required(raw, "data_dir", f"sources.{source_id}"),
@@ -851,6 +938,41 @@ class S2Reader(BaseReader):
         if not data_dir.is_dir():
             raise PipelineConfigError(f"S2 source directory does not exist: {data_dir}")
         return S2SourceConfig(source_id, data_dir)
+
+    def granule_finder(
+        self,
+        source: Any,
+        plan: Any,
+        *,
+        bands: tuple[str, ...],
+        resolution_m: int,
+        years: tuple[int, ...] | None,
+        speriod: tuple[int, int],
+        eperiod: tuple[int, int],
+        logger: logging.Logger | None = None,
+    ) -> GranuleFinder:
+        """Return the function that lists the source's granules for an AOI unit."""
+        if self.source_type == SourceType.s2_l2a_remote:
+            from sentinel_py.pipeline.readers.s2_remote import RemoteGranuleFinder
+
+            return RemoteGranuleFinder(
+                plan, bands=bands, collection=source.collection, years=years,
+                speriod=speriod, eperiod=eperiod, logger=logger,
+            )
+        return local_granule_finder(
+            source.data_dir, bands, resolution_m,
+            years=years, speriod=speriod, eperiod=eperiod,
+        )
+
+    def point_cache_fingerprint(self, source: Any, find_granules: GranuleFinder) -> Any:
+        """Return the source identity folded into point-sample cache keys."""
+        if self.source_type == SourceType.s2_l2a_remote:
+            return find_granules.fingerprint
+        # The state fingerprint covers checkpoint parts as well as the base file.
+        fingerprint = REGISTRY["cdse_downloads"].store(source.data_dir).fingerprint()
+        if fingerprint is None:
+            fingerprint = (str(source.data_dir), source.data_dir.stat().st_mtime_ns)
+        return fingerprint
 
     def read_raster(self, unit: AOIUnit, **kwargs: Any) -> Any:
         """Build one lazy canonical-grid raster read."""

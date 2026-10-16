@@ -297,7 +297,9 @@ def test_s2_point_sampling_reports_node_progress(tmp_path, monkeypatch):
 
     monkeypatch.setattr("sentinel_py.pipeline.readers.s2.sample_s2_points", fake_sample)
     pipeline = SimpleNamespace(
-        sources={"s2": SimpleNamespace(data_dir=tmp_path)},
+        sources={
+            "s2": SimpleNamespace(data_dir=tmp_path, source_type="s2.l2a.local")
+        },
         aoi_plan=SimpleNamespace(units=()),
         output_grid=SimpleNamespace(crs="EPSG:3338", resolution=(20.0, 20.0), anchor=(0.0, 0.0)),
         selection=SimpleNamespace(years=(2024,), start_period=(6, 1), end_period=(8, 31)),

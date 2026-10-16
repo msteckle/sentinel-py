@@ -25,6 +25,7 @@ def test_default_registries_expose_builtin_names():
     assert set(get_default_reader_registry().source_types) == {
         "s1.grd.local",
         "s2.l2a.local",
+        "s2.l2a.remote",
         "dem.local",
         "dem.remote",
     }

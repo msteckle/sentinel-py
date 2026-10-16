@@ -75,9 +75,17 @@ class SourceType(StrEnum):
     """Reader source types accepted by the pipeline ``sources`` section."""
 
     s2_l2a_local = "s2.l2a.local"
+    s2_l2a_remote = "s2.l2a.remote"
     s1_grd_local = "s1.grd.local"
     dem_local = "dem.local"
     dem_remote = "dem.remote"
+
+
+class EarthSearchCollection(StrEnum):
+    """Element84 Earth Search Sentinel-2 L2A collections for ``s2.l2a.remote``."""
+
+    l2a = "sentinel-2-l2a"
+    c1_l2a = "sentinel-2-c1-l2a"
 
 
 # Download and write-result CVs -------------------------------------------------------
@@ -336,6 +344,27 @@ class S2DownloadAssets(str, Enum):
 
 # Canonical uint16 nodata sentinel used by Sentinel-2 preprocessing outputs.
 S2_NODATA = 65535
+
+# Saturated-pixel DN of Level-2A bands. SAFE products declare it in their metadata;
+# the STAC items of ``s2.l2a.remote`` sources do not, so the ESA-specified value is used.
+S2_SATURATED_DN = 65535
+
+# Element84 Earth Search asset keys of the Level-2A cloud-optimized GeoTIFFs.
+S2_BAND_ASSET_KEYS = {
+    "B01": "coastal",
+    "B02": "blue",
+    "B03": "green",
+    "B04": "red",
+    "B05": "rededge1",
+    "B06": "rededge2",
+    "B07": "rededge3",
+    "B08": "nir",
+    "B8A": "nir08",
+    "B09": "nir09",
+    "B11": "swir16",
+    "B12": "swir22",
+    "SCL": "scl",
+}
 
 # ESA band_id values used by BOA_ADD_OFFSET elements in Level-2A metadata.
 S2_BAND_IDS = {

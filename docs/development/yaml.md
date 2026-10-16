@@ -80,6 +80,12 @@ Then, users should create a classmethod that, given a raw mapping (typically par
         return cls(aoi=aoi, years=years, start_period=start, end_period=end)
 ```
 
+## Sentinel-2 and ArcticDEM sources: local and remote
+
+A `sources` entry of type `s2.l2a.local` points at a directory of downloaded Sentinel-2 L2A SAFE products (key `data_dir`, required). A `dem.local` entry points at a directory of ArcticDEM GeoTIFFs (`data_dir` required, `pattern` default `*.tif`). The `.remote` types read the same data in place over HTTPS, so nothing is downloaded and the compute nodes need internet access. `dem.remote` takes no keys besides `type` and reads the public PGC ArcticDEM v4.1 10 m tiles. The `s2.l2a.remote` source's only key is `collection`, either `sentinel-2-l2a` (default) or `sentinel-2-c1-l2a` (the consistently reprocessed Collection 1 archive), and it reads the Element84 Earth Search cloud-optimized GeoTIFFs in the public `sentinel-cogs` bucket. Scenes and tiles for all AOIs are found with a few STAC searches and cached, so reruns do not search again. Processors accept either type: `s2.preprocess` and `dem` need no change in the YAML beyond the source `type`. `snap_gpt` still requires `s1.grd.local` and `dem.local` because SNAP reads files from disk.
+
+Remote reads hold the raster lock, so each worker process makes one network read at a time and the number of concurrent connections equals `execution.workers`. No request limit is published for Earth Search, `sentinel-cogs` or the PGC bucket; GDAL retries throttled responses with a growing delay. Remote scenes carry the offset, scale and nodata of the STAC item; the saturated DN is taken as 65535, the value ESA specifies for L2A.
+
 ## Sentinel-1 sources and the `snap_gpt` node
 
 A `sources` entry of type `s1.grd.local` points at a directory of ASF Sentinel-1 GRD ZIP files. Its keys are `data_dir` (required), `flight_direction` (`BOTH`, `ASCENDING`, `DESCENDING`, or `PREDOMINANT`, default `BOTH`), and `orbit` (`precise`, `restituted`, or `precise-or-restituted`, the acceptable staged orbit-file types). The scene catalog is built from each archive's `manifest.safe` and cached beside the data. The `snap_gpt` node and its keys are documented in `docs/development/processors.md`.

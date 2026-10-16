@@ -139,7 +139,8 @@ def get_default_reader_registry() -> ReaderRegistry:
 
         registry = ReaderRegistry()
         registry.register(S1Reader())
-        registry.register(S2Reader())
+        registry.register(S2Reader(SourceType.s2_l2a_local))
+        registry.register(S2Reader(SourceType.s2_l2a_remote))
         registry.register(ArcticDEMReader(SourceType.dem_local))
         registry.register(ArcticDEMReader(SourceType.dem_remote))
         _DEFAULT_READERS = registry

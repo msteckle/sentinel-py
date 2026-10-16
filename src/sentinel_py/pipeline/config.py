@@ -597,21 +597,24 @@ class OutputGridConfig:
 @dataclass(frozen=True)
 class S2SourceConfig:
     """
-    Data class representing a local Sentinel-2 Level-2A source.
+    Data class representing a Sentinel-2 Level-2A source, local or remote.
 
     Arguments
     ---------
     source_id : str
         Identifier for the source.
-    data_dir : Path
-        Directory containing the source data.
+    data_dir : Path or None
+        Directory containing the source data; ``None`` for ``s2.l2a.remote``.
     source_type : str, optional
         Type of the source (default is ``SourceType.s2_l2a_local``).
+    collection : str or None, optional
+        Earth Search collection of an ``s2.l2a.remote`` source.
     """
 
     source_id: str
-    data_dir: Path
+    data_dir: Path | None
     source_type: str = SourceType.s2_l2a_local
+    collection: str | None = None
 
 
 @dataclass(frozen=True)

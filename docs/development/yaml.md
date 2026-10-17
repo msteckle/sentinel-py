@@ -90,6 +90,10 @@ Remote reads hold the raster lock, so each worker process makes one network read
 
 A `sources` entry of type `s1.grd.local` points at a directory of ASF Sentinel-1 GRD ZIP files. Its keys are `data_dir` (required), `flight_direction` (`BOTH`, `ASCENDING`, `DESCENDING`, or `PREDOMINANT`, default `BOTH`), and `orbit` (`precise`, `restituted`, or `precise-or-restituted`, the acceptable staged orbit-file types). The scene catalog is built from each archive's `manifest.safe` and cached beside the data. The `snap_gpt` node and its keys are documented in `docs/development/processors.md`.
 
+## Joined outputs and VRTs
+
+A `join` node (see `docs/development/processors.md`) lets one output hold several nodes: with point AOIs a single Parquet table, with polygon AOIs a single COG set whose tiles carry the bands of every input. An output fed by a `join` cannot set `encoding`, because the bands have different units. Every `format: cog` output also gets VRT mosaics beside the tiles: `<variable>.vrt` for each AOI unit and one `OUTPUT/PRODUCT_ID/GRANULE_ID/<variable>.vrt` per time bin and variable covering all AOI units, which opens in QGIS as one layer. No YAML key controls them.
+
 ## Output encoding
 
 An `outputs` entry with `format: cog` may set `encoding` to pack floating-point variables as integers: `dtype` (`int16` or `uint16`, required), `scale` (positive number, required), and `offset` (number, default `0`). The stored integer represents `value = stored * scale + offset`, and the scale and offset are written to each band's GDAL tags. NaN is stored as `-32768` (`int16`) or `65535` (`uint16`). Integer variables are unaffected, and `encoding` is rejected for other formats. Changing `encoding` rewrites existing tiles on the next run.

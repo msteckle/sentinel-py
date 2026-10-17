@@ -194,8 +194,15 @@ def test_remote_boxes_example_pipeline_validates(tmp_path) -> None:
     config = PipelineConfig.from_file(tmp_path / "examples" / example.name)
 
     assert config.aoi_plan.kind == "polygon"
-    assert set(config.outputs) == {"composited", "terrain", "s1_backscatter_db"}
-    assert {output.format for output in config.outputs.values()} == {"cog"}
+    # One joined output, as for points: no per-node outputs and no packing.
+    assert set(config.outputs) == {"samples"}
+    output = config.outputs["samples"]
+    assert output.node == "samples" and output.format == "cog" and output.encoding is None
+    assert config.nodes[-1].inputs == {
+        "base": "indices",
+        "terrain": "terrain",
+        "radar": "s1-db",
+    }
 
 
 ########################################################################################

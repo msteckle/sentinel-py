@@ -142,7 +142,10 @@ Building this Dataset performs SAFE discovery and reads XML metadata, but raster
 remains deferred until an output writer requests Dask computation. The example's
 `format: cog` writer creates compressed, internally tiled COGs for each scene,
 variable, and canonical spatial chunk. It writes files atomically and records
-resumable state under the output directory. Use `format: xarray` only when the caller
+resumable state under the output directory. It also writes small VRT files that stitch each
+AOI's tiles, and one mosaic over all AOIs, so QGIS opens the output as one layer. A
+`join` node can combine several nodes (for example S2 indices, terrain, and S1
+backscatter) into one output for point and polygon AOIs. Use `format: xarray` only when the caller
 needs the lazy in-memory artifact without materialization.
 
 All requested outputs are combined into one Dask computation so they reuse common

@@ -92,18 +92,18 @@ nodes:
     hillshade_azimuth: 315
     hillshade_altitude: 45
 
-# Polygon AOIs write one COG set per node (the `join` node combines point samples only).
+  # One multi-band cube per box: the first input is the base (it sets the time bins);
+  # the static terrain bands are repeated on every bin and the Sentinel-1 bands match
+  # the same summer bin. Band names must be unique across the inputs.
+  - id: samples
+    type: join
+    inputs: {base: indices, terrain: terrain, radar: s1-db}
+
+# One output, like the point example: the tiles of each box, plus VRTs that stitch them
+# (open OUTPUT/PRODUCT_ID/GRANULE_ID/reflectance.vrt in QGIS to see every box as one
+# layer). A joined cube mixes units, so it is stored as float32 with no `encoding`.
 outputs:
-  composited:
-    from: indices
-    path: ../data/processed/pavc_random_sample_boxes_remote/s2
+  samples:
+    from: samples
+    path: ../data/processed/pavc_random_sample_boxes_remote
     format: cog
-  terrain:
-    from: terrain
-    path: ../data/processed/pavc_random_sample_boxes_remote/arcticdem
-    format: cog
-  s1_backscatter_db:
-    from: s1-db
-    path: ../data/processed/pavc_random_sample_boxes_remote/s1
-    format: cog
-    encoding: {dtype: int16, scale: 0.01}  # 0.01 dB steps; about half the size of float32

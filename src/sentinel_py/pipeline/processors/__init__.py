@@ -16,6 +16,9 @@ from sentinel_py.pipeline.processors.s2_preprocess import S2PreprocessProcessor
 from sentinel_py.pipeline.processors.db import ToDBProcessor
 from sentinel_py.pipeline.processors.dem import DEMProcessor
 from sentinel_py.pipeline.processors.join import JoinProcessor
+from sentinel_py.pipeline.processors.pavc_gridded_rf.modeling import (
+    PavcGriddedRFProcessor,
+)
 from sentinel_py.pipeline.processors.snap_gpt import SnapGPTProcessor
 
 
@@ -28,9 +31,11 @@ def register_builtin_processors(registry: ProcessorRegistry) -> None:
     registry.register(SnapGPTProcessor())
     registry.register(ToDBProcessor())
     registry.register(JoinProcessor())
+    registry.register(PavcGriddedRFProcessor())
 
 
 __all__ = [
+    "PavcGriddedRFProcessor",
     "Processor",
     "ProcessorRegistry",
     "S2PreprocessProcessor",

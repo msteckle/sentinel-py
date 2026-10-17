@@ -173,11 +173,20 @@ def test_processor_is_registered() -> None:
         ({"n_estimators": 0}, "n_estimators"),
         ({"sample_radius_m": -1.0}, "sample_radius_m"),
         ({"cook": True}, "cook"),
+        ({"training": None}, "give training to fit them"),
+        ({"models": "m", "n_estimators": 5}, "fit keys are not allowed: .*n_estimators"),
+        ({"models": "m", "training": "t.csv"}, "not allowed: .*training"),
     ],
 )
 def test_config_rejections(overrides: dict[str, Any], message: str) -> None:
     with pytest.raises(ValidationError, match=message):
         _config(**overrides)
+
+
+def test_predict_config_needs_only_models() -> None:
+    config = PavcGriddedRFNodeConfig.model_validate({"models": "m"})
+    assert config.models == "m" and config.pfts is None
+    PavcGriddedRFNodeConfig.model_validate({"models": "m", "pfts": ["water"]})
 
 
 def test_config_accepts_yaml_style_numbers() -> None:
@@ -248,6 +257,7 @@ def test_fit_and_predict_returns_rounded_uint8_cover(tmp_path: Path) -> None:
     assert len(manifest) == 1
     assert {path.name for path in manifest[0].parent.iterdir()} == {
         "manifest.json",
+        "training_features.parquet",
         "graminoid.joblib",
         "water.joblib",
     }
@@ -329,6 +339,103 @@ def test_cover_cube_is_written_as_uint8_cog_tiles(tmp_path: Path) -> None:
         assert dataset.nodata == 255
         assert dataset.descriptions == ("graminoid", "water")
         assert dataset.read(1)[0, 0] == 255
+
+
+def _predict_config(tmp_path: Path, **overrides: Any) -> PavcGriddedRFNodeConfig:
+    """Predict-mode configuration pointing at the one fitted model directory."""
+    (fitted,) = (tmp_path / "models").iterdir()
+    values: dict[str, Any] = {"models": f"models/{fitted.name}", **overrides}
+    return PavcGriddedRFNodeConfig.model_validate(values)
+
+
+def test_predict_mode_reuses_saved_models_without_training_files(
+    tmp_path: Path, synchronous_sampling: list[int]
+) -> None:
+    _write_tables(tmp_path)
+    processor = PavcGriddedRFProcessor()
+    fitted = processor.execute(_config(), {"f": _artifact()}, _context(tmp_path))
+    for name in ("training.csv", "cover.csv"):
+        (tmp_path / name).unlink()
+    key = ("site-6", "part-0000")
+
+    predicted = processor.execute(
+        _predict_config(tmp_path), {"f": _artifact()}, _context(tmp_path)
+    )
+
+    assert synchronous_sampling == [BOXES]  # no sampling for the prediction run
+    assert predicted.datasets[key].band.values.tolist() == ["graminoid", "water"]
+    assert np.array_equal(
+        predicted.datasets[key]["cover"].values, fitted.datasets[key]["cover"].values
+    )
+    assert (
+        predicted.datasets[key].attrs["recipe_id"]
+        != fitted.datasets[key].attrs["recipe_id"]
+    )
+
+
+def test_predict_mode_can_select_a_subset_of_pfts(tmp_path: Path) -> None:
+    _write_tables(tmp_path)
+    processor = PavcGriddedRFProcessor()
+    processor.execute(_config(), {"f": _artifact()}, _context(tmp_path))
+
+    result = processor.execute(
+        _predict_config(tmp_path, pfts=["water"]), {"f": _artifact()}, _context(tmp_path)
+    )
+
+    cube = result.datasets[("site-1", "part-0000")]
+    assert cube.band.values.tolist() == ["water"]
+    assert cube["cover"].values.shape == (1, 1, SIZE, SIZE)
+
+
+def test_predict_recipe_id_follows_model_file_content(tmp_path: Path) -> None:
+    _write_tables(tmp_path)
+    processor = PavcGriddedRFProcessor()
+    processor.execute(_config(), {"f": _artifact()}, _context(tmp_path))
+    key = ("site-0", "part-0000")
+
+    def recipe() -> str:
+        """Recipe ID of a prediction with the current model files."""
+        result = processor.execute(
+            _predict_config(tmp_path), {"f": _artifact()}, _context(tmp_path)
+        )
+        return result.datasets[key].attrs["recipe_id"]
+
+    before = recipe()
+    assert recipe() == before
+    (fitted,) = (tmp_path / "models").iterdir()
+    with (fitted / "water.joblib").open("ab") as handle:
+        handle.write(b"x")
+    assert recipe() != before
+
+
+def test_predict_mode_failures(tmp_path: Path) -> None:
+    _write_tables(tmp_path)
+    processor = PavcGriddedRFProcessor()
+    context = _context(tmp_path)
+
+    with pytest.raises(ValueError, match="models directory has no manifest.json"):
+        processor.execute(
+            PavcGriddedRFNodeConfig.model_validate({"models": "nowhere"}),
+            {"f": _artifact()},
+            context,
+        )
+
+    processor.execute(_config(), {"f": _artifact()}, context)
+    with pytest.raises(ValueError, match="do not include: forb; available: graminoid, water"):
+        processor.execute(
+            _predict_config(tmp_path, pfts=["forb"]), {"f": _artifact()}, context
+        )
+
+    renamed = _artifact()
+    for key, dataset in renamed.datasets.items():
+        renamed.datasets[key] = dataset.assign_coords(band=["b0", "b1", "other"])
+    with pytest.raises(ValueError, match="first differ at position 2"):
+        processor.execute(_predict_config(tmp_path), {"f": renamed}, context)
+
+    (fitted,) = (tmp_path / "models").iterdir()
+    (fitted / "graminoid.joblib").unlink()
+    with pytest.raises(ValueError, match="model file\\(s\\) missing"):
+        processor.execute(_predict_config(tmp_path), {"f": _artifact()}, context)
 
 
 ########################################################################################

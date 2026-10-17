@@ -1,0 +1,118 @@
+version: 1
+
+execution:
+  method: local
+  workers: 2
+  threads_per_worker: 2
+
+selection:
+  aoi: ../data/aois/pavc_random_sample_boxes.geojson
+  aoi_id_field: site_visit_id
+  years: [2023, 2024]
+  speriod: "06-01"
+  eperiod: "08-31"
+
+output_grid:
+  crs: EPSG:3338
+  resolution: 20
+  extent: aoi
+  anchor: [0, 0]
+  chunks: {y: 1024, x: 1024}
+
+sources:
+  s2:
+    type: s2.l2a.local
+    data_dir: ../data/s2/raw
+  s1:
+    type: s1.grd.local
+    data_dir: ../data/s1/raw
+    flight_direction: PREDOMINANT  # don't mix ascending and descending scenes
+    orbit: precise-or-restituted
+  arcticdem:
+    type: dem.local
+    data_dir: ../data/arcticdem/10m
+    pattern: "*.tif"
+
+nodes:
+  # Sentinel-2
+  - id: preprocess
+    type: s2.preprocess
+    source: s2
+    bands: [B02, B03, B04, B05, B06, B07, B08, B8A, B11, B12]
+    mask_classes: [0, 1, 3, 8, 9, 10, 11]
+    nodata: 65535
+  - id: all-composite
+    type: composite
+    inputs: {data: preprocess}
+    period: all
+    aggregation: median
+  - id: indices
+    type: s2.index
+    inputs: {data: all-composite}
+    indices: [NDGI, NDWI1, NDWI2, MSAVI, VARI, RVI, OSAVI, TGI, GLI, NGRDI, CIG, GNDVI, CVI, MTVI2, TCARI, TCI, NARI, TCAPB, TCAPG, TCAPW]
+  # Sentinel-1
+  - id: s1-preprocess
+    type: snap_gpt
+    source: s1
+    dem: arcticdem
+    polarizations: [VV, VH]
+    subset: aoi
+    dem_vertical_datum: ellipsoid  # ArcticDEM heights are ellipsoidal
+    memory_gb: 16
+    threads: 4
+  - id: s1-composite
+    type: composite
+    inputs: {data: s1-preprocess}
+    period: all
+    aggregation: median
+    empty_bins: fill  # sites without Sentinel-1 scenes get nodata, not an error
+  - id: s1-db
+    type: to_db
+    inputs: {data: s1-composite}
+  # ArcticDEM
+  - id: terrain
+    type: dem
+    source: arcticdem
+    features: [elevation, aspect, slope, hillshade]
+    algorithm: Horn
+    hillshade_azimuth: 315
+    hillshade_altitude: 45
+
+  # One multi-band cube per box (the first input sets the time bins)
+  - id: samples
+    type: join
+    inputs: {base: indices, terrain: terrain, radar: s1-db}
+
+  # Fit step of the two-pipeline workflow: train on local data here, then predict the
+  # watersheds with pavc_gridded_rf_watersheds_remote_prediction.yaml, which must use
+  # the same S2, terrain and S1 nodes. Per-PFT random forests: the node samples the
+  # joined cube at each field plot that
+  # lies in a box (aoi_id == site_visit_id), fits one forest per PFT, saves the models
+  # under model_dir/<recipe id>/ (a rerun with the same recipe reuses them), and
+  # returns a uint8 cube, one band per PFT: percent cover 0-100, nodata 255.
+  # `training` selects the plots and gives their coordinates; cover values and
+  # qa_review_flag come from `pft_table`. Plots outside every box are skipped, so
+  # the full tables can stay in place while only a few boxes are processed.
+  - id: pft-cover
+    type: pavc_gridded_rf
+    inputs: {features: samples}
+    training: ../../pavc/data/misc_data/upscaling_pavc_subsets/pavc2_1972-2024_filtered-lt500m-mostrecent_tier03_2026-10-05.csv
+    pft_table: ../../pavc/data/releases/v2_0/tier_03_cover_v2_0.csv
+    model_dir: ../data/models/pavc_gridded_rf
+    pfts: [evergreen_shrub, deciduous_shrub, graminoid, forb, bryophyte, lichen, litter, bareground, water]
+    n_estimators: 100
+    max_depth: 10
+    max_features: 10
+    seed: 42
+    sample_radius_m: 30      # median of the pixels within 30 m of the plot (0 = one pixel)
+    drop_qa_flagged: true    # drop plots with qa_review_flag == yes
+    missing_cover: zero      # -9999 (not recorded) counts as 0; `drop` removes the plot from that PFT
+    n_jobs: 1
+
+# The pipeline needs one output; the cover maps of the training boxes are a useful
+# sanity check on the fitted models (the models themselves are saved under model_dir).
+outputs:
+  pft-cover:
+    from: pft-cover
+    path: ../data/processed/pavc_gridded_rf_boxes_local
+    format: cog

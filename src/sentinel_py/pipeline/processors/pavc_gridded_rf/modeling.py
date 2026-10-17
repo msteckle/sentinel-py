@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from sentinel_py.cache import deterministic_cache_key
 from sentinel_py.enums import AOIKind, MissingCoverPolicy, PFTClass
@@ -31,12 +31,14 @@ from sentinel_py.pipeline.processors.base import (
 )
 from sentinel_py.pipeline.processors.pavc_gridded_rf.training import (
     DEFAULT_ID_COLUMN,
+    MANIFEST_NAME,
     ForestParams,
     file_digest,
     fit_pft_models,
     load_manifest,
     load_pft_training,
     model_path,
+    read_manifest,
     sample_features,
 )
 
@@ -56,15 +58,19 @@ _COPIED_ATTRS = ("crs", "transform", "bounds", "time_representation")
 class PavcGriddedRFNodeConfig(BaseModel):
     """YAML configuration of one ``pavc_gridded_rf`` node.
 
-    Relative paths resolve against the directory of the pipeline file.
+    The node either fits models (``training``, ``pft_table``, ``model_dir`` and
+    ``pfts``, plus optional hyperparameters) or predicts with models fitted by an
+    earlier run (``models``, optionally ``pfts``); the two key sets cannot be
+    mixed. Relative paths resolve against the directory of the pipeline file.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    training: str = Field(min_length=1)
-    pft_table: str = Field(min_length=1)
-    model_dir: str = Field(min_length=1)
-    pfts: tuple[str, ...]
+    models: str | None = Field(None, min_length=1)
+    training: str | None = Field(None, min_length=1)
+    pft_table: str | None = Field(None, min_length=1)
+    model_dir: str | None = Field(None, min_length=1)
+    pfts: tuple[str, ...] | None = None
     id_column: str = DEFAULT_ID_COLUMN
     n_estimators: int = Field(100, ge=1)
     max_depth: int | None = Field(10, ge=1)
@@ -79,6 +85,8 @@ class PavcGriddedRFNodeConfig(BaseModel):
     @classmethod
     def _pfts(cls, value: Any) -> Any:
         """Accept a YAML list of known PFT names without repeats."""
+        if value is None:
+            return None
         if not isinstance(value, (list, tuple)) or not value:
             raise ValueError("pfts must be a non-empty list of PFT names")
         known = {member.value for member in PFTClass}
@@ -91,6 +99,30 @@ class PavcGriddedRFNodeConfig(BaseModel):
         if len(set(value)) != len(value):
             raise ValueError("pfts must not repeat a PFT")
         return tuple(value)
+
+    @model_validator(mode="after")
+    def _one_mode(self) -> PavcGriddedRFNodeConfig:
+        """Require either the fit keys or ``models``, never a mix."""
+        if self.models is None:
+            missing = [
+                key
+                for key in ("training", "pft_table", "model_dir", "pfts")
+                if getattr(self, key) is None
+            ]
+            if missing:
+                raise ValueError(
+                    "set 'models' to predict with saved models, or give "
+                    + ", ".join(missing)
+                    + " to fit them"
+                )
+            return self
+        fit_only = sorted(self.model_fields_set - {"models", "pfts"})
+        if fit_only:
+            raise ValueError(
+                "'models' predicts with saved models, so these fit keys are not "
+                "allowed: " + ", ".join(fit_only)
+            )
+        return self
 
 
 ########################################################################################
@@ -154,7 +186,7 @@ def _predict_block(block: np.ndarray, *, model_paths: tuple[str, ...]) -> np.nda
 def _predict_dataset(
     source: Any,
     variable: str,
-    config: PavcGriddedRFNodeConfig,
+    pfts: tuple[str, ...],
     *,
     model_paths: tuple[str, ...],
     recipe_id: str,
@@ -167,10 +199,10 @@ def _predict_dataset(
         Joined feature cube of the unit.
     variable
         Banded feature variable of ``source``.
-    config
-        Node configuration (supplies the PFT band names).
+    pfts
+        PFT names, used as the output band names.
     model_paths
-        Saved models in ``config.pfts`` order.
+        Saved models in ``pfts`` order.
     recipe_id
         Recipe identifier stamped on the output.
 
@@ -192,7 +224,7 @@ def _predict_dataset(
         meta=np.empty((0, 0, 0), dtype=np.uint8),
     )
     coords = {name: source.coords[name] for name in _COPIED_COORDS}
-    coords["band"] = list(config.pfts)
+    coords["band"] = list(pfts)
     dataset = xr.Dataset(
         {OUTPUT_VARIABLE: (("time", "band", "y", "x"), predicted[None, ...])},
         coords=coords,
@@ -260,38 +292,45 @@ class PavcGriddedRFProcessor(BaseProcessor):
         features = self._feature_names(datasets, variable)
 
         base = Path(context.pipeline.path).parent
-        training_csv = self._existing_file(base, config.training, "training")
-        pft_csv = self._existing_file(base, config.pft_table, "pft_table")
-        recipe_id = self._recipe_id(
-            config, datasets, features, file_digest(training_csv), file_digest(pft_csv)
-        )
-        model_dir = (base / config.model_dir).resolve() / recipe_id
-
-        manifest = load_manifest(model_dir, config.pfts)
-        if manifest is not None and manifest["features"] == features:
-            logger.info("Reusing PFT models %s (recipe %s).", model_dir, recipe_id)
-        else:
-            tables = load_pft_training(
-                training_csv,
-                pft_csv,
-                pfts=config.pfts,
-                id_column=config.id_column,
-                drop_qa_flagged=config.drop_qa_flagged,
-                missing_cover=MissingCoverPolicy(config.missing_cover),
-                logger=logger,
+        if config.models is not None:
+            pfts, model_dir, recipe_id = self._saved_models(
+                config, base, datasets, features
             )
-            self._fit(config, tables, datasets, variable, model_dir, context)
+            logger.info("Predicting with saved PFT models %s.", model_dir)
+        else:
+            pfts = config.pfts
+            training_csv = self._existing_file(base, config.training, "training")
+            pft_csv = self._existing_file(base, config.pft_table, "pft_table")
+            recipe_id = self._recipe_id(
+                config, datasets, features,
+                file_digest(training_csv), file_digest(pft_csv),
+            )
+            model_dir = (base / config.model_dir).resolve() / recipe_id
+            manifest = load_manifest(model_dir, pfts)
+            if manifest is not None and manifest["features"] == features:
+                logger.info("Reusing PFT models %s (recipe %s).", model_dir, recipe_id)
+            else:
+                tables = load_pft_training(
+                    training_csv,
+                    pft_csv,
+                    pfts=pfts,
+                    id_column=config.id_column,
+                    drop_qa_flagged=config.drop_qa_flagged,
+                    missing_cover=MissingCoverPolicy(config.missing_cover),
+                    logger=logger,
+                )
+                self._fit(config, tables, datasets, variable, model_dir, context)
 
-        model_paths = tuple(str(model_path(model_dir, pft)) for pft in config.pfts)
+        model_paths = tuple(str(model_path(model_dir, pft)) for pft in pfts)
         logger.info(
             "PFT cover node=%s recipe=%s pfts=%s AOI units=%d",
-            context.node.node_id, recipe_id, ",".join(config.pfts), len(datasets),
+            context.node.node_id, recipe_id, ",".join(pfts), len(datasets),
         )
         return RasterArtifact(
             source.plan,
             {
                 key: _predict_dataset(
-                    dataset, variable, config,
+                    dataset, variable, pfts,
                     model_paths=model_paths, recipe_id=recipe_id,
                 )
                 for key, dataset in datasets.items()
@@ -331,6 +370,92 @@ class PavcGriddedRFProcessor(BaseProcessor):
             raise ValueError(f"{self.type_name} input has no AOI units")
         return names
 
+    def _saved_models(
+        self,
+        config: PavcGriddedRFNodeConfig,
+        base: Path,
+        datasets: Mapping[Any, Any],
+        features: list[str],
+    ) -> tuple[tuple[str, ...], Path, str]:
+        """Locate saved models and check they were fitted on these feature bands.
+
+        Parameters
+        ----------
+        config
+            Node configuration in predict mode.
+        base
+            Directory of the pipeline file.
+        datasets
+            Input cubes, used for the recipe identifier.
+        features
+            Feature band names of the input cubes.
+
+        Returns
+        -------
+        tuple
+            The PFTs to predict, the model directory, and the recipe identifier,
+            which covers the content of the model files.
+
+        Raises
+        ------
+        ValueError
+            If the directory has no complete manifest, a requested PFT has no model,
+            or the feature bands differ from those the models were fitted on.
+        """
+        model_dir = (base / Path(config.models).expanduser()).resolve()
+        manifest = read_manifest(model_dir)
+        if manifest is None:
+            raise ValueError(
+                f"pavc_gridded_rf models directory has no {MANIFEST_NAME}: {model_dir}"
+            )
+        pfts = config.pfts or tuple(manifest["pfts"])
+        absent = [pft for pft in pfts if pft not in manifest["pfts"]]
+        if absent:
+            raise ValueError(
+                f"saved models in {model_dir} do not include: {', '.join(absent)}; "
+                f"available: {', '.join(manifest['pfts'])}"
+            )
+        if load_manifest(model_dir, pfts) is None:
+            raise ValueError(f"model file(s) missing in {model_dir}")
+        if manifest["features"] != features:
+            fitted, given = manifest["features"], features
+            first = next(
+                (i for i, (a, b) in enumerate(zip(fitted, given)) if a != b),
+                min(len(fitted), len(given)),
+            )
+            raise ValueError(
+                f"input has {len(given)} feature bands but the saved models were "
+                f"fitted on {len(fitted)}; they first differ at position {first} "
+                f"(models: {fitted[first:first + 1] or 'end'}, "
+                f"input: {given[first:first + 1] or 'end'})"
+            )
+        recipe_id = make_recipe_id(
+            self.type_name,
+            self.version,
+            mode="predict",
+            **self._input_identity(datasets),
+            features=features,
+            models={
+                pft: file_digest(model_path(model_dir, pft)) for pft in pfts
+            },
+        )
+        return tuple(pfts), model_dir, recipe_id
+
+    @staticmethod
+    def _input_identity(datasets: Mapping[Any, Any]) -> dict[str, Any]:
+        """Return recipe parameters identifying the upstream recipes and scenes."""
+        return {
+            "source_recipes": sorted(
+                {str(dataset.attrs.get("recipe_id")) for dataset in datasets.values()}
+            ),
+            "source_fingerprints": deterministic_cache_key(
+                sorted(
+                    [key[0], key[1], [str(v) for v in dataset.source_fingerprint.values]]
+                    for key, dataset in datasets.items()
+                )
+            ),
+        }
+
     @staticmethod
     def _existing_file(base: Path, value: str, label: str) -> Path:
         """Resolve a configured path against ``base`` and require that it exists."""
@@ -357,15 +482,7 @@ class PavcGriddedRFProcessor(BaseProcessor):
         return make_recipe_id(
             self.type_name,
             self.version,
-            source_recipes=sorted(
-                {str(dataset.attrs.get("recipe_id")) for dataset in datasets.values()}
-            ),
-            source_fingerprints=deterministic_cache_key(
-                sorted(
-                    [key[0], key[1], [str(v) for v in dataset.source_fingerprint.values]]
-                    for key, dataset in datasets.items()
-                )
-            ),
+            **self._input_identity(datasets),
             features=features,
             training=training_digest,
             pft_table=pft_table_digest,
@@ -373,7 +490,7 @@ class PavcGriddedRFProcessor(BaseProcessor):
             **{
                 key: value
                 for key, value in config.model_dump().items()
-                if key not in {"training", "pft_table", "model_dir", "n_jobs"}
+                if key not in {"models", "training", "pft_table", "model_dir", "n_jobs"}
             },
         )
 

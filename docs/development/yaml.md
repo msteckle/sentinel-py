@@ -96,7 +96,7 @@ A `join` node (see `docs/development/processors.md`) lets one output hold severa
 
 ## Cover model nodes and outputs
 
-A `pavc_gridded_rf` node (see `docs/development/processors.md`) reads its training CSVs and writes its fitted models next to the pipeline, using paths relative to the YAML file. Its output is an unpacked `uint8` cube, so a `cog` output fed by it must not set `encoding`, and a `parquet` output is rejected as for any polygon AOI.
+A `pavc_gridded_rf` node (see `docs/development/processors.md`) either fits models (`training`, `pft_table`, `model_dir`, `pfts`) or predicts with models fitted earlier (`models`), never both; paths are relative to the YAML file. Its output is an unpacked `uint8` cube, so a `cog` output fed by it must not set `encoding`, and a `parquet` output is rejected as for any polygon AOI.
 
 ## Output encoding
 

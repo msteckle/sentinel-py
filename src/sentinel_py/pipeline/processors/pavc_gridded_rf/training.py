@@ -23,7 +23,7 @@ import pandas as pd
 from affine import Affine
 from pyproj import CRS, Transformer
 
-from sentinel_py.cache import write_json_atomic
+from sentinel_py.cache import write_json_atomic, write_parquet_atomic
 from sentinel_py.enums import PFT_COVER_NODATA, MissingCoverPolicy
 
 DEFAULT_ID_COLUMN = "site_visit_id"
@@ -33,6 +33,7 @@ LATITUDE_COLUMN = "latitude"
 LONGITUDE_COLUMN = "longitude"
 MIN_TRAINING_ROWS = 2
 MANIFEST_NAME = "manifest.json"
+FEATURES_NAME = "training_features.parquet"
 MODEL_SUFFIX = ".joblib"
 TOP_FEATURES = 5
 
@@ -375,6 +376,12 @@ def model_path(model_dir: Path, pft: str) -> Path:
     return model_dir / f"{pft}{MODEL_SUFFIX}"
 
 
+def read_manifest(model_dir: Path) -> dict[str, Any] | None:
+    """Return the manifest saved in ``model_dir``, or ``None`` if there is none."""
+    manifest = model_dir / MANIFEST_NAME
+    return json.loads(manifest.read_text()) if manifest.is_file() else None
+
+
 def load_manifest(model_dir: Path, pfts: Sequence[str]) -> dict[str, Any] | None:
     """Return the manifest of a complete model directory, or ``None``.
 
@@ -391,12 +398,9 @@ def load_manifest(model_dir: Path, pfts: Sequence[str]) -> dict[str, Any] | None
         The saved manifest (features and per-PFT fit summaries) when the manifest
         and every requested model file exist, otherwise ``None``.
     """
-    manifest = model_dir / MANIFEST_NAME
-    if not manifest.is_file() or not all(
-        model_path(model_dir, pft).is_file() for pft in pfts
-    ):
+    if not all(model_path(model_dir, pft).is_file() for pft in pfts):
         return None
-    return json.loads(manifest.read_text())
+    return read_manifest(model_dir)
 
 
 def fit_pft_models(
@@ -411,7 +415,9 @@ def fit_pft_models(
 
     Plots whose feature vector has any non-finite value are left out, as the
     original workflow dropped plots with missing satellite features. The manifest is
-    written last, so an interrupted fit is never mistaken for a complete one.
+    written last, so an interrupted fit is never mistaken for a complete one. The
+    sampled feature table is saved beside the models so the plots' features can be
+    inspected or reused without resampling.
 
     Parameters
     ----------
@@ -505,6 +511,7 @@ def fit_pft_models(
             "n/a" if summary[pft]["oob_r2"] is None else f"{oob:.3f}",
             ", ".join(summary[pft]["top_features"]),
         )
+    write_parquet_atomic(features, model_dir / FEATURES_NAME)
     manifest = {"features": names, "pfts": list(tables), "models": summary}
     write_json_atomic(model_dir / MANIFEST_NAME, manifest)
     return manifest

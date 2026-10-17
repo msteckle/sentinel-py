@@ -215,9 +215,11 @@ A ``dem.local`` source reads tiles from ``data_dir``. A ``dem.remote`` source (`
 
 New DEM-derived bands can be added by defining and registering a ``DEMFeature`` subclass in ``sentinel_py.pipeline.processors.dem``. The processor validates feature names from the shared registry and assembles the selected bands without changing YAML dispatch. DEM raster reads run under the process-wide raster lock, like every other native GDAL call. Changing a feature's output requires bumping ``PROCESSOR_VERSION`` in ``dem.py``.
 
-## Joining point samples
+## Joining nodes
 
-The built-in ``join`` processor merges the point rows of several nodes into one wide table, so a point pipeline can write a single Parquet file holding, for example, spectral indices, terrain, and backscatter. It takes two or more ``inputs`` and no other keys. The first input is the base: its rows, order, and identity and provenance columns are kept. The value columns of the other inputs are added by a left join. An input whose rows are all ``static`` (such as ``dem`` terrain) is matched on the point (``aoi_id`` and ``component_id``) and repeated on every base row; any other input is matched on the point and its ``time`` label, so seasonal composite bins of different sources line up, and a point with no matching row gets missing values. An input with several rows per join key (for example uncomposited scenes) and a value column name that already exists are errors, so aggregate with ``composite`` first. ``join`` only supports point AOIs; with polygon AOIs each node keeps its own raster output.
+The built-in ``join`` processor merges the outputs of several nodes into one table or cube, so a pipeline can write a single output holding, for example, spectral indices, terrain, and backscatter. It takes two or more ``inputs`` and no other keys. The first input is the base: its identity and provenance and every one of its rows or time steps are kept, so list the input that varies in time (the composite) first. An input that is ``static`` (such as ``dem`` terrain) is matched on the point or pixel only and repeated for every base time; any other input is matched on the time label too, so seasonal bins of different sources line up, and a missing bin gets missing values.
+
+With point AOIs the rows are left-joined and the value columns of the other inputs are added. An input with several rows per join key (for example uncomposited scenes) and a value column name that already exists are errors, so aggregate with ``composite`` first. With polygon AOIs each AOI unit's cubes are joined into one float32 ``reflectance`` cube whose bands are the inputs' bands in order, written as one COG set (and VRTs, see the COG writer above) instead of one per node. Every input is matched to the base by grid position, so all inputs must be on the same output grid; each input's nodata (65535, -9999, NaN) becomes NaN, and band names must be unique across inputs. The cube's ``recipe_id`` and per-time ``source_fingerprint`` cover every input, so changing any input rewrites the tiles. A joined cube mixes units, so an output fed by a join cannot set ``encoding``; the band descriptions carry the names.
 
 ```yaml
 nodes:
@@ -225,7 +227,7 @@ nodes:
     type: join
     inputs: {base: indices, terrain: terrain, radar: s1-db}
 outputs:
-  samples: {from: samples, path: ../data/samples, format: parquet}
+  samples: {from: samples, path: ../data/samples, format: parquet}  # or cog for polygons
 ```
 
 ## Sentinel-1 preprocessing with SNAP

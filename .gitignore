@@ -18,6 +18,7 @@ data/arcticdem
 data/logs
 data/tests
 data/aois
+data/processed
 
 # Cache
 *.asf-cache

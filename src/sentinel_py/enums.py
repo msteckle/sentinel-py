@@ -88,6 +88,34 @@ class EarthSearchCollection(StrEnum):
     c1_l2a = "sentinel-2-c1-l2a"
 
 
+class PFTClass(StrEnum):
+    """Plant functional type and ground-cover columns of the PAVC cover tables."""
+
+    evergreen_shrub = "evergreen_shrub"
+    deciduous_shrub = "deciduous_shrub"
+    graminoid = "graminoid"
+    forb = "forb"
+    bryophyte = "bryophyte"
+    lichen = "lichen"
+    evergreen_needleleaf_tree = "evergreen_needleleaf_tree"
+    boreal_deciduous_tree = "boreal_deciduous_tree"
+    water = "water"
+    bareground = "bareground"
+    other = "other"
+    litter = "litter"
+
+
+class MissingCoverPolicy(StrEnum):
+    """How unmeasured (``-9999``) PFT cover values enter a PFT's training set."""
+
+    zero = "zero"
+    drop = "drop"
+
+
+# Cover tables flag a PFT that was not recorded for a plot with this value.
+PFT_COVER_NODATA = -9999
+
+
 # Download and write-result CVs -------------------------------------------------------
 class Mission(StrEnum):
     """Sentinel mission codes accepted by the CDSE download layer."""

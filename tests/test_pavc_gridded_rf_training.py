@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 
 from sentinel_py.enums import MissingCoverPolicy, PFTClass
-from sentinel_py.pipeline.processors.pft_rf_training import (
+from sentinel_py.pipeline.processors.pavc_gridded_rf.training import (
     file_digest,
     load_pft_training,
 )

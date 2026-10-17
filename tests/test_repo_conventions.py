@@ -96,7 +96,7 @@ def test_processors_declare_a_version_and_are_registered():
         for name in get_default_registry().type_names
     }
     processor_dir = SRC / "pipeline" / "processors"
-    for path in sorted(processor_dir.glob("*.py")):
+    for path in sorted([*processor_dir.glob("*.py"), *processor_dir.glob("*/*.py")]):
         tree = _parse(path)
         classes = [
             node.name

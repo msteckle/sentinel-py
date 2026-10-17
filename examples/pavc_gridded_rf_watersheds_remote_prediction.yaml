@@ -99,7 +99,7 @@ nodes:
     type: join
     inputs: {base: indices, terrain: terrain, radar: s1-db}
 
-  # Predict only: load the forests fitted by pavc_gridded_rf_boxes_local_training.yaml
+  # Predict only: load the forests fitted by pavc_gridded_rf_points_local_training.yaml
   # (the folder name is the recipe ID printed by that run) and map cover over the
   # watersheds. The input must have the same feature bands, in the same order, so
   # keep the S2, terrain and S1 nodes identical to the training pipeline. No training

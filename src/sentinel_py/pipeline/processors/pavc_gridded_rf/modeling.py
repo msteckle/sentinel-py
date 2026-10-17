@@ -1,17 +1,17 @@
-"""Per-PFT random-forest cover model: fit at plots, predict lazily on the AOI boxes.
+"""Per-PFT random-forest cover model: fit at plots, predict lazily on grids.
 
-The node takes one joined feature cube per AOI box (``join`` of S2 indices, terrain
-and S1). While the graph is built it samples the cube at the field plots, fits one
-forest per PFT (see :mod:`.training`) and saves the models; the output is a lazy
-``uint8`` cube with one band per PFT holding percent cover (0-100, nodata 255) that
-workers compute chunk by chunk from the saved models.
+Fitting runs in a point-AOI pipeline: the node takes the joined feature rows of the
+field plots (one row per plot, from ``join`` of S2 indices, terrain and S1), fits one
+forest per PFT (see :mod:`.training`) and saves the models. Prediction runs in a
+polygon-AOI pipeline whose ``models`` key points at those saved models; the output is
+a lazy ``uint8`` cube with one band per PFT holding percent cover (0-100, nodata 255)
+that workers compute chunk by chunk.
 """
 
 from __future__ import annotations
 
 import functools
 import importlib.metadata
-import logging
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from sentinel_py.cache import deterministic_cache_key
 from sentinel_py.enums import AOIKind, MissingCoverPolicy, PFTClass
-from sentinel_py.pipeline.artifacts import RasterArtifact
+from sentinel_py.pipeline.artifacts import PointSampleArtifact, RasterArtifact
 from sentinel_py.pipeline.processors.base import (
     BaseProcessor,
     ProcessorConfig,
@@ -29,17 +29,22 @@ from sentinel_py.pipeline.processors.base import (
     make_recipe_id,
     select_cube_variable,
 )
+from sentinel_py.pipeline.readers.base import (
+    POINT_METADATA_COLUMNS,
+    S1_POINT_ATTRIBUTE_COLUMNS,
+)
 from sentinel_py.pipeline.processors.pavc_gridded_rf.training import (
     DEFAULT_ID_COLUMN,
     MANIFEST_NAME,
+    OOB_NAME,
     ForestParams,
     file_digest,
     fit_pft_models,
     load_manifest,
-    load_pft_training,
+    features_digest,
+    load_pft_cover,
     model_path,
     read_manifest,
-    sample_features,
 )
 
 PROCESSOR_VERSION = 1
@@ -58,16 +63,16 @@ _COPIED_ATTRS = ("crs", "transform", "bounds", "time_representation")
 class PavcGriddedRFNodeConfig(BaseModel):
     """YAML configuration of one ``pavc_gridded_rf`` node.
 
-    The node either fits models (``training``, ``pft_table``, ``model_dir`` and
-    ``pfts``, plus optional hyperparameters) or predicts with models fitted by an
-    earlier run (``models``, optionally ``pfts``); the two key sets cannot be
-    mixed. Relative paths resolve against the directory of the pipeline file.
+    The node either fits models in a point-AOI pipeline (``pft_table``, ``model_dir``
+    and ``pfts``, plus optional hyperparameters) or predicts in a polygon-AOI
+    pipeline with models fitted by an earlier run (``models``, optionally ``pfts``);
+    the two key sets cannot be mixed. Relative paths resolve against the directory of
+    the pipeline file.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     models: str | None = Field(None, min_length=1)
-    training: str | None = Field(None, min_length=1)
     pft_table: str | None = Field(None, min_length=1)
     model_dir: str | None = Field(None, min_length=1)
     pfts: tuple[str, ...] | None = None
@@ -76,7 +81,6 @@ class PavcGriddedRFNodeConfig(BaseModel):
     max_depth: int | None = Field(10, ge=1)
     max_features: int | float | Literal["sqrt", "log2"] | None = 10
     seed: int = 42
-    sample_radius_m: float = Field(0.0, ge=0)
     drop_qa_flagged: bool = True
     missing_cover: Literal["zero", "drop"] = "zero"
     n_jobs: int = Field(1, ge=-1)
@@ -106,7 +110,7 @@ class PavcGriddedRFNodeConfig(BaseModel):
         if self.models is None:
             missing = [
                 key
-                for key in ("training", "pft_table", "model_dir", "pfts")
+                for key in ("pft_table", "model_dir", "pfts")
                 if getattr(self, key) is None
             ]
             if missing:
@@ -247,7 +251,7 @@ def _predict_dataset(
 
 
 class PavcGriddedRFProcessor(BaseProcessor):
-    """Fit a random forest per PFT at field plots and map percent cover on boxes."""
+    """Fit a random forest per PFT at field plots and map percent cover on grids."""
 
     type_name = "pavc_gridded_rf"
     config_model = PavcGriddedRFNodeConfig
@@ -278,54 +282,31 @@ class PavcGriddedRFProcessor(BaseProcessor):
         inputs: Mapping[str, Any],
         context: ProcessorContext,
     ) -> Any:
-        """Fit (or reuse) the PFT models, then return the lazy cover cubes."""
+        """Predict cover with saved models, returning the lazy cover cubes."""
         if not isinstance(config, PavcGriddedRFNodeConfig):
             raise TypeError("Invalid pavc_gridded_rf configuration")
+        if config.models is None:
+            raise ValueError(
+                f"{self.type_name} fits models in a {AOIKind.point.value} AOI pipeline "
+                "(one point per plot); use 'models' to predict on a "
+                f"{AOIKind.polygon.value} AOI"
+            )
         source = self.single_input(inputs)
         if not isinstance(source, RasterArtifact):
             raise TypeError("pavc_gridded_rf input must be a RasterArtifact")
-        logger = context.logger
         datasets = source.datasets
         variable = select_cube_variable(
             next(iter(datasets.values())), None, owner=self.type_name
         )
         features = self._feature_names(datasets, variable)
-
         base = Path(context.pipeline.path).parent
-        if config.models is not None:
-            pfts, model_dir, recipe_id = self._saved_models(
-                config, base, datasets, features
-            )
-            logger.info("Predicting with saved PFT models %s.", model_dir)
-        else:
-            pfts = config.pfts
-            training_csv = self._existing_file(base, config.training, "training")
-            pft_csv = self._existing_file(base, config.pft_table, "pft_table")
-            recipe_id = self._recipe_id(
-                config, datasets, features,
-                file_digest(training_csv), file_digest(pft_csv),
-            )
-            model_dir = (base / config.model_dir).resolve() / recipe_id
-            manifest = load_manifest(model_dir, pfts)
-            if manifest is not None and manifest["features"] == features:
-                logger.info("Reusing PFT models %s (recipe %s).", model_dir, recipe_id)
-            else:
-                tables = load_pft_training(
-                    training_csv,
-                    pft_csv,
-                    pfts=pfts,
-                    id_column=config.id_column,
-                    drop_qa_flagged=config.drop_qa_flagged,
-                    missing_cover=MissingCoverPolicy(config.missing_cover),
-                    logger=logger,
-                )
-                self._fit(config, tables, datasets, variable, model_dir, context)
-
-        model_paths = tuple(str(model_path(model_dir, pft)) for pft in pfts)
-        logger.info(
-            "PFT cover node=%s recipe=%s pfts=%s AOI units=%d",
-            context.node.node_id, recipe_id, ",".join(pfts), len(datasets),
+        pfts, model_dir, recipe_id = self._saved_models(config, base, datasets, features)
+        context.logger.info(
+            "Predicting with saved PFT models %s: node=%s recipe=%s pfts=%s AOI "
+            "units=%d",
+            model_dir, context.node.node_id, recipe_id, ",".join(pfts), len(datasets),
         )
+        model_paths = tuple(str(model_path(model_dir, pft)) for pft in pfts)
         return RasterArtifact(
             source.plan,
             {
@@ -343,12 +324,99 @@ class PavcGriddedRFProcessor(BaseProcessor):
         inputs: Mapping[str, Any],
         context: ProcessorContext,
     ) -> Any:
-        """Reject point AOIs: prediction needs the polygon boxes around the plots."""
-        del config, inputs, context
-        raise ValueError(
-            f"{self.type_name} requires a {AOIKind.polygon.value} AOI (the boxes "
-            "around the training plots), not a point AOI"
+        """Fit (or reuse) the PFT models from the plots' feature rows.
+
+        Returns one row per plot with its observed cover and out-of-bag prediction
+        for every PFT, so a point pipeline has an output to write.
+        """
+        import pandas as pd
+
+        if not isinstance(config, PavcGriddedRFNodeConfig):
+            raise TypeError("Invalid pavc_gridded_rf configuration")
+        if config.models is not None:
+            raise ValueError(
+                f"{self.type_name} predicts with saved models on a "
+                f"{AOIKind.polygon.value} AOI, not a {AOIKind.point.value} AOI"
+            )
+        source = self.single_input(inputs)
+        if not isinstance(source, PointSampleArtifact):
+            raise TypeError("pavc_gridded_rf input must be a PointSampleArtifact")
+        logger = context.logger
+        features = self._plot_features(source.rows)
+        names = list(features.columns[1:])
+        base = Path(context.pipeline.path).parent
+        pft_csv = self._existing_file(base, config.pft_table, "pft_table")
+        recipe_id = self._fit_recipe_id(config, features, file_digest(pft_csv))
+        model_dir = (base / config.model_dir).resolve() / recipe_id
+
+        manifest = load_manifest(model_dir, config.pfts)
+        if manifest is not None and manifest["features"] == names:
+            logger.info("Reusing PFT models %s (recipe %s).", model_dir, recipe_id)
+        else:
+            tables = load_pft_cover(
+                pft_csv,
+                features["aoi_id"].tolist(),
+                pfts=config.pfts,
+                id_column=config.id_column,
+                drop_qa_flagged=config.drop_qa_flagged,
+                missing_cover=MissingCoverPolicy(config.missing_cover),
+                logger=logger,
+            )
+            fit_pft_models(
+                tables,
+                features,
+                params=ForestParams(
+                    n_estimators=config.n_estimators,
+                    max_depth=config.max_depth,
+                    max_features=config.max_features,
+                    seed=config.seed,
+                    n_jobs=config.n_jobs,
+                ),
+                model_dir=model_dir,
+                logger=logger,
+            )
+        logger.info(
+            "PFT models node=%s recipe=%s dir=%s", context.node.node_id, recipe_id,
+            model_dir,
         )
+        identity = [
+            column
+            for column in ("aoi_id", "component_id", "point_index", "longitude", "latitude")
+            if column in source.rows.columns
+        ]
+        rows = source.rows[identity].merge(
+            pd.read_parquet(model_dir / OOB_NAME), on="aoi_id", how="left"
+        )
+        return PointSampleArtifact(rows, source.plan)
+
+    def _plot_features(self, rows: Any) -> Any:
+        """Return ``aoi_id`` plus the numeric feature columns, one row per plot.
+
+        Raises
+        ------
+        ValueError
+            If a plot has several rows (for example several time steps) or the rows
+            carry no numeric feature column.
+        """
+        from pandas.api.types import is_numeric_dtype
+
+        names = [
+            column
+            for column in rows.columns
+            if column not in POINT_METADATA_COLUMNS
+            and column not in S1_POINT_ATTRIBUTE_COLUMNS
+            and is_numeric_dtype(rows[column])
+        ]
+        if not names:
+            raise ValueError(f"{self.type_name} input has no numeric feature columns")
+        if rows["aoi_id"].duplicated().any():
+            raise ValueError(
+                f"{self.type_name} needs one row per plot; some plots have several "
+                "(use a single-window composite so each plot has one time step)"
+            )
+        features = rows[["aoi_id", *names]].copy()
+        features[names] = features[names].astype("float32")
+        return features
 
     def _feature_names(self, datasets: Mapping[Any, Any], variable: str) -> list[str]:
         """Return the shared feature band names, checking single time steps."""
@@ -464,15 +532,10 @@ class PavcGriddedRFProcessor(BaseProcessor):
             raise ValueError(f"pavc_gridded_rf {label} file not found: {path}")
         return path
 
-    def _recipe_id(
-        self,
-        config: PavcGriddedRFNodeConfig,
-        datasets: Mapping[Any, Any],
-        features: list[str],
-        training_digest: str,
-        pft_table_digest: str,
+    def _fit_recipe_id(
+        self, config: PavcGriddedRFNodeConfig, features: Any, pft_table_digest: str
     ) -> str:
-        """Return the recipe identifier covering inputs, tables and hyperparameters."""
+        """Return the recipe identifier of a fit: feature values, cover table, settings."""
         try:
             sklearn_version = importlib.metadata.version("scikit-learn")
         except importlib.metadata.PackageNotFoundError as error:
@@ -482,60 +545,13 @@ class PavcGriddedRFProcessor(BaseProcessor):
         return make_recipe_id(
             self.type_name,
             self.version,
-            **self._input_identity(datasets),
-            features=features,
-            training=training_digest,
+            features=list(features.columns[1:]),
+            feature_values=features_digest(features),
             pft_table=pft_table_digest,
             sklearn=".".join(sklearn_version.split(".")[:2]),
             **{
                 key: value
                 for key, value in config.model_dump().items()
-                if key not in {"models", "training", "pft_table", "model_dir", "n_jobs"}
+                if key not in {"models", "pft_table", "model_dir", "n_jobs"}
             },
-        )
-
-    def _fit(
-        self,
-        config: PavcGriddedRFNodeConfig,
-        tables: Mapping[str, Any],
-        datasets: Mapping[Any, Any],
-        variable: str,
-        model_dir: Path,
-        context: ProcessorContext,
-    ) -> None:
-        """Sample features at the plots and fit the per-PFT forests."""
-        import pandas as pd
-
-        logger: logging.Logger = context.logger
-        points = pd.concat(tables.values())[
-            ["aoi_id", "latitude", "longitude"]
-        ].drop_duplicates("aoi_id")
-        label = f"Sampling training features ({context.node.node_id})"
-        sampled, outside = sample_features(
-            datasets,
-            variable,
-            points,
-            radius_m=config.sample_radius_m,
-            execution=context.pipeline.execution,
-            report=lambda done, total: context.report_progress(label, done, total),
-        )
-        if outside:
-            logger.warning(
-                "%d of %d training plots fall outside every AOI box and were skipped.",
-                outside, len(points),
-            )
-        if sampled.empty:
-            raise ValueError("No training plot falls inside an AOI box of this input")
-        fit_pft_models(
-            tables,
-            sampled,
-            params=ForestParams(
-                n_estimators=config.n_estimators,
-                max_depth=config.max_depth,
-                max_features=config.max_features,
-                seed=config.seed,
-                n_jobs=config.n_jobs,
-            ),
-            model_dir=model_dir,
-            logger=logger,
         )

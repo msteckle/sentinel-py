@@ -1,9 +1,8 @@
-"""Training data, feature sampling, and model fitting for the PFT cover forests.
+"""PFT cover tables and random-forest fitting for the PFT cover processor.
 
-The loader joins the selected field plots with the PFT cover table. Feature values at
-the plots are read from the lazy upstream cubes of the plots' own AOI boxes, one
-random forest is fitted per PFT, and each model is saved with a manifest so a rerun
-with the same recipe skips sampling and fitting.
+The loader reads the PFT cover table and splits it per PFT for the plots that a point
+pipeline sampled. One random forest is fitted per PFT, and each model is saved with a
+manifest so a rerun with the same recipe skips fitting.
 """
 
 from __future__ import annotations
@@ -13,15 +12,13 @@ import json
 import logging
 import os
 import warnings
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
-from affine import Affine
-from pyproj import CRS, Transformer
 
 from sentinel_py.cache import write_json_atomic, write_parquet_atomic
 from sentinel_py.enums import PFT_COVER_NODATA, MissingCoverPolicy
@@ -29,11 +26,10 @@ from sentinel_py.enums import PFT_COVER_NODATA, MissingCoverPolicy
 DEFAULT_ID_COLUMN = "site_visit_id"
 QA_FLAG_COLUMN = "qa_review_flag"
 QA_FLAG_REJECT = "yes"
-LATITUDE_COLUMN = "latitude"
-LONGITUDE_COLUMN = "longitude"
 MIN_TRAINING_ROWS = 2
 MANIFEST_NAME = "manifest.json"
 FEATURES_NAME = "training_features.parquet"
+OOB_NAME = "oob_predictions.parquet"
 MODEL_SUFFIX = ".joblib"
 TOP_FEATURES = 5
 
@@ -65,45 +61,33 @@ def file_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _read_csv(path: Path, required: Sequence[str], label: str) -> pd.DataFrame:
-    """Read a CSV and check that it has the required columns and unique plot IDs.
+def features_digest(features: pd.DataFrame) -> str:
+    """Return a digest of a feature table that ignores its row order.
 
     Parameters
     ----------
-    path
-        CSV file to read.
-    required
-        Column names that must be present; the first is the plot ID column.
-    label
-        Human-readable table name used in error messages.
+    features
+        Table with ``aoi_id`` and one column per feature band.
 
     Returns
     -------
-    pandas.DataFrame
-        The table, with the ID column read as text.
-
-    Raises
-    ------
-    ValueError
-        If the file lacks required columns or repeats a plot ID.
+    str
+        SHA-256 hex digest of the sorted rows, so that changed feature values (not
+        only changed scenes) change the recipe ID of a fit.
     """
-    table = pd.read_csv(path, dtype={required[0]: str})
-    missing = [column for column in required if column not in table.columns]
-    if missing:
-        raise ValueError(f"{label} {path} is missing columns: {', '.join(missing)}.")
-    if table[required[0]].duplicated().any():
-        raise ValueError(f"{label} {path} repeats values of {required[0]!r}.")
-    return table
+    ordered = features.sort_values("aoi_id").reset_index(drop=True)
+    hashes = pd.util.hash_pandas_object(ordered, index=False).to_numpy()
+    return hashlib.sha256(hashes.tobytes()).hexdigest()
 
 
 ########################################################################################
-# Public loader
+# Cover table loader
 ########################################################################################
 
 
-def load_pft_training(
-    training_path: Path,
+def load_pft_cover(
     pft_table_path: Path,
+    plot_ids: Sequence[str],
     *,
     pfts: Sequence[str],
     id_column: str = DEFAULT_ID_COLUMN,
@@ -111,25 +95,24 @@ def load_pft_training(
     missing_cover: MissingCoverPolicy | str = MissingCoverPolicy.zero,
     logger: logging.Logger | None = None,
 ) -> dict[str, pd.DataFrame]:
-    """Join selected plots with the PFT cover table and split them per PFT.
+    """Select the sampled plots from the PFT cover table and split them per PFT.
 
-    The training CSV selects plots and supplies their coordinates; the PFT cover
-    table supplies the cover values and the ``qa_review_flag``. Plots flagged
-    ``yes`` are dropped when ``drop_qa_flagged`` is true, then plots with no
-    measured value for any requested PFT are dropped. Cover values equal to
-    ``-9999`` are unmeasured: ``zero`` treats them as 0 and ``drop`` removes the
-    plot from that PFT's table only.
+    Plots flagged ``yes`` in ``qa_review_flag`` are dropped when ``drop_qa_flagged``
+    is true, then plots with no measured value for any requested PFT are dropped.
+    Cover values equal to ``-9999`` are unmeasured: ``zero`` treats them as 0 and
+    ``drop`` removes the plot from that PFT's table only.
 
     Parameters
     ----------
-    training_path
-        CSV with ``id_column``, ``latitude`` and ``longitude`` for the plots to use.
     pft_table_path
         CSV with ``id_column``, ``qa_review_flag`` and one column per PFT.
+    plot_ids
+        Plot identifiers that were sampled (the point AOI's ``aoi_id`` values); other
+        rows of the table are ignored.
     pfts
         PFT column names to build tables for.
     id_column
-        Plot identifier shared by both tables (the pipeline ``aoi_id``).
+        Plot identifier column of the table.
     drop_qa_flagged
         Drop plots whose ``qa_review_flag`` is ``yes``.
     missing_cover
@@ -140,8 +123,7 @@ def load_pft_training(
     Returns
     -------
     dict[str, pandas.DataFrame]
-        Per PFT, a frame with columns ``aoi_id``, ``latitude``, ``longitude`` and
-        ``cover`` (percent, 0-100).
+        Per PFT, a frame with columns ``aoi_id`` and ``cover`` (percent, 0-100).
 
     Raises
     ------
@@ -152,15 +134,17 @@ def load_pft_training(
     logger = logger or _LOGGER
     policy = MissingCoverPolicy(missing_cover)
     pfts = list(pfts)
-    plots = _read_csv(
-        training_path, [id_column, LATITUDE_COLUMN, LONGITUDE_COLUMN], "Training table"
-    )
-    cover = _read_csv(pft_table_path, [id_column, QA_FLAG_COLUMN, *pfts], "PFT table")
+    required = [id_column, QA_FLAG_COLUMN, *pfts]
+    cover = pd.read_csv(pft_table_path, dtype={id_column: str})
+    missing = [column for column in required if column not in cover.columns]
+    if missing:
+        raise ValueError(
+            f"PFT table {pft_table_path} is missing columns: {', '.join(missing)}."
+        )
+    if cover[id_column].duplicated().any():
+        raise ValueError(f"PFT table {pft_table_path} repeats values of {id_column!r}.")
 
-    table = plots[[id_column, LATITUDE_COLUMN, LONGITUDE_COLUMN]].merge(
-        cover[[id_column, QA_FLAG_COLUMN, *pfts]], on=id_column, how="inner"
-    )
-    selected = len(plots)
+    table = cover[required][cover[id_column].isin(set(plot_ids))]
     joined = len(table)
     if drop_qa_flagged:
         flagged = table[QA_FLAG_COLUMN].astype(str).str.strip().str.lower()
@@ -169,9 +153,9 @@ def load_pft_training(
     table = table.loc[values.notna().any(axis=1)]
     values = values.loc[table.index]
     logger.info(
-        "PFT training plots: %d selected, %d with cover data, %d after QA/empty "
-        "filtering (missing_cover=%s).",
-        selected,
+        "PFT training plots: %d sampled, %d found in the cover table, %d after "
+        "QA/empty filtering (missing_cover=%s).",
+        len(set(plot_ids)),
         joined,
         len(table),
         policy.value,
@@ -184,8 +168,6 @@ def load_pft_training(
         frame = pd.DataFrame(
             {
                 "aoi_id": table[id_column].to_numpy(),
-                LATITUDE_COLUMN: table[LATITUDE_COLUMN].to_numpy(dtype=float),
-                LONGITUDE_COLUMN: table[LONGITUDE_COLUMN].to_numpy(dtype=float),
                 "cover": values[pft].to_numpy(dtype=float),
             }
         )
@@ -200,159 +182,6 @@ def load_pft_training(
             )
         result[pft] = frame.reset_index(drop=True)
     return result
-
-
-########################################################################################
-# Feature sampling at the training points
-########################################################################################
-
-
-def point_window(
-    affine: Affine, shape: tuple[int, int], x: float, y: float, radius_m: float
-) -> tuple[slice, slice, np.ndarray] | None:
-    """Locate a point in a raster and the pixels within ``radius_m`` of it.
-
-    Parameters
-    ----------
-    affine
-        Pixel-to-CRS transform of the raster.
-    shape
-        ``(height, width)`` of the raster.
-    x, y
-        Point coordinates in the raster CRS (metres for a projected CRS).
-    radius_m
-        Neighbourhood radius; 0 selects only the pixel containing the point.
-
-    Returns
-    -------
-    tuple[slice, slice, numpy.ndarray] or None
-        Row slice, column slice, and a boolean mask over that window selecting
-        pixels whose centres lie within the radius (the containing pixel is always
-        selected); ``None`` if the point falls outside the raster.
-    """
-    col_f, row_f = ~affine @ (x, y)
-    row, col = int(np.floor(row_f)), int(np.floor(col_f))
-    height, width = shape
-    if not (0 <= row < height and 0 <= col < width):
-        return None
-    half = int(np.ceil(radius_m / min(abs(affine.a), abs(affine.e))))
-    rows = slice(max(row - half, 0), min(row + half + 1, height))
-    cols = slice(max(col - half, 0), min(col + half + 1, width))
-    row_index, col_index = np.mgrid[rows, cols]
-    center_x, center_y = affine @ (col_index + 0.5, row_index + 0.5)
-    mask = (center_x - x) ** 2 + (center_y - y) ** 2 <= radius_m**2
-    mask[row - rows.start, col - cols.start] = True
-    return rows, cols, mask
-
-
-def _window_median(block: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Return the per-band NaN-aware median of the masked pixels of a window.
-
-    Parameters
-    ----------
-    block
-        Feature window shaped ``(band, y, x)``.
-    mask
-        Boolean ``(y, x)`` selection of the pixels to summarise.
-
-    Returns
-    -------
-    numpy.ndarray
-        ``float32`` vector with one value per band; NaN where no pixel is valid.
-    """
-    values = np.asarray(block, dtype=np.float32)[:, mask]
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        return np.nanmedian(values, axis=1).astype(np.float32)
-
-
-def sample_features(
-    datasets: Mapping[tuple[str, str], Any],
-    variable: str,
-    points: pd.DataFrame,
-    *,
-    radius_m: float,
-    execution: Any,
-    report: Callable[[int, int], None] | None = None,
-) -> tuple[pd.DataFrame, int]:
-    """Read the feature vector at each training point from its AOI unit's cube.
-
-    Parameters
-    ----------
-    datasets
-        Upstream cubes keyed by ``(aoi_id, component_id)``; each carries ``crs`` and
-        ``transform`` attributes and a single time step.
-    variable
-        Banded cube variable holding the features.
-    points
-        Unique plots with ``aoi_id``, ``latitude`` and ``longitude`` columns.
-    radius_m
-        Neighbourhood radius; the median of the pixels within it is used.
-    execution
-        Pipeline execution configuration used to compute the sampling tasks.
-    report
-        Optional ``(completed, total)`` progress callback.
-
-    Returns
-    -------
-    tuple[pandas.DataFrame, int]
-        A table with ``aoi_id`` plus one column per feature band, and the number of
-        plots that had no AOI unit containing them.
-    """
-    import dask
-    from sentinel_py.pipeline.execution import compute_dask_tasks
-
-    units: dict[str, list[tuple[str, str]]] = {}
-    for key in datasets:
-        units.setdefault(key[0], []).append(key)
-    transformers: dict[str, Transformer] = {}
-    tasks: list[Any] = []
-    owners: list[str] = []
-    for aoi_id, lat, lon in zip(
-        points["aoi_id"], points[LATITUDE_COLUMN], points[LONGITUDE_COLUMN]
-    ):
-        for key in units.get(aoi_id, ()):
-            dataset = datasets[key]
-            crs = str(dataset.attrs["crs"])
-            if crs not in transformers:
-                transformers[crs] = Transformer.from_crs(
-                    "EPSG:4326", CRS.from_user_input(crs), always_xy=True
-                )
-            x, y = transformers[crs].transform(lon, lat)
-            data = dataset[variable].data
-            window = point_window(
-                Affine(*dataset.attrs["transform"]),
-                (data.shape[2], data.shape[3]),
-                x,
-                y,
-                radius_m,
-            )
-            if window is not None:
-                rows, cols, mask = window
-                tasks.append(
-                    dask.delayed(_window_median)(data[0, :, rows, cols], mask)
-                )
-                owners.append(aoi_id)
-                break
-    names = [str(band) for band in next(iter(datasets.values())).band.values]
-    completed = 0
-
-    def on_result(_: Any) -> None:
-        """Count one finished sampling task."""
-        nonlocal completed
-        completed += 1
-        if report is not None:
-            report(completed, len(tasks))
-
-    if report is not None:
-        report(0, len(tasks))
-    computed = compute_dask_tasks(tasks, execution, progress_callback=on_result)
-    features = pd.DataFrame(
-        np.vstack(computed) if computed else np.empty((0, len(names)), np.float32),
-        columns=names,
-    )
-    features.insert(0, "aoi_id", owners)
-    return features, len(points) - len(owners)
 
 
 ########################################################################################
@@ -416,15 +245,15 @@ def fit_pft_models(
     Plots whose feature vector has any non-finite value are left out, as the
     original workflow dropped plots with missing satellite features. The manifest is
     written last, so an interrupted fit is never mistaken for a complete one. The
-    sampled feature table is saved beside the models so the plots' features can be
-    inspected or reused without resampling.
+    sampled feature table and the per-plot observed and out-of-bag cover
+    (``oob_predictions.parquet``) are saved beside the models.
 
     Parameters
     ----------
     tables
-        Per-PFT frames from :func:`load_pft_training`.
+        Per-PFT frames from :func:`load_pft_cover`.
     features
-        Output of :func:`sample_features`.
+        Table with ``aoi_id`` and one column per feature band, one row per plot.
     params
         Forest hyperparameters.
     model_dir
@@ -460,6 +289,7 @@ def fit_pft_models(
         )
     model_dir.mkdir(parents=True, exist_ok=True)
     summary: dict[str, Any] = {}
+    oob_columns: list[pd.DataFrame] = []
     for pft, table in tables.items():
         merged = table.merge(features, on="aoi_id", how="inner")
         matrix = merged[names].to_numpy(dtype=np.float32)
@@ -495,6 +325,15 @@ def fit_pft_models(
             os.replace(part, model_path(model_dir, pft))
         finally:
             part.unlink(missing_ok=True)
+        oob_columns.append(
+            pd.DataFrame(
+                {
+                    f"{pft}_observed": merged["cover"].to_numpy()[usable],
+                    f"{pft}_oob": np.rint(np.clip(forest.oob_prediction_, 0, 100)),
+                },
+                index=merged["aoi_id"].to_numpy()[usable],
+            )
+        )
         oob = float(getattr(forest, "oob_score_", np.nan))
         top = np.argsort(forest.feature_importances_)[::-1][:TOP_FEATURES]
         summary[pft] = {
@@ -512,6 +351,11 @@ def fit_pft_models(
             ", ".join(summary[pft]["top_features"]),
         )
     write_parquet_atomic(features, model_dir / FEATURES_NAME)
+    oob_table = pd.concat(oob_columns, axis=1).rename_axis("aoi_id").reset_index()
+    for column in oob_table.columns[1:]:
+        if column.endswith("_oob"):
+            oob_table[column] = oob_table[column].astype("Int16")
+    write_parquet_atomic(oob_table, model_dir / OOB_NAME)
     manifest = {"features": names, "pfts": list(tables), "models": summary}
     write_json_atomic(model_dir / MANIFEST_NAME, manifest)
     return manifest

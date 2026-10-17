@@ -43,6 +43,24 @@ bash esa-snap_sentinel_linux-14.0.0.sh
 
 The installer is an install4j script; on a headless node it can usually be run unattended with `-q -dir <install directory>`. Install to a shared filesystem path that every compute node can read, and set `SNAP_HOME` to that directory.
 
+### CADES Pathfinder
+
+On CADES, install SNAP on project storage, which is shared across nodes and not purged. Do not use scratch (Lustre), which is purged periodically and handles many small files poorly, or `$HOME`, which is small. This example installs next to the repository, so the install stays with the project and is not scattered across the shared project directory. Run it on a login node, which has internet access, and keep the roughly 1 GB installer out of the repository:
+
+```bash
+mkdir -p /tmp/$USER-snap && cd /tmp/$USER-snap
+curl -fLO https://download.esa.int/step/snap/14.0/installers/esa-snap_sentinel_linux-14.0.0.sh
+curl -fLO https://step.esa.int/downloads/14.0/installers/sha256sums
+sha256sum esa-snap_sentinel_linux-14.0.0.sh
+grep esa-snap_sentinel_linux-14.0.0.sh sha256sums
+
+export SNAP_HOME=/projects/<project>/<shared-dir>/sentinel-py/.snap-install
+bash esa-snap_sentinel_linux-14.0.0.sh -q -dir "$SNAP_HOME"
+rm -rf /tmp/$USER-snap
+```
+
+The two hashes must be identical. Select the Microwave toolbox if the installer asks about components. To keep SNAP's per-user files out of `$HOME` while you verify the install, export `_JAVA_OPTIONS="-Dsnap.userdir=<repository>/.snap-userdir"` first, then follow the steps below. Pipeline runs do not use this directory, because each scene gets its own temporary SNAP user directory. Add `.snap-install/` and `.snap-userdir/` to `.gitignore`, exclude them from any rsync or deploy of the repository, and export `SNAP_HOME` inside your `sbatch` script, because compute nodes do not inherit your login environment. The pipeline example for Slurm is `examples/pavc_gridded_rf_points_2019_hpc_training.sbatch`.
+
 ### Verify the install
 
 Do not rely on a bare `gpt` command: macOS ships an unrelated `/usr/sbin/gpt` (a disk partitioning tool), which shadows SNAP's `gpt` whenever SNAP is not first on `PATH`. Always call SNAP's tool by its full path:

@@ -1,0 +1,127 @@
+version: 1
+
+execution:
+  # local: isolated Dask worker processes on the sbatch node (size to -c / --mem)
+  # dask: connect to scheduler_address
+  # slurm: create workers through dask-jobqueue
+  method: local
+  workers: 4
+  threads_per_worker: 1
+
+selection:
+  aoi: ../data/aois/pavc2_2010-2024_filtered-lt20m-mostrecent_tier03_2026-10-16.geojson
+  aoi_id_field: site_visit_id
+  years: [2019]
+  speriod: "06-01"
+  eperiod: "08-31"
+
+output_grid:
+  crs: EPSG:3338
+  resolution: 20
+  extent: aoi
+  anchor: [0, 0]
+  chunks: {y: 1024, x: 1024}
+
+sources:
+  s2:
+    type: s2.l2a.local
+    data_dir: ../data/s2/raw
+  s1:
+    type: s1.grd.local
+    data_dir: ../data/s1/raw
+    flight_direction: PREDOMINANT  # don't mix ascending and descending scenes
+    orbit: precise-or-restituted
+  arcticdem:
+    type: dem.local
+    data_dir: ../data/arcticdem/10m
+    pattern: "*.tif"
+
+nodes:
+  # S2 processing steps
+  # 1. preprocess sentinel-2 bands
+  - id: preprocess
+    type: s2.preprocess
+    source: s2
+    bands: [B02, B03, B04, B05, B06, B07, B08, B8A, B11, B12]
+    mask_classes: [0, 1, 3, 8, 9, 10, 11]
+    nodata: 65535
+  # 2. create one summer representative composite per band
+  - id: all-composite
+    type: composite
+    inputs: {data: preprocess}
+    period: all
+    aggregation: median
+  # 3. calculate indices from the composite
+  - id: indices
+    type: s2.index
+    inputs: {data: all-composite}
+    indices: [NDGI, NDWI1, NDWI2, MSAVI, VARI, RVI, OSAVI, TGI, GLI, NGRDI, CIG, GNDVI, CVI, MTVI2, TCARI, TCI, NARI, TCAPB, TCAPG, TCAPW]
+
+  # S1 processing steps
+  # 1. preprocess using SNAP GPT
+  - id: s1-preprocess
+    type: snap_gpt
+    source: s1
+    dem: arcticdem
+    polarizations: [VV, VH]
+    subset: aoi
+    dem_vertical_datum: ellipsoid  # ArcticDEM heights are ellipsoidal
+    memory_gb: 16
+    threads: 4
+  # 2. create one summer representative composite per band
+  - id: s1-composite
+    type: composite
+    inputs: {data: s1-preprocess}
+    period: all
+    aggregation: median
+    empty_bins: fill  # sites without Sentinel-1 scenes get nodata, not an error
+  # 3. convert the composite to decibels
+  - id: s1-db
+    type: to_db
+    inputs: {data: s1-composite}
+
+  # ArcticDEM processing steps
+  # 1. calculate terrain features from the DEM
+  - id: terrain
+    type: dem
+    source: arcticdem
+    features: [elevation, aspect, slope, hillshade]
+    algorithm: Horn
+    hillshade_azimuth: 315
+    hillshade_altitude: 45
+
+  # One wide row per plot: the first input is the base; the static terrain columns are
+  # added to every row and the Sentinel-1 columns match the same summer bin.
+  - id: samples
+    type: join
+    inputs: {base: indices, terrain: terrain, radar: s1-db}
+
+  # Fit step: one random forest per PFT from the features at the plots (a single 20 m
+  # pixel each). The point AOI decides which plots are used (build it from the subset
+  # CSV); `pft_table` supplies the cover values and qa_review_flag, and plots missing
+  # from it are ignored. Models are saved under model_dir/<recipe id>/ with a manifest,
+  # training_features.parquet and oob_predictions.parquet; a rerun with the same recipe
+  # reuses them. Map any area afterwards with `models:` in a polygon-AOI pipeline (see
+  # pavc_gridded_rf_watersheds_remote_prediction.yaml), which must use the same S2,
+  # terrain and S1 nodes and the same output_grid.
+  - id: pft-models
+    type: pavc_gridded_rf
+    inputs: {features: samples}
+    pft_table: ../data/tables/tier_03_cover_v2_0.csv  # copy from pavc/data/releases/v2_0
+    model_dir: ../data/models/pavc_gridded_rf_2019
+    pfts: [evergreen_shrub, deciduous_shrub, graminoid, forb, bryophyte, lichen, litter, bareground, water]
+    n_estimators: 100
+    max_depth: 10
+    max_features: 10
+    seed: 42
+    drop_qa_flagged: true    # drop plots with qa_review_flag == yes
+    missing_cover: zero      # -9999 (not recorded) counts as 0; `drop` removes the plot from that PFT
+    n_jobs: 4
+
+# A pipeline needs an output: one row per plot with the observed cover and the
+# out-of-bag prediction (integer percent) for every PFT.
+outputs:
+  pft-fit:
+    from: pft-models
+    path: ../data/processed/pavc_gridded_rf_fit_2019
+    format: parquet

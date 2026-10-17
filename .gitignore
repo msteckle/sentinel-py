@@ -11,6 +11,10 @@ wheels/
 .venv
 uv.lock
 
+# SNAP install and user directory (HPC)
+.snap-install/
+.snap-userdir/
+
 # Data files
 data/s1
 data/s2

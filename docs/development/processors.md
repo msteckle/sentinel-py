@@ -230,6 +230,28 @@ outputs:
   samples: {from: samples, path: ../data/samples, format: parquet}  # or cog for polygons
 ```
 
+## Per-PFT cover models
+
+The `pavc_gridded_rf` processor (package `processors/pavc_gridded_rf/`: `training.py` for data, sampling and fitting, `modeling.py` for the node and prediction) trains one scikit-learn `RandomForestRegressor` per plant functional type (PFT) at field plots and maps percent cover onto the AOI boxes around them. It needs the optional `ml` extra (`pip install sentinel-py[ml]`) and a polygon AOI whose `aoi_id` values are the plot identifiers (`site_visit_id`). It takes exactly one input, normally a `join` of spectral indices, terrain and backscatter with a single time step per box; every band of that cube is a feature, in order.
+
+The node builds its models while the graph is built, then predicts lazily. It reads the feature vector at every plot that lies in a box (the median of the pixels within `sample_radius_m`, or the single pixel at 0), drops plots with any non-finite feature, fits one forest per PFT, and saves each as `model_dir/<recipe id>/<pft>.joblib` with a `manifest.json` (feature names, training size, out-of-bag R2 and top features per PFT) written last. A rerun with the same recipe finds the manifest and skips sampling and fitting. Workers load the models from `model_dir`, so it must be on a filesystem they share. The output is a `cover` variable of `uint8` with one band per PFT: percent cover rounded to an integer and clipped to 0-100, with nodata 255 where any feature is missing.
+
+Training data come from two CSVs. `training` selects the plots and supplies their `latitude` and `longitude`; `pft_table` supplies the cover columns and `qa_review_flag`, joined on `id_column`. Plots flagged `yes` are dropped when `drop_qa_flagged` is true, as are plots with no recorded value for any requested PFT. A cover of `-9999` means not recorded: `missing_cover: zero` trains on 0 (the behaviour of the earlier notebooks) and `drop` leaves the plot out of that PFT's model only. Plots outside every box are skipped with a warning. There is no Cook's-distance filtering and no hold-out split; the log reports the out-of-bag R2 per PFT.
+
+The recipe ID covers the upstream recipe and source fingerprints, the feature names, the content of both CSVs, the PFT list, the hyperparameters, `seed`, the sampling radius, the two filtering options and the scikit-learn major.minor version, so changing any of them fits new models and rewrites the tiles. `PROCESSOR_VERSION` is 1. See `examples/pavc_gridded_rf_boxes_remote_processing.yaml`.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `training`, `pft_table`, `model_dir` | required | Paths, relative to the pipeline file |
+| `pfts` | required | PFT columns to model (`PFTClass` values) |
+| `id_column` | `site_visit_id` | Plot identifier shared by the tables and the AOI |
+| `n_estimators`, `max_depth`, `max_features` | 100, 10, 10 | Forest hyperparameters (`max_depth: null` is unlimited; an integer `max_features` may not exceed the number of bands) |
+| `seed` | 42 | Random state |
+| `sample_radius_m` | 0 | Neighbourhood radius for the training features |
+| `drop_qa_flagged` | true | Drop plots with `qa_review_flag` equal to `yes` |
+| `missing_cover` | `zero` | `zero` or `drop` for `-9999` cover values |
+| `n_jobs` | 1 | Threads used while fitting (-1 for all cores) |
+
 ## Sentinel-1 preprocessing with SNAP
 
 The built-in `snap_gpt` processor runs the external SNAP `gpt` tool once per Sentinel-1 GRD scene and AOI unit, then exposes the terrain-corrected scenes as a lazy `backscatter` variable with dimensions `(time, band, y, x)` on the canonical output grid. Install SNAP 14 first (see `docs/quickstart/install.md`), then stage orbit files and the EGM96 grid with `sentinel-py asf download` so processing never needs the network. The node sources are an `s1.grd.local` source (ASF ZIPs plus the staged orbits) and a `dem.local` source holding ArcticDEM tiles.

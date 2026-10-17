@@ -382,3 +382,15 @@ def test_plots_outside_every_box_are_skipped_with_a_warning(
         PavcGriddedRFProcessor().execute(_config(), {"f": source}, _context(tmp_path))
 
     assert "1 of 8 training plots fall outside every AOI box" in caplog.text
+
+
+def test_too_few_complete_plots_names_the_sampled_count(tmp_path: Path) -> None:
+    _write_tables(tmp_path)
+    source = _artifact()
+    for index in range(1, BOXES):  # every box but one has an all-NaN feature
+        source.datasets[(f"site-{index}", "part-0000")]["reflectance"].loc[
+            {"band": "b0"}
+        ] = np.nan
+
+    with pytest.raises(ValueError, match="1 plot\\(s\\) with complete feature values out of 8"):
+        PavcGriddedRFProcessor().execute(_config(), {"f": source}, _context(tmp_path))

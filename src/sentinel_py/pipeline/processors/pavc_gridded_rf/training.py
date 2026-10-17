@@ -461,7 +461,15 @@ def fit_pft_models(
         if usable.sum() < MIN_TRAINING_ROWS:
             raise ValueError(
                 f"PFT {pft!r} has {int(usable.sum())} plot(s) with complete feature "
-                f"values out of {len(table)}; at least {MIN_TRAINING_ROWS} are required"
+                f"values out of {len(merged)} sampled inside the AOI boxes; at least "
+                f"{MIN_TRAINING_ROWS} are required"
+            )
+        if not usable.all():
+            logger.warning(
+                "%s: %d plot(s) have missing features (for example %s).",
+                pft,
+                int((~usable).sum()),
+                ", ".join(merged["aoi_id"][~usable].head(3)),
             )
         forest = RandomForestRegressor(
             n_estimators=params.n_estimators,

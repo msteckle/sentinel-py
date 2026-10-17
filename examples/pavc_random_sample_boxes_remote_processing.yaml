@@ -1,0 +1,109 @@
+version: 1
+
+execution:
+  # Every worker reads Sentinel-2 and ArcticDEM over HTTPS, so the compute nodes need
+  # internet access. Concurrent connections equal the number of worker processes
+  # (workers, or jobs x processes_per_job on Slurm); raster reads hold a lock, so use
+  # threads_per_worker 1 and raise workers instead.
+  # Sentinel-1 is not remote: SNAP needs the ZIPs, orbit files and DEM tiles on disk.
+  method: local
+  workers: 8
+  threads_per_worker: 1
+
+selection:
+  aoi: ../data/aois/pavc_random_sample_boxes.geojson
+  aoi_id_field: site_visit_id
+  years: [2023, 2024]
+  speriod: "06-01"
+  eperiod: "08-31"
+
+output_grid:
+  crs: EPSG:3338
+  resolution: 20
+  extent: aoi
+  anchor: [0, 0]
+  chunks: {y: 1024, x: 1024}
+
+sources:
+  # Nothing is downloaded: scenes and tiles are found with STAC searches (cached) and
+  # their cloud-optimized GeoTIFFs are read in place.
+  s2:
+    type: s2.l2a.remote
+    collection: sentinel-2-c1-l2a  # Collection 1 (default; values match CDSE SAFE); or sentinel-2-l2a
+  arcticdem:
+    type: dem.remote
+  # Sentinel-1 preprocessing runs SNAP gpt on local files: stage the ZIPs and orbit
+  # files with `sentinel-py asf download` and the DEM tiles with `sentinel-py pgc
+  # download` (`sentinel-py pgc missing --pipeline <yaml>` lists uncovered areas).
+  s1:
+    type: s1.grd.local
+    data_dir: ../data/s1/raw
+    flight_direction: PREDOMINANT  # don't mix ascending and descending scenes
+    orbit: precise-or-restituted
+  arcticdem_local:
+    type: dem.local
+    data_dir: ../data/arcticdem/10m
+    pattern: "*.tif"
+
+nodes:
+  # Sentinel-2: one summer median per band, then spectral indices from the medians
+  - id: preprocess
+    type: s2.preprocess
+    source: s2
+    bands: [B02, B03, B04, B05, B06, B07, B08, B8A, B11, B12]
+    mask_classes: [0, 1, 3, 8, 9, 10, 11]
+    nodata: 65535
+  - id: all-composite
+    type: composite
+    inputs: {data: preprocess}
+    period: all
+    aggregation: median
+  - id: indices
+    type: s2.index
+    inputs: {data: all-composite}
+    indices: [NDGI, NDWI1, NDWI2, MSAVI, VARI, RVI, OSAVI, TGI, GLI, NGRDI, CIG, GNDVI, CVI, MTVI2, TCARI, TCI, NARI, TCAPB, TCAPG, TCAPW]
+
+  # Sentinel-1: SNAP preprocessing per scene, a summer median, then decibels
+  - id: s1-preprocess
+    type: snap_gpt
+    source: s1
+    dem: arcticdem_local
+    polarizations: [VV, VH]
+    subset: aoi
+    dem_vertical_datum: ellipsoid  # ArcticDEM heights are ellipsoidal
+    memory_gb: 16
+    threads: 4
+  - id: s1-composite
+    type: composite
+    inputs: {data: s1-preprocess}
+    period: all
+    aggregation: median
+    empty_bins: fill  # sites without Sentinel-1 scenes get nodata, not an error
+  - id: s1-db
+    type: to_db
+    inputs: {data: s1-composite}
+
+  # ArcticDEM: terrain features, read remotely
+  - id: terrain
+    type: dem
+    source: arcticdem
+    features: [elevation, aspect, slope, hillshade]
+    algorithm: Horn
+    hillshade_azimuth: 315
+    hillshade_altitude: 45
+
+# Polygon AOIs write one COG set per node (the `join` node combines point samples only).
+outputs:
+  composited:
+    from: indices
+    path: ../data/processed/pavc_random_sample_boxes_remote/s2
+    format: cog
+  terrain:
+    from: terrain
+    path: ../data/processed/pavc_random_sample_boxes_remote/arcticdem
+    format: cog
+  s1_backscatter_db:
+    from: s1-db
+    path: ../data/processed/pavc_random_sample_boxes_remote/s1
+    format: cog
+    encoding: {dtype: int16, scale: 0.01}  # 0.01 dB steps; about half the size of float32

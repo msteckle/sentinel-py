@@ -150,3 +150,45 @@ def test_remote_example_pipeline_validates(tmp_path) -> None:
         "radar": "s1-db",
     }
     assert [node.node_id for node in config.ordered_nodes][-1] == "samples"
+
+
+def test_remote_boxes_example_pipeline_validates(tmp_path) -> None:
+    import json
+    import shutil
+    from pathlib import Path
+
+    example = (
+        Path(__file__).parents[1] / "examples" / "pavc_random_sample_boxes_remote_processing.yaml"
+    )
+    (tmp_path / "examples").mkdir()
+    shutil.copy(example, tmp_path / "examples" / example.name)
+    (tmp_path / "data" / "s1" / "raw").mkdir(parents=True)
+    (tmp_path / "data" / "arcticdem" / "10m").mkdir(parents=True)
+    aoi = tmp_path / "data" / "aois" / "pavc_random_sample_boxes.geojson"
+    aoi.parent.mkdir(parents=True)
+    aoi.write_text(
+        json.dumps(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {"site_visit_id": "a"},
+                        "geometry": {
+                            "type": "Polygon",
+                            "coordinates": [
+                                [[-150.0, 68.0], [-149.99, 68.0], [-149.99, 68.01],
+                                 [-150.0, 68.01], [-150.0, 68.0]]
+                            ],
+                        },
+                    }
+                ],
+            }
+        )
+    )
+
+    config = PipelineConfig.from_file(tmp_path / "examples" / example.name)
+
+    assert config.aoi_plan.kind == "polygon"
+    assert set(config.outputs) == {"composited", "terrain", "s1_backscatter_db"}
+    assert {output.format for output in config.outputs.values()} == {"cog"}

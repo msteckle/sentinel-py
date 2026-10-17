@@ -156,6 +156,12 @@ OUTPUT/PRODUCT_ID/GRANULE_ID/reflectance.rRRRR.cCCCC.tif
 OUTPUT/PRODUCT_ID/GRANULE_ID/scl.rRRRR.cCCCC.tif
 ```
 
+Next to each AOI unit's tiles the writer also writes `<variable>.vrt`, a small virtual
+mosaic that stitches the tile rows and columns so a GIS opens them as one raster, and
+polygon outputs get one mosaic per time bin and variable that covers every AOI unit
+(`OUTPUT/PRODUCT_ID/GRANULE_ID/<variable>.vrt`). Open that file in QGIS to see all
+sites as one layer; the VRT stores no pixels and uses each tile's overviews.
+
 Each worker writes a unique temporary sibling with Rasterio and atomically replaces
 the final COG only after it closes successfully. The central writer stores cache keys
 and structured results in `OUTPUT/.sentinel-py/cog_outputs.parquet`. Cache keys

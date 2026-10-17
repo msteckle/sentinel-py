@@ -10,6 +10,7 @@ and offset tags), which roughly halves its size with a bounded quantization erro
 
 from __future__ import annotations
 
+import logging
 import os
 import uuid
 from dataclasses import replace
@@ -24,8 +25,15 @@ import sentinel_py.pipeline.grid as pipeline_grid
 from sentinel_py.cache import REGISTRY, RowStore, deterministic_cache_key
 from sentinel_py.enums import AOIKind, ArtifactKind, OutputFormat, WriteStatus
 from sentinel_py.pipeline.writers.base import BaseOutputWriter, OutputWritePlan
+from sentinel_py.pipeline.writers.vrt import (
+    VRTSpec,
+    VRTTile,
+    write_output_mosaics,
+    write_unit_vrts,
+)
 
 COG_WRITER_VERSION = 1
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -231,6 +239,60 @@ def _tile_variables(artifact: Any) -> list[tuple[str, int | float, tuple[str, ..
     return banded + unbanded
 
 
+def _failed_paths(results: Any) -> set[Path]:
+    """Return the tile paths whose write failed."""
+    return {
+        result.output_path for result in results if result.status == WriteStatus.failed
+    }
+
+
+def _tile_encoding(output: Any, dtype: np.dtype) -> tuple[str, float, float] | None:
+    """Return the ``(dtype, scale, offset)`` packing of a variable, if any.
+
+    Only floating-point variables are packed; integer data (DN, SCL) is kept.
+    """
+    requested = getattr(output, "encoding", None)
+    if requested is None or not np.issubdtype(dtype, np.floating):
+        return None
+    return requested.dtype, requested.scale, requested.offset
+
+
+def _vrt_spec(
+    artifact: Any,
+    output: Any,
+    time_index: int,
+    variable: tuple[str, int | float, tuple[str, ...]],
+    dtype: np.dtype,
+    tiles: list[VRTTile],
+) -> VRTSpec:
+    """Describe the tiles of one (time bin, variable) for its VRT."""
+    name, nodata, descriptions = variable
+    transform = artifact.attrs["transform"]
+    encoding = _tile_encoding(output, dtype)
+    if encoding is None:
+        stored, stored_nodata = np.dtype(dtype).name, float(nodata)
+        scale = offset = None
+    else:
+        # Packed tiles store int codes with a reserved nodata code (see pack_values).
+        info = np.iinfo(encoding[0])
+        stored = encoding[0]
+        stored_nodata = float(info.min if info.min < 0 else info.max)
+        scale, offset = float(encoding[1]), float(encoding[2])
+    return VRTSpec(
+        product_id=str(artifact.product_id.values[time_index]),
+        granule_id=str(artifact.granule_id.values[time_index]),
+        variable=name,
+        crs=str(artifact.attrs["crs"]),
+        resolution=(float(transform[0]), abs(float(transform[4]))),
+        dtype=stored,
+        nodata=stored_nodata,
+        descriptions=descriptions,
+        scale=scale,
+        offset=offset,
+        tiles=tuple(tiles),
+    )
+
+
 class COGOutputWriter(BaseOutputWriter):
     """Build chunk-level COG tasks and maintain output-scoped resume state."""
 
@@ -313,8 +375,10 @@ class COGOutputWriter(BaseOutputWriter):
         }
         tasks: list[Any] = []
         completed: list[COGWriteResult] = []
+        vrt_specs: list[VRTSpec] = []
         for time_index in range(artifact.sizes["time"]):
             for variable in variables:
+                tiles: list[VRTTile] = []
                 self._plan_variable_tiles(
                     artifact,
                     arrays,
@@ -324,6 +388,13 @@ class COGOutputWriter(BaseOutputWriter):
                     cached,
                     tasks,
                     completed,
+                    tiles,
+                )
+                vrt_specs.append(
+                    _vrt_spec(
+                        artifact, output, time_index, variable,
+                        arrays[variable[0]].dtype, tiles,
+                    )
                 )
         return OutputWritePlan(
             output,
@@ -333,6 +404,7 @@ class COGOutputWriter(BaseOutputWriter):
                 "state_path": state_path,
                 "state": state,
                 "store": state_store,
+                "vrt": tuple(vrt_specs),
                 # Task ids already persisted by checkpoint(), so finalize() does
                 # not write them twice.
                 "checkpointed": set(),
@@ -349,6 +421,7 @@ class COGOutputWriter(BaseOutputWriter):
         cached: dict[str, Any],
         tasks: list[Any],
         completed: list[COGWriteResult],
+        tiles: list[VRTTile],
     ) -> None:
         """Append one task (or one skipped result) per chunk of one time step.
 
@@ -369,6 +442,8 @@ class COGOutputWriter(BaseOutputWriter):
             Completed state rows by task id.
         tasks, completed : list
             Output lists extended in place.
+        tiles : list[VRTTile]
+            Extended in place with the position of every tile, for the VRT.
         """
         from dask import delayed
 
@@ -383,13 +458,7 @@ class COGOutputWriter(BaseOutputWriter):
 
         data_array = arrays[name]
         has_band = "band" in data_array.dims
-        # Only floating-point variables are packed; integer data (DN, SCL) is kept.
-        requested = getattr(output, "encoding", None)
-        encoding = (
-            (requested.dtype, requested.scale, requested.offset)
-            if requested is not None and np.issubdtype(data_array.dtype, np.floating)
-            else None
-        )
+        encoding = _tile_encoding(output, data_array.dtype)
         array = data_array.data[time_index]
         delayed_blocks = array.to_delayed(optimize_graph=False)
         row_offset = 0
@@ -407,6 +476,15 @@ class COGOutputWriter(BaseOutputWriter):
                     / f"{name}.r{row_index:04d}.c{column_index:04d}.tif"
                 )
                 output_path = output.path / relative
+                tiles.append(
+                    VRTTile(
+                        output_path,
+                        transform[2] + column_offset * x_resolution,
+                        transform[5] - row_offset * y_resolution,
+                        width,
+                        height,
+                    )
+                )
                 key_payload = {
                     "writer_version": COG_WRITER_VERSION,
                     "output_id": output.output_id,
@@ -517,7 +595,12 @@ class COGOutputWriter(BaseOutputWriter):
         plan: OutputWritePlan,
         computed: tuple[Any, ...],
     ) -> tuple[COGWriteResult, ...]:
-        """Persist resume state for completed tiles and return all results."""
+        """Persist resume state, write the VRTs, and return all tile results.
+
+        A leaf plan (one AOI unit) writes a VRT per time bin and variable beside its
+        tiles; the parent plan of a polygon output then writes one mosaic VRT per time
+        bin and variable over every unit under the output directory.
+        """
         if "subplans" in plan.metadata:
             results = []
             offset = 0
@@ -525,6 +608,22 @@ class COGOutputWriter(BaseOutputWriter):
                 count = len(subplan.tasks)
                 results.extend(self.finalize(subplan, computed[offset:offset + count]))
                 offset += count
+            unit_specs = [
+                subplan.metadata["vrt"]
+                for subplan in plan.metadata["subplans"]
+                if subplan.metadata.get("vrt")
+            ]
+            if unit_specs:
+                try:
+                    mosaics = write_output_mosaics(
+                        unit_specs, plan.output.path, _failed_paths(results)
+                    )
+                except OSError as error:
+                    logger.warning("Could not write the output VRT mosaics: %s", error)
+                else:
+                    logger.info(
+                        "Wrote %d mosaic VRT(s) under %s", len(mosaics), plan.output.path
+                    )
             return tuple(results)
         results = tuple(plan.completed) + tuple(computed)
         checkpointed: set[str] = plan.metadata["checkpointed"]
@@ -537,4 +636,11 @@ class COGOutputWriter(BaseOutputWriter):
             ]
         )
         store.compact()
+        if plan.metadata.get("vrt"):
+            try:
+                write_unit_vrts(
+                    plan.metadata["vrt"], plan.output.path, _failed_paths(results)
+                )
+            except OSError as error:
+                logger.warning("Could not write VRTs under %s: %s", plan.output.path, error)
         return results

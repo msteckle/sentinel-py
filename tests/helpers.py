@@ -287,8 +287,12 @@ def write_s1_project(
     orbits: bool = True,
     node_extra: str = "",
     source_extra: str = "",
+    point_offsets: tuple[tuple[float, float], ...] = ((0.0, 0.0),),
 ) -> Path:
     """Write a synthetic S1 + ArcticDEM pipeline whose ``gpt`` is a test stub.
+
+    With ``point=True`` one plot is written per ``point_offsets`` entry, as metres
+    east and north of the base plot.
 
     Creates scene ZIPs with manifests, staged orbit files and EGM96 archive, one DEM
     tile, an AOI, and a ``snap_gpt`` pipeline YAML. Returns the pipeline path.
@@ -335,22 +339,27 @@ def write_s1_project(
             transform=from_origin(cx - 75000, cy + 75000, 500, 500),
         ) as dst:
             dst.write(np.full((300, 300), 120.0, "float32"), 1)
-    geometry = (
-        {"type": "Point", "coordinates": [cx, cy]}
-        if point
-        else {
-            "type": "Polygon",
-            "coordinates": [[[cx, cy], [cx + 400, cy], [cx + 400, cy + 400],
-                             [cx, cy + 400], [cx, cy]]],
-        }
-    )
+    if point:
+        geometries = [
+            {"type": "Point", "coordinates": [cx + dx, cy + dy]}
+            for dx, dy in point_offsets
+        ]
+    else:
+        geometries = [
+            {
+                "type": "Polygon",
+                "coordinates": [[[cx, cy], [cx + 400, cy], [cx + 400, cy + 400],
+                                 [cx, cy + 400], [cx, cy]]],
+            }
+        ]
     (tmp_path / "aoi.geojson").write_text(
         json.dumps(
             {
                 "type": "FeatureCollection",
                 "crs": {"type": "name", "properties": {"name": "EPSG:3338"}},
                 "features": [
-                    {"type": "Feature", "properties": {"site": "site-1"}, "geometry": geometry}
+                    {"type": "Feature", "properties": {"site": f"site-{index}"}, "geometry": geometry}
+                    for index, geometry in enumerate(geometries, start=1)
                 ],
             }
         )

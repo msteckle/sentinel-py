@@ -393,6 +393,95 @@ def test_points_where_every_scene_has_no_overlap_become_nodata(tmp_path: Path, m
     assert len(composite) == 1 and composite[["VV", "VH"]].isna().all().all()
 
 
+def _planned_jobs(project: Path):
+    """Return the config, node, prepared state and per-plot jobs of a point project."""
+    from sentinel_py.pipeline.processors.base import ProcessorContext
+    from sentinel_py.pipeline.processors.snap_gpt import SnapGPTProcessor
+
+    config = PipelineConfig.from_file(project)
+    node = config.nodes[0]
+    processor = SnapGPTProcessor()
+    context = ProcessorContext(config, node, (), LOGGER)
+    state = processor._prepare(node.config, context)
+    per_unit = [
+        (unit, processor._jobs(unit, node.config, context, state))
+        for unit in config.aoi_plan.units
+    ]
+    return config, node, state, per_unit
+
+
+THREE_PLOTS = ((0.0, 0.0), (100.0, 100.0), (30_000.0, 0.0))
+
+
+def test_group_cell_km_defaults_off_and_rejects_negative_values():
+    assert SnapGPTNodeConfig(source="s1", dem="dem").group_cell_km == 0.0
+    with pytest.raises(ValueError):
+        SnapGPTNodeConfig(source="s1", dem="dem", group_cell_km=-1.0)
+
+
+def test_grouping_with_tiny_cells_keeps_every_original_job_key(tmp_path: Path):
+    from sentinel_py.pipeline.processors.snap_gpt import _group_unit_jobs
+
+    config, node, state, per_unit = _planned_jobs(
+        write_s1_project(tmp_path, point=True, point_offsets=THREE_PLOTS)
+    )
+    grouped = _group_unit_jobs(
+        per_unit, config=node.config.model_copy(update={"group_cell_km": 0.001}),
+        crs=config.output_grid.crs, dem_tiles=state["dem_tiles"],
+    )
+    original = [[job.key() for _, job in jobs] for _, jobs in per_unit]
+    assert [[job.key() for _, job in jobs] for _, jobs in grouped] == original
+
+
+def test_grouping_merges_plots_of_one_scene_into_a_covering_region(tmp_path: Path):
+    from shapely import wkt
+
+    from sentinel_py.pipeline.processors.snap_gpt import _group_unit_jobs
+
+    config, node, state, per_unit = _planned_jobs(
+        write_s1_project(tmp_path, point=True, point_offsets=THREE_PLOTS)
+    )
+    grouped = _group_unit_jobs(
+        per_unit, config=node.config.model_copy(update={"group_cell_km": 1000.0}),
+        crs=config.output_grid.crs, dem_tiles=state["dem_tiles"],
+    )
+    unique = {job.key(): job for _, jobs in grouped for _, job in jobs}
+    assert len(unique) == len(S1_SCENES)  # one run per scene for all three plots
+    for (_, original_jobs), (_, merged_jobs) in zip(per_unit, grouped, strict=True):
+        for (_, original), (_, merged) in zip(original_jobs, merged_jobs, strict=True):
+            assert merged.scene == original.scene
+            west, south, east, north = wkt.loads(merged.region_wkt).bounds
+            o_west, o_south, o_east, o_north = wkt.loads(original.region_wkt).bounds
+            assert west <= o_west and south <= o_south and east >= o_east and north >= o_north
+            assert merged.dem_bounds_wgs84[0] <= original.dem_bounds_wgs84[0]
+            assert merged.dem_tiles  # the merged DEM extent still selects tiles
+
+
+def test_grouped_points_run_gpt_once_per_scene_with_the_same_values(
+    tmp_path: Path, monkeypatch
+):
+    def run(name: str, node_extra: str):
+        folder = tmp_path / name
+        folder.mkdir()
+        log = folder / "gpt-runs.log"
+        monkeypatch.setenv("STUB_GPT_LOG", str(log))
+        project = write_s1_project(
+            folder, point=True, point_offsets=THREE_PLOTS, node_extra=node_extra
+        )
+        rows = _run(project).node_results["sigma0"].rows
+        runs = len(log.read_text().splitlines())
+        return rows.sort_values(["aoi_id", "product_id"]).reset_index(drop=True), runs
+
+    plain, plain_runs = run("plain", "")
+    grouped, grouped_runs = run("grouped", "    group_cell_km: 1000")
+
+    assert plain_runs == 3 * len(S1_SCENES) and grouped_runs == len(S1_SCENES)
+    assert len(grouped) == len(plain) == 3 * len(S1_SCENES)
+    assert not grouped[["VV", "VH"]].isna().any().any()  # every plot pixel was found
+    assert grouped[["VV", "VH"]].to_numpy() == pytest.approx(plain[["VV", "VH"]].to_numpy())
+    assert grouped["aoi_id"].tolist() == plain["aoi_id"].tolist()
+
+
 def test_max_concurrent_defaults_and_is_validated():
     assert SnapGPTNodeConfig(source="s1", dem="dem").max_concurrent == 2
     with pytest.raises(ValueError):

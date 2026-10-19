@@ -9,6 +9,8 @@ per-scene cache; point AOIs run the same cached scene jobs and sample one pixel.
 
 from __future__ import annotations
 
+import dataclasses
+import math
 import os
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -81,6 +83,7 @@ class SnapGPTNodeConfig(BaseModel):
     timeout_s: int | None = Field(default=None, gt=0)
     on_no_scenes: Literal["warn", "error"] = "warn"
     max_concurrent: int = Field(default=2, ge=1)
+    group_cell_km: float = Field(default=0.0, ge=0)
 
     @field_validator("polarizations", mode="before")
     @classmethod
@@ -219,6 +222,77 @@ def _unit_jobs(
             )
         )
     return jobs
+
+
+def _group_unit_jobs(
+    per_unit: list[tuple[Any, list[tuple[Any, snap.SceneJob]]]],
+    *,
+    config: SnapGPTNodeConfig,
+    crs: str,
+    dem_tiles: tuple[Path, ...],
+) -> list[tuple[Any, list[tuple[Any, snap.SceneJob]]]]:
+    """Share one SNAP run between the plots of a scene that fall in one spatial cell.
+
+    Every ``gpt`` run pays a fixed cost (JVM start-up and staging the scene's ZIP),
+    so one run per plot repeats it for every plot in the scene. Plots are bucketed
+    per scene into square cells of ``config.group_cell_km`` in the output CRS; each
+    bucket gets one job whose region is the bounds of its plots' regions. Point
+    reads locate each plot's pixel by coordinates, so any output covering the pixel
+    serves it. A plot alone in its cell keeps exactly its original job and cache key.
+
+    Parameters
+    ----------
+    per_unit : list
+        ``(unit, [(catalog_row, job), ...])`` pairs from :func:`_unit_jobs`.
+    config : SnapGPTNodeConfig
+        Node configuration supplying ``group_cell_km`` and ``dem_margin_m``.
+    crs : str
+        Projected metre output CRS in which cells are laid out.
+    dem_tiles : tuple[pathlib.Path, ...]
+        DEM tiles to select from for each merged region.
+
+    Returns
+    -------
+    list
+        The same structure with every job replaced by its group's job.
+    """
+    from pyproj import Transformer
+    from shapely import wkt
+
+    cell_m = config.group_cell_km * 1000.0
+    to_grid = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+
+    def cell_of(unit: Any) -> tuple[int, int]:
+        """Return the cell index of a unit's centroid."""
+        centroid = unit.geometry_wgs84.centroid
+        x, y = to_grid.transform(centroid.x, centroid.y)
+        return math.floor(x / cell_m), math.floor(y / cell_m)
+
+    members: dict[tuple[str, int, int], list[snap.SceneJob]] = {}
+    for unit, jobs in per_unit:
+        for _, job in jobs:
+            members.setdefault((job.scene, *cell_of(unit)), []).append(job)
+
+    merged: dict[tuple[str, int, int], snap.SceneJob] = {}
+    for group, group_jobs in members.items():
+        boxes = [wkt.loads(job.region_wkt).bounds for job in group_jobs]
+        region = (
+            min(box[0] for box in boxes), min(box[1] for box in boxes),
+            max(box[2] for box in boxes), max(box[3] for box in boxes),
+        )
+        dem_bounds = snap.expand_bounds(region, config.dem_margin_m)
+        merged[group] = dataclasses.replace(
+            group_jobs[0],
+            region_wkt=snap.region_polygon_wkt(region),
+            dem_tiles=tuple(
+                str(tile) for tile in snap.select_dem_tiles(dem_tiles, dem_bounds)
+            ),
+            dem_bounds_wgs84=dem_bounds,
+        )
+    return [
+        (unit, [(row, merged[(job.scene, *cell_of(unit))]) for row, job in jobs])
+        for unit, jobs in per_unit
+    ]
 
 
 ########################################################################################
@@ -573,11 +647,22 @@ class SnapGPTProcessor(BaseProcessor):
             (unit, self._jobs(unit, config, context, state))
             for unit in pipeline.aoi_plan.units
         ]
+        pairs = sum(len(jobs) for _, jobs in per_unit)
+        if config.group_cell_km:
+            per_unit = _group_unit_jobs(
+                per_unit, config=config, crs=pipeline.output_grid.crs,
+                dem_tiles=state["dem_tiles"],
+            )
         unique = {job.key(): job for _, jobs in per_unit for _, job in jobs}
         context.logger.info(
-            "snap_gpt points=%d scene runs=%d workers=%d",
-            len(per_unit), len(unique), pipeline.execution.workers,
+            "snap_gpt points=%d scene/plot pairs=%d scene runs=%d workers=%d",
+            len(per_unit), pairs, len(unique), pipeline.execution.workers,
         )
+        if config.group_cell_km:
+            context.logger.info(
+                "snap_gpt node=%s grouped plots per scene in %g km cells",
+                context.node.node_id, config.group_cell_km,
+            )
         # Threads only wait on gpt subprocesses; more than max_concurrent would just
         # queue on the machine's gpt slots.
         pool_size = max(1, min(pipeline.execution.workers, config.max_concurrent))

@@ -1,0 +1,53 @@
+# Template for the Sentinel-1 plot-grouping test. s1_group_test.sbatch substitutes the
+# mode name (baseline or grouped) and the group_cell_km value (0 or 25) with sed.
+version: 1
+
+execution:
+  method: local
+  workers: 4
+  threads_per_worker: 1
+
+selection:
+  aoi: ../data/aois/s1_group_test_25.geojson
+  aoi_id_field: site_visit_id
+  years: [2019]
+  speriod: "06-01"
+  eperiod: "08-31"
+
+output_grid:
+  crs: EPSG:3338
+  resolution: 20
+  extent: aoi
+  anchor: [0, 0]
+  chunks: {y: 1024, x: 1024}
+
+sources:
+  s1:
+    type: s1.grd.local
+    data_dir: ../data/s1/raw
+    flight_direction: PREDOMINANT
+    orbit: precise-or-restituted
+  arcticdem:
+    type: dem.local
+    data_dir: ../data/arcticdem/10m
+    pattern: "*.tif"
+
+nodes:
+  # Only the SNAP step: one terrain-corrected row per plot and scene.
+  - id: s1-preprocess
+    type: snap_gpt
+    source: s1
+    dem: arcticdem
+    polarizations: [VV, VH]
+    subset: aoi
+    dem_vertical_datum: ellipsoid
+    memory_gb: 16
+    threads: 4
+    max_concurrent: 4
+    group_cell_km: __GROUP__   # 0 = one gpt run per plot (baseline)
+
+outputs:
+  s1-rows:
+    from: s1-preprocess
+    path: ../data/processed/s1_group_test___MODE__
+    format: parquet

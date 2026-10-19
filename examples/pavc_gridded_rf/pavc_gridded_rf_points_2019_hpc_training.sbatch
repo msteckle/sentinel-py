@@ -5,7 +5,7 @@
 #SBATCH -n 1
 #SBATCH -c 16
 #SBATCH --mem=128g
-#SBATCH -t 48:00:00
+#SBATCH -t 24:00:00
 #SBATCH -J pavc_rf19
 #SBATCH -o %x_%j.out
 set -euo pipefail

@@ -108,7 +108,7 @@ nodes:
     type: pavc_gridded_rf
     inputs: {features: samples}
     pft_table: ../data/tables/tier_03_cover_v2_0.csv  # copy from pavc/data/releases/v2_0
-    model_dir: ../data/models/pavc_gridded_rf_2019
+    model_dir: ../data/models/pavc_gridded_ak_rf_2019
     pfts: [evergreen_shrub, deciduous_shrub, graminoid, forb, bryophyte, lichen, litter, bareground, water]
     n_estimators: 100
     max_depth: 10
@@ -123,5 +123,5 @@ nodes:
 outputs:
   pft-fit:
     from: pft-models
-    path: ../data/processed/pavc_gridded_rf_fit_2019
+    path: ../data/processed/pavc_gridded_ak_rf_fit_2019
     format: parquet

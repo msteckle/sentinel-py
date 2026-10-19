@@ -70,6 +70,19 @@ _VERSION_RE = re.compile(r"SNAP Release version\s+(\S+)")
 _DEGREES_PER_METER = 1.0 / 111_320.0
 SLOT_DIR_PREFIX = "sentinel-py-snap-slots"
 SLOT_POLL_SECONDS = 0.25
+# SNAP's Subset step logs this when the region misses the scene's pixels (a catalog
+# footprint can overlap a region that the calibrated product does not), after which
+# Terrain-Correction fails on the empty product.
+NO_OVERLAP_MESSAGE = "No intersection with source product boundary"
+NO_OVERLAP_SUFFIX = ".nooverlap"
+
+
+class SceneNoOverlapError(RuntimeError):
+    """Raised when a scene has no pixels inside the job's region.
+
+    This is a property of the scene/region pair, not a SNAP fault: callers that
+    sample points treat it as "no observation" rather than a failed run.
+    """
 
 
 ########################################################################################
@@ -599,6 +612,9 @@ def run_scene(job: SceneJob, logger: logging.Logger | None = None) -> str:
 
     Raises
     ------
+    SceneNoOverlapError
+        If the scene has no pixels inside the job's region. The result is recorded
+        next to the would-be output so reruns do not launch ``gpt`` again.
     RuntimeError
         If ``gpt`` fails, times out, or produces an invalid file; the message
         includes the end of the run log.
@@ -608,6 +624,11 @@ def run_scene(job: SceneJob, logger: logging.Logger | None = None) -> str:
     if output.is_file():
         logger.debug("SNAP output cached: %s", output)
         return str(output)
+    no_overlap = output.with_suffix(NO_OVERLAP_SUFFIX)
+    if no_overlap.is_file():
+        raise SceneNoOverlapError(
+            f"{job.scene} has no pixels inside the job region (recorded in {no_overlap})"
+        )
 
     output.parent.mkdir(parents=True, exist_ok=True)
     work = Path(job.work_dir)
@@ -669,7 +690,17 @@ def run_scene(job: SceneJob, logger: logging.Logger | None = None) -> str:
                 f"SNAP timed out after {job.timeout_s}s for {job.scene}; see {log_path}"
             ) from error
         if completed.returncode != 0 or not partial.is_file():
-            tail = "\n".join(log_path.read_text().splitlines()[-15:])
+            log_text = log_path.read_text()
+            if NO_OVERLAP_MESSAGE in log_text:
+                write_json_atomic(
+                    no_overlap,
+                    {"scene": job.scene, "key": key, "reason": NO_OVERLAP_MESSAGE,
+                     "region_wkt": job.region_wkt, "log": str(log_path)},
+                )
+                raise SceneNoOverlapError(
+                    f"{job.scene} has no pixels inside the job region; see {log_path}"
+                )
+            tail = "\n".join(log_text.splitlines()[-15:])
             raise RuntimeError(
                 f"SNAP gpt failed (exit {completed.returncode}) for {job.scene}; "
                 f"log: {log_path}\n{tail}"

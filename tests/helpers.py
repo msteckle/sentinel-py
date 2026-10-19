@@ -226,6 +226,15 @@ for arg in args:
     if arg.startswith("-P"):
         name, value = arg[2:].split("=", 1)
         params[name] = value
+no_overlap = os.environ.get("STUB_GPT_NO_OVERLAP")
+if no_overlap and no_overlap in params["input"]:
+    # Mirrors SNAP: Subset warns about an empty region, then Terrain-Correction
+    # fails because the empty product has no bands.
+    print("WARNING: org.esa.snap.core.gpf.common.SubsetOp: No intersection with "
+          "source product boundary " + os.path.basename(params["input"]))
+    print("Error: [NodeId: Terrain-Correction] Operator 'RangeDopplerGeocodingOp': "
+          "Value for 'Source Bands' is invalid: 'Sigma0_VV'")
+    sys.exit(1)
 userdir = next(a.split("=", 1)[1] for a in args if a.startswith("-Dsnap.userdir="))
 orbits = glob.glob(os.path.join(userdir, "auxdata/Orbits/Sentinel-1/*/*/*/*/*.EOF"))
 assert orbits, "orbit file not linked into the SNAP user directory"

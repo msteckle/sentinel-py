@@ -111,6 +111,39 @@ def test_run_scene_failure_leaves_no_output_and_cleans_up(tmp_path: Path, monkey
     assert not any((Path(job.work_dir) / "tmp").iterdir())
 
 
+def test_run_scene_records_no_overlap_and_does_not_rerun_gpt(tmp_path: Path, monkeypatch):
+    job = _job(tmp_path)
+    monkeypatch.setenv("STUB_GPT_NO_OVERLAP", job.scene)
+    with pytest.raises(snap.SceneNoOverlapError, match="no pixels inside"):
+        snap.run_scene(job)
+
+    marker = job.output_path.with_suffix(snap.NO_OVERLAP_SUFFIX)
+    record = json.loads(marker.read_text())
+    assert record["scene"] == job.scene and record["reason"] == snap.NO_OVERLAP_MESSAGE
+    assert not job.output_path.exists()
+    assert not list(job.output_path.parent.glob("*_partial*.tif"))
+
+    # The marker answers reruns, so a gpt that would now succeed is never launched.
+    monkeypatch.delenv("STUB_GPT_NO_OVERLAP")
+    log_before = job.output_path.with_suffix(".log").stat().st_mtime_ns
+    with pytest.raises(snap.SceneNoOverlapError, match="recorded in"):
+        snap.run_scene(job)
+    assert job.output_path.with_suffix(".log").stat().st_mtime_ns == log_before
+    assert not job.output_path.exists()
+
+
+def test_no_overlap_error_is_a_runtime_error_but_other_failures_are_not_skips(
+    tmp_path: Path, monkeypatch
+):
+    assert issubclass(snap.SceneNoOverlapError, RuntimeError)
+    job = _job(tmp_path)
+    monkeypatch.setenv("STUB_GPT_FAIL", "1")
+    with pytest.raises(RuntimeError, match="simulated failure") as error:
+        snap.run_scene(job)
+    assert not isinstance(error.value, snap.SceneNoOverlapError)
+    assert not job.output_path.with_suffix(snap.NO_OVERLAP_SUFFIX).exists()
+
+
 def test_run_scene_requires_staged_orbit_and_egm96(tmp_path: Path):
     job = _job(tmp_path)
     Path(job.orbit_path).unlink()

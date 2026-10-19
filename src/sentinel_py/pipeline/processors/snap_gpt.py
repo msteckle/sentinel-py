@@ -582,13 +582,22 @@ class SnapGPTProcessor(BaseProcessor):
         # queue on the machine's gpt slots.
         pool_size = max(1, min(pipeline.execution.workers, config.max_concurrent))
         label = f"SNAP scenes ({context.node.node_id})"
-        outputs = {}
+        outputs: dict[str, str | None] = {}
+        no_overlap: list[str] = []
         context.report_progress(label, 0, len(unique))
         with ThreadPoolExecutor(max_workers=pool_size) as pool:
             futures = {pool.submit(snap.run_scene, job): key for key, job in unique.items()}
             try:
                 for done, future in enumerate(as_completed(futures), start=1):
-                    outputs[futures[future]] = future.result()
+                    key = futures[future]
+                    try:
+                        outputs[key] = future.result()
+                    except snap.SceneNoOverlapError:
+                        # The catalog footprint is four straight-edged corners, so a
+                        # plot near a swath edge can fall outside the real product;
+                        # that plot simply has no observation from this scene.
+                        outputs[key] = None
+                        no_overlap.append(unique[key].scene)
                     context.report_progress(label, done, len(unique))
             except BaseException:
                 pool.shutdown(wait=False, cancel_futures=True)  # stop queued scenes
@@ -604,6 +613,8 @@ class SnapGPTProcessor(BaseProcessor):
             )
             window = next(grid.iter_windows())
             for scene_row, job in jobs:
+                if outputs[job.key()] is None:
+                    continue
                 values = _read_window(
                     outputs[job.key()], grid, window, len(config.polarizations)
                 )[:, 0, 0]
@@ -621,6 +632,14 @@ class SnapGPTProcessor(BaseProcessor):
                 )
                 rows.append(row)
         self._warn_no_scenes(context, config, state, empty, len(per_unit))
+        if no_overlap:
+            shown = ", ".join(no_overlap[:5]) + (" ..." if len(no_overlap) > 5 else "")
+            context.logger.warning(
+                "snap_gpt node=%s: skipped %d scene/plot pair(s) with no pixels inside "
+                "the plot region (SNAP Subset found no intersection): %s; each is "
+                "recorded in a .nooverlap file next to the scene outputs",
+                context.node.node_id, len(no_overlap), shown,
+            )
         if not rows:  # keep the column layout so downstream nodes can fill nodata
             template = point_row(
                 per_unit[0][0], time="", product_id="", granule_id="",

@@ -361,6 +361,38 @@ def test_s1_points_flow_into_binned_climatology(tmp_path: Path):
     assert rows["VV"].isna().sum() == 7 and set(rows["units"].dropna()) == {"dB"}
 
 
+def test_points_skip_scenes_with_no_overlap_and_warn(tmp_path: Path, monkeypatch, caplog):
+    monkeypatch.setenv("STUB_GPT_NO_OVERLAP", S1_SCENES[0])
+    logger = logging.getLogger("snap-no-overlap")
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        result = run_pipeline(
+            PipelineConfig.from_file(write_s1_project(tmp_path, point=True)), logger
+        )
+
+    rows = result.node_results["sigma0"].rows
+    assert rows["granule_id"].tolist() == [S1_SCENES[1]]
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "skipped 1 scene/plot pair" in messages and S1_SCENES[0] in messages
+
+
+def test_points_where_every_scene_has_no_overlap_become_nodata(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("STUB_GPT_NO_OVERLAP", "S1A_IW_GRDH")  # matches both scenes
+    project = write_s1_project(tmp_path, point=True)
+    project.write_text(
+        project.read_text().replace(
+            "outputs:\n  result:\n    from: sigma0\n    path: output\n    format: parquet",
+            "  - id: seasonal\n    type: composite\n    inputs: {data: sigma0}\n"
+            "    period: all\n    aggregation: median\n    empty_bins: fill\n"
+            "outputs:\n  result:\n    from: seasonal\n    path: output\n    format: parquet",
+        )
+    )
+    result = _run(project)
+
+    assert result.node_results["sigma0"].rows.empty
+    composite = result.node_results["seasonal"].rows
+    assert len(composite) == 1 and composite[["VV", "VH"]].isna().all().all()
+
+
 def test_max_concurrent_defaults_and_is_validated():
     assert SnapGPTNodeConfig(source="s1", dem="dem").max_concurrent == 2
     with pytest.raises(ValueError):

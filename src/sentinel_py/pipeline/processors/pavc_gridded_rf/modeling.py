@@ -32,6 +32,7 @@ from sentinel_py.pipeline.processors.base import (
 from sentinel_py.pipeline.readers.base import (
     POINT_METADATA_COLUMNS,
     S1_POINT_ATTRIBUTE_COLUMNS,
+    S2_POINT_ATTRIBUTE_COLUMNS,
 )
 from sentinel_py.pipeline.processors.pavc_gridded_rf.training import (
     DEFAULT_ID_COLUMN,
@@ -47,7 +48,7 @@ from sentinel_py.pipeline.processors.pavc_gridded_rf.training import (
     read_manifest,
 )
 
-PROCESSOR_VERSION = 1
+PROCESSOR_VERSION = 2
 OUTPUT_VARIABLE = "cover"
 OUTPUT_NODATA = 255
 MAX_COVER = 100
@@ -405,6 +406,7 @@ class PavcGriddedRFProcessor(BaseProcessor):
             for column in rows.columns
             if column not in POINT_METADATA_COLUMNS
             and column not in S1_POINT_ATTRIBUTE_COLUMNS
+            and column not in S2_POINT_ATTRIBUTE_COLUMNS
             and is_numeric_dtype(rows[column])
         ]
         if not names:

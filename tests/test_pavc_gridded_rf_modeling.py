@@ -270,6 +270,17 @@ def test_fit_saves_models_and_returns_per_plot_oob_rows(tmp_path: Path) -> None:
     assert manifest["pfts"] == ["graminoid", "water"]
 
 
+def test_sentinel2_scene_attribute_is_not_a_feature(tmp_path: Path) -> None:
+    _write_cover(tmp_path)
+    rows = _rows().assign(quantification_value=10000)
+
+    _fit(tmp_path, rows)
+
+    (fitted,) = (tmp_path / "models").iterdir()
+    manifest = pd.read_json(fitted / "manifest.json", typ="series")
+    assert manifest["features"] == BANDS
+
+
 def test_second_fit_reuses_models(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

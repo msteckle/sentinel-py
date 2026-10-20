@@ -93,6 +93,9 @@ POINT_METADATA_COLUMNS = frozenset(
         "product_id", "granule_id", "time_representation", "source_fingerprint",
     }
 )
+# Sentinel-2 point rows carry the scene's radiometric scale next to the band values; it
+# is a per-scene attribute, not a surface measurement, so models must not fit on it.
+S2_POINT_ATTRIBUTE_COLUMNS = frozenset({"quantification_value"})
 S1_POINT_POLARIZATIONS = frozenset({"VV", "VH", "HH", "HV"})
 S1_POINT_ATTRIBUTE_COLUMNS = frozenset(
     {"flight_direction", "relative_orbit", "orbit_type", "units"}
